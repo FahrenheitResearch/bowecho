@@ -17,6 +17,9 @@
 //! - QC per Tyndall & Horel (2013): innovation gross check
 //!   |d| ≤ max(ε_m·σ_local(40 km), floor) with ε_m = 10, floors 3 K (T)
 //!   / 4 K (Td); per-network ε² from their Table (CWOP-class inflated).
+//! - A sector-balanced 75-km buddy check operates on innovations (never
+//!   raw temperatures), with a robust median/MAD threshold. Sparse stations
+//!   are left alone and a coherent multi-station anomaly is exonerated.
 //! - Config anchors: R = 80 km (background-error scale, Tyndall, Horel &
 //!   De Pondeca 2010 — NOT shrunk for dense mesonets; density is mᵢ's
 //!   job), 10 iterations w/ tolerance exit (skill saturates ~10, Myrick
@@ -43,6 +46,19 @@ const MAX_ITER: usize = 12;
 const TOL_FRAC: f64 = 0.05;
 /// Innovation gross check multiplier (Tyndall Eq. 5).
 const EPS_M: f64 = 10.0;
+/// MADIS-style innovation buddy radius. The spec deliberately caps this
+/// below the 80-km background-error scale so fronts are not compared across
+/// a broad synoptic neighborhood.
+const BUDDY_RADIUS_KM: f64 = 75.0;
+/// Nearest buddy in each directional sector prevents one dense mesonet from
+/// overwhelming all of the spatial evidence.
+const BUDDY_SECTORS: usize = 8;
+const BUDDY_MIN_COUNT: usize = 3;
+/// Two independent directional buddies are enough to preserve a coherent
+/// local anomaly, including one that the broad background gross check marks.
+const BUDDY_SUPPORT_COUNT: usize = 2;
+const MAD_TO_SIGMA: f64 = 1.482_6;
+const BUDDY_SIGMA_LIMIT: f64 = 3.0;
 /// Vertical decorrelation scale, m (Tyndall, Horel & De Pondeca 2010).
 const RZ_M: f64 = 200.0;
 /// Intervening-terrain blockage scale, m (Myrick, Horel & Lazarus 2005,
@@ -89,6 +105,8 @@ pub struct VarConfig {
     pub eps2_mesonet: f64,
     /// Gross-check floor (same units as the variable).
     pub qc_floor: f64,
+    /// Minimum innovation departure from the buddy median required to reject.
+    pub buddy_floor: f64,
     /// Apply elevation/terrain decorrelation (off for wind, per RTMA).
     pub terrain_aware: bool,
 }
@@ -99,6 +117,7 @@ pub const T2M: VarConfig = VarConfig {
     eps2_metar: 0.35,
     eps2_mesonet: 0.5,
     qc_floor: 3.0,
+    buddy_floor: 3.5,
     terrain_aware: true,
 };
 /// Td2m — spec §7 row 2 (derived* anchors).
@@ -107,6 +126,7 @@ pub const TD2M: VarConfig = VarConfig {
     eps2_metar: 0.6,
     eps2_mesonet: 1.5,
     qc_floor: 4.0,
+    buddy_floor: 4.5,
     terrain_aware: true,
 };
 /// 10-m wind components, analyzed separately/univariately (spec §7 row 3;
@@ -116,6 +136,7 @@ pub const WIND10: VarConfig = VarConfig {
     eps2_metar: 1.0,
     eps2_mesonet: 2.0,
     qc_floor: 7.5,
+    buddy_floor: 5.0,
     terrain_aware: false,
 };
 
@@ -129,6 +150,14 @@ struct AnalysisOb {
     eps2: f64,
     /// Station elevation m MSL (reported, else model terrain at cell).
     elev: f64,
+}
+
+/// Observation after unit matching and the adaptive background check, but
+/// before spatial buddy QC. A gross suspect may still be exonerated by two
+/// coherent directional buddies.
+struct PendingOb {
+    ob: AnalysisOb,
+    gross_suspect: bool,
 }
 
 /// Result: the analyzed increment on the background grid + diagnostics.
@@ -173,13 +202,83 @@ pub fn config_for(var: &str) -> Option<VarConfig> {
     }
 }
 
-/// Convert the °C observation into the background field's unit space,
-/// branching on the field's declared units (mirrors rw-ui's reader) so
-/// a K-vs-°C store difference can never poison the innovations.
-fn ob_to_field_units(units: &str, value_c: f64) -> f64 {
-    match units {
-        "K" => value_c + 273.15,
-        _ => value_c,
+/// Affine conversion from an observation's canonical analysis units
+/// (Celsius for T/Td, m/s for wind components) into the already-converted
+/// display units carried by [`FieldData`]. `delta_scale` also converts every
+/// dimensional QC/error constant; offsets must never be applied to a spread.
+#[derive(Clone, Copy, Debug)]
+struct ObUnitTransform {
+    scale: f64,
+    offset: f64,
+}
+
+impl ObUnitTransform {
+    fn value(self, value: f64) -> f64 {
+        value * self.scale + self.offset
+    }
+
+    fn delta(self, value: f64) -> f64 {
+        value * self.scale
+    }
+}
+
+fn normalized_unit(units: &str) -> String {
+    units
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(*c, '_' | '°' | '^'))
+        .collect()
+}
+
+/// Resolve the field's *actual current* unit space. rw-ui converts store
+/// fields into production/user display units before exposing `latest_field`,
+/// so matching only the store-native `K`/`m/s` labels is unsafe. Unknown unit
+/// labels fail closed: an OA is skipped instead of silently mixing dimensions.
+fn ob_unit_transform(var: &str, units: &str) -> Option<ObUnitTransform> {
+    let unit = normalized_unit(units);
+    match var {
+        "temperature_2m" | "dewpoint_2m" => match unit.as_str() {
+            "k" | "degk" | "kelvin" | "degreek" | "degreesk" | "degreeskelvin" => {
+                Some(ObUnitTransform {
+                    scale: 1.0,
+                    offset: 273.15,
+                })
+            }
+            "c" | "degc" | "celsius" | "centigrade" | "degreec" | "degreesc" | "℃" => {
+                Some(ObUnitTransform {
+                    scale: 1.0,
+                    offset: 0.0,
+                })
+            }
+            "f" | "degf" | "fahrenheit" | "degreef" | "degreesf" | "℉" => Some(ObUnitTransform {
+                scale: 9.0 / 5.0,
+                offset: 32.0,
+            }),
+            _ => None,
+        },
+        "u_10m" | "v_10m" => match unit.as_str() {
+            "m/s" | "mps" | "ms-1" | "m/sec" | "meter/second" | "meters/second"
+            | "metre/second" | "metres/second" => Some(ObUnitTransform {
+                scale: 1.0,
+                offset: 0.0,
+            }),
+            "kt" | "kts" | "kn" | "knot" | "knots" => Some(ObUnitTransform {
+                scale: 1.943_844_5,
+                offset: 0.0,
+            }),
+            "mph" | "mi/h" | "mile/hour" | "miles/hour" => Some(ObUnitTransform {
+                scale: 2.236_936_292_1,
+                offset: 0.0,
+            }),
+            "km/h" | "kmh" | "kph" | "kilometer/hour" | "kilometers/hour" | "kilometre/hour"
+            | "kilometres/hour" => Some(ObUnitTransform {
+                scale: 3.6,
+                offset: 0.0,
+            }),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -238,6 +337,102 @@ fn local_stddev(field: &FieldData, col: f64, row: f64, cells_40km: usize) -> f64
     (sum2 / count as f64 - mean * mean).max(0.0).sqrt()
 }
 
+/// Pick at most the nearest observation from each 45-degree sector. This is
+/// both a cheap MADIS-style density control and protection against a dense
+/// network on one side of a front voting eight times against a lone sector.
+fn directional_buddies(obs: &[PendingOb], target: usize, radius_cells: f64) -> Vec<usize> {
+    let mut nearest: [Option<(f64, usize)>; BUDDY_SECTORS] = [None; BUDDY_SECTORS];
+    let origin = &obs[target].ob;
+    let radius2 = radius_cells * radius_cells;
+    for (index, candidate) in obs.iter().enumerate() {
+        if index == target {
+            continue;
+        }
+        let dx = candidate.ob.col - origin.col;
+        let dy = candidate.ob.row - origin.row;
+        let distance2 = dx * dx + dy * dy;
+        // Co-located reports are not independent buddy evidence and often
+        // represent duplicate feeds for the same physical instrument.
+        if distance2 <= f64::EPSILON || distance2 > radius2 {
+            continue;
+        }
+        let mut angle = dy.atan2(dx);
+        if angle < 0.0 {
+            angle += std::f64::consts::TAU;
+        }
+        let sector = ((angle / std::f64::consts::TAU * BUDDY_SECTORS as f64).floor() as usize)
+            .min(BUDDY_SECTORS - 1);
+        if nearest[sector].is_none_or(|(best_distance2, _)| distance2 < best_distance2) {
+            nearest[sector] = Some((distance2, index));
+        }
+    }
+    nearest
+        .into_iter()
+        .flatten()
+        .map(|(_, index)| index)
+        .collect()
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    })
+}
+
+/// Decide one candidate using two independent safeguards:
+///
+/// 1. A background-gross suspect remains rejected unless two directional
+///    buddies corroborate its innovation.
+/// 2. A gross-pass observation is rejected only when at least three clean
+///    sectors disagree with it beyond both the published variable floor and
+///    a 3-sigma robust neighborhood spread.
+///
+/// This intentionally favors false negatives in sparse/heterogeneous data:
+/// the purpose is to remove bullseye-making failures, not real cold pools.
+fn rejected_by_innovation_qc(
+    index: usize,
+    obs: &[PendingOb],
+    radius_cells: f64,
+    buddy_floor: f64,
+) -> bool {
+    let buddies = directional_buddies(obs, index, radius_cells);
+    let target = obs[index].ob.d;
+    let coherent_support = buddies
+        .iter()
+        .filter(|&&buddy| (obs[buddy].ob.d - target).abs() <= buddy_floor)
+        .count();
+    if coherent_support >= BUDDY_SUPPORT_COUNT {
+        return false;
+    }
+    if obs[index].gross_suspect {
+        return true;
+    }
+
+    let mut clean_innovations: Vec<f64> = buddies
+        .into_iter()
+        .filter(|&buddy| !obs[buddy].gross_suspect)
+        .map(|buddy| obs[buddy].ob.d)
+        .collect();
+    if clean_innovations.len() < BUDDY_MIN_COUNT {
+        return false;
+    }
+    let center = median(&mut clean_innovations).expect("non-empty buddy innovations");
+    let mut deviations: Vec<f64> = clean_innovations
+        .iter()
+        .map(|innovation| (innovation - center).abs())
+        .collect();
+    let mad = median(&mut deviations).expect("non-empty buddy deviations");
+    let limit = buddy_floor.max(BUDDY_SIGMA_LIMIT * MAD_TO_SIGMA * mad);
+    (target - center).abs() > limit
+}
+
 /// Run the Bratseth analysis for one variable.
 ///
 /// `grid_cell_km` = the background's grid spacing (HRRR: 3.0).
@@ -252,15 +447,26 @@ pub fn analyze(
     locate: impl Fn(&SurfaceOb) -> Option<(f64, f64)>,
 ) -> Option<Analysis> {
     let config = config_for(var)?;
+    let unit_transform = ob_unit_transform(var, &field.units)?;
+    if !grid_cell_km.is_finite() || grid_cell_km <= 0.0 {
+        return None;
+    }
+    // The solver works in FieldData's display space, so every dimensional
+    // constant must be scaled there too. For example 3 K is 5.4 degF, while
+    // the affine +32 offset applies only to absolute observations.
+    let sigma_b = unit_transform.delta(config.sigma_b);
+    let qc_floor = unit_transform.delta(config.qc_floor);
+    let buddy_floor = unit_transform.delta(config.buddy_floor);
     let cells_40km = (40.0 / grid_cell_km).round() as usize;
     let r_cells = R_KM / grid_cell_km;
     let cutoff_cells = CUTOFF_KM / grid_cell_km;
+    let buddy_radius_cells = BUDDY_RADIUS_KM / grid_cell_km;
 
     // ---- innovations + QC ----
-    let mut accepted: Vec<AnalysisOb> = Vec::new();
+    let mut pending: Vec<PendingOb> = Vec::new();
     let mut rejected = 0usize;
     for ob in obs {
-        let Some(value_c) = ob_value_for(var, ob) else {
+        let Some(value) = ob_value_for(var, ob) else {
             continue;
         };
         let Some((col, row)) = locate(ob) else {
@@ -269,13 +475,14 @@ pub fn analyze(
         let Some(background) = bilinear(field, col, row) else {
             continue;
         };
-        let d = ob_to_field_units(&field.units, value_c) - background;
-        // Innovation gross check (Tyndall Eq. 5).
-        let sigma_local = local_stddev(field, col, row, cells_40km);
-        if d.abs() > (EPS_M * sigma_local).max(config.qc_floor) {
+        let d = unit_transform.value(value) - background;
+        if !d.is_finite() {
             rejected += 1;
             continue;
         }
+        // Innovation gross check (Tyndall Eq. 5).
+        let sigma_local = local_stddev(field, col, row, cells_40km);
+        let gross_suspect = d.abs() > (EPS_M * sigma_local).max(qc_floor);
         let eps2 = if ob.network == "METAR" {
             config.eps2_metar
         } else {
@@ -292,13 +499,27 @@ pub fn analyze(
             .elevation_m
             .map(f64::from)
             .unwrap_or_else(|| terrain_at(col, row));
-        accepted.push(AnalysisOb {
-            col,
-            row,
-            d,
-            eps2,
-            elev,
+        pending.push(PendingOb {
+            ob: AnalysisOb {
+                col,
+                row,
+                d,
+                eps2,
+                elev,
+            },
+            gross_suspect,
         });
+    }
+    let reject_by_index: Vec<bool> = (0..pending.len())
+        .map(|index| rejected_by_innovation_qc(index, &pending, buddy_radius_cells, buddy_floor))
+        .collect();
+    let mut accepted = Vec::with_capacity(pending.len());
+    for (candidate, reject) in pending.into_iter().zip(reject_by_index) {
+        if reject {
+            rejected += 1;
+        } else {
+            accepted.push(candidate.ob);
+        }
     }
     if accepted.is_empty() {
         return None;
@@ -406,7 +627,7 @@ pub fn analyze(
         for j in 0..n {
             f[j] += delta_f[j];
         }
-        if max_residual < TOL_FRAC * config.sigma_b {
+        if max_residual < TOL_FRAC * sigma_b {
             break;
         }
     }
@@ -482,6 +703,15 @@ mod tests {
         })
     }
 
+    fn field_with_values(nx: usize, ny: usize, units: &str, values: Vec<f32>) -> Arc<FieldData> {
+        assert_eq!(values.len(), nx * ny);
+        let mut field = (*flat_field(nx, ny, 0.0)).clone();
+        field.units = units.to_owned();
+        field.values = values;
+        field.range = None;
+        Arc::new(field)
+    }
+
     #[test]
     fn cell_km_measured_from_grid() {
         // No grid file -> HRRR-class fallback.
@@ -528,6 +758,63 @@ mod tests {
             completeness: 1,
             map_state_abbr: None,
         }
+    }
+
+    #[test]
+    fn observation_units_match_display_space_and_scale_qc_deltas() {
+        let fahrenheit = ob_unit_transform("temperature_2m", "degF").expect("degF");
+        let value_f = fahrenheit.value(26.0);
+        assert!((value_f - 78.8).abs() < 1.0e-9);
+        assert!((value_f - 90.0 + 11.2).abs() < 1.0e-9);
+        assert!((fahrenheit.delta(3.0) - 5.4).abs() < 1.0e-9);
+
+        let knots = ob_unit_transform("u_10m", "kt").expect("kt");
+        assert!((knots.value(10.0) - 19.438_445).abs() < 1.0e-9);
+        assert!((knots.delta(5.0) - 9.719_222_5).abs() < 1.0e-9);
+        assert!(
+            (ob_unit_transform("v_10m", "mph").unwrap().value(10.0) - 22.369_362_921).abs()
+                < 1.0e-9
+        );
+        assert_eq!(
+            ob_unit_transform("u_10m", "km/h").unwrap().value(10.0),
+            36.0
+        );
+        assert_eq!(ob_unit_transform("u_10m", "mps").unwrap().value(10.0), 10.0);
+    }
+
+    #[test]
+    fn unknown_analysis_units_fail_closed() {
+        assert!(ob_unit_transform("temperature_2m", "widgets").is_none());
+        let mut field = (*flat_field(40, 40, 80.0)).clone();
+        field.units = "widgets".to_owned();
+        let field = Arc::new(field);
+        let obs = vec![ob_at(10.0, 10.0, 26.0, "METAR")];
+        assert!(
+            analyze("temperature_2m", &field, &obs, 3.0, None, |_| {
+                Some((20.0, 20.0))
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fahrenheit_background_does_not_treat_26c_as_26f() {
+        let mut field = (*flat_field(100, 100, 80.0)).clone();
+        field.units = "degF".to_owned();
+        let field = Arc::new(field);
+        let obs = vec![ob_at(40.0, -95.0, 26.0, "METAR")];
+        let analysis = analyze("temperature_2m", &field, &obs, 3.0, None, |_| {
+            Some((50.0, 50.0))
+        })
+        .expect("78.8 F observation should be valid against an 80 F background");
+        assert_eq!(analysis.obs_used, 1);
+        assert_eq!(analysis.obs_rejected, 0);
+        let expected = (78.8 - 80.0) / (1.0 + T2M.eps2_metar);
+        let increment = f64::from(analysis.increment[50 * 100 + 50]);
+        assert!(
+            (increment - expected).abs() < 0.02,
+            "{increment} vs {expected}"
+        );
     }
 
     /// Spec validation item 1: a single ob makes a Gaussian blob of
@@ -583,6 +870,97 @@ mod tests {
             at_ob > single_expected - 0.02 && at_ob < two_ob_oi + 0.05,
             "{at_ob} outside [{single_expected}, {two_ob_oi}]"
         );
+    }
+
+    /// Regression for the coastal/front failure mode: local background
+    /// variance makes the published gross threshold deliberately loose, but
+    /// four balanced, background-consistent buddies still remove one real
+    /// 26 F report embedded in a 70--90 F environment.
+    #[test]
+    fn buddy_rejects_isolated_cold_innovation_after_adaptive_gross_pass() {
+        let (nx, ny) = (120usize, 120usize);
+        let values = (0..ny)
+            .flat_map(|_| (0..nx).map(|col| if col < 60 { 70.0 } else { 90.0 }))
+            .collect();
+        let field = field_with_values(nx, ny, "degF", values);
+        let temp_c_for_f = |value_f: f32| (value_f - 32.0) * (5.0 / 9.0);
+        let obs = vec![
+            ob_at(60.0, 60.0, temp_c_for_f(26.0), "METAR"),
+            ob_at(60.0, 52.0, temp_c_for_f(70.0), "METAR"),
+            ob_at(60.0, 68.0, temp_c_for_f(90.0), "METAR"),
+            ob_at(52.0, 60.0, temp_c_for_f(90.0), "METAR"),
+            ob_at(68.0, 60.0, temp_c_for_f(90.0), "METAR"),
+        ];
+
+        let transform = ob_unit_transform("temperature_2m", &field.units).unwrap();
+        let target_innovation = transform.value(f64::from(obs[0].temp_c.unwrap())) - 90.0;
+        let sigma_local = local_stddev(&field, 60.0, 60.0, 13);
+        assert!(
+            target_innovation.abs() <= (EPS_M * sigma_local).max(transform.delta(T2M.qc_floor)),
+            "fixture must pass the legacy adaptive gross check"
+        );
+
+        let analysis = analyze("temperature_2m", &field, &obs, 3.0, None, |ob| {
+            Some((f64::from(ob.lon), f64::from(ob.lat)))
+        })
+        .expect("four valid buddies remain");
+        assert_eq!(analysis.obs_used, 4);
+        assert_eq!(analysis.obs_rejected, 1);
+    }
+
+    /// A multi-station cold anomaly is evidence, not a bullseye. Two
+    /// directional supporters exonerate each member even when a flat
+    /// background makes the first-pass gross threshold tight.
+    #[test]
+    fn coherent_cold_cluster_is_retained() {
+        let field = flat_field(120, 120, 300.0);
+        let cold_temp_c = 280.0f32 - 273.15;
+        let obs = vec![
+            ob_at(60.0, 60.0, cold_temp_c, "METAR"),
+            ob_at(60.0, 64.0, cold_temp_c, "METAR"),
+            ob_at(64.0, 62.0, cold_temp_c, "METAR"),
+        ];
+        let analysis = analyze("temperature_2m", &field, &obs, 3.0, None, |ob| {
+            Some((f64::from(ob.lon), f64::from(ob.lat)))
+        })
+        .expect("coherent cluster");
+        assert_eq!(analysis.obs_used, 3);
+        assert_eq!(analysis.obs_rejected, 0);
+    }
+
+    /// Buddy QC compares innovations, not absolute temperatures. A sharp
+    /// but background-resolved front therefore remains intact even though
+    /// raw station temperatures differ by 20 K inside the buddy radius.
+    #[test]
+    fn background_resolved_front_is_retained() {
+        let (nx, ny) = (120usize, 120usize);
+        let values: Vec<f32> = (0..ny)
+            .flat_map(|_| (0..nx).map(|col| if col < 60 { 280.0 } else { 300.0 }))
+            .collect();
+        let field = field_with_values(nx, ny, "K", values);
+        let points = [
+            (52.0, 52.0),
+            (52.0, 60.0),
+            (52.0, 68.0),
+            (60.0, 52.0),
+            (60.0, 68.0),
+            (68.0, 52.0),
+            (68.0, 60.0),
+            (68.0, 68.0),
+        ];
+        let obs: Vec<SurfaceOb> = points
+            .into_iter()
+            .map(|(row, col)| {
+                let background_k = if col < 60.0 { 280.0 } else { 300.0 };
+                ob_at(row, col, background_k - 273.15 + 1.0, "METAR")
+            })
+            .collect();
+        let analysis = analyze("temperature_2m", &field, &obs, 3.0, None, |ob| {
+            Some((f64::from(ob.lon), f64::from(ob.lat)))
+        })
+        .expect("front-following observations");
+        assert_eq!(analysis.obs_used, obs.len());
+        assert_eq!(analysis.obs_rejected, 0);
     }
 
     /// QC: an absurd innovation is rejected by the gross check.

@@ -306,6 +306,22 @@ impl ModelWorkspaceSource {
     }
 }
 
+/// One real timestep on the currently selected workspace axis. Local entries
+/// retain their complete [`HourKey`] (including exact-time metadata); remote
+/// entries retain the catalog index rather than treating a signed storage slot
+/// as a contiguous forecast hour.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkspaceTimeScrubberTarget {
+    Local(HourKey),
+    RemoteCatalogIndex(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceTimeScrubberEntry {
+    target: WorkspaceTimeScrubberTarget,
+    label: String,
+}
+
 /// Primary output modes stay visible even when their backing server endpoint
 /// is not yet present. This makes capability gaps explicit without burying
 /// the workflows among import and research tools.
@@ -9295,6 +9311,133 @@ impl ModelDataDock {
         ui.add_space(6.0);
     }
 
+    /// Always-visible forecast-time control for the source selected in the
+    /// workspace header. The slider moves through advertised axis positions,
+    /// not numeric hour ranges: sparse local manifests and non-contiguous
+    /// signed remote storage slots therefore remain exact.
+    fn workspace_time_scrubber(&mut self, ui: &mut egui::Ui) {
+        let (axis, selected_target, empty_message) = match self.workspace_source {
+            ModelWorkspaceSource::LocalStore => {
+                let selected = self.browser.selected();
+                let axis = selected
+                    .and_then(|selected| {
+                        self.tree
+                            .as_ref()
+                            .map(|tree| local_time_scrubber_axis(tree, selected))
+                    })
+                    .unwrap_or_default();
+                (
+                    axis,
+                    selected.cloned().map(WorkspaceTimeScrubberTarget::Local),
+                    "Choose a model run from the library to see its loaded forecast times.",
+                )
+            }
+            ModelWorkspaceSource::RemoteCatalog => {
+                let axis = self
+                    .remote_profile_catalog
+                    .as_ref()
+                    .map(|catalog| remote_time_scrubber_axis(&catalog.axis))
+                    .unwrap_or_default();
+                (
+                    axis,
+                    Some(WorkspaceTimeScrubberTarget::RemoteCatalogIndex(
+                        self.remote_selected_time,
+                    )),
+                    "Load a signed remote model/run catalog to see its forecast times.",
+                )
+            }
+        };
+
+        let selected_index = selected_target
+            .as_ref()
+            .and_then(|target| time_scrubber_selected_index(&axis, target));
+        let mut picked_index = selected_index.unwrap_or(0);
+        let selected_label = selected_index
+            .and_then(|index| axis.get(index))
+            .map(|entry| entry.label.as_str());
+        let theme = crate::ui_theme::theme();
+
+        egui::Frame::new()
+            .fill(theme.inset)
+            .stroke(egui::Stroke::new(1.0, theme.hairline))
+            .corner_radius(5)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(model_section_heading("Forecast time"));
+                    if let Some(label) = selected_label {
+                        ui.monospace(label);
+                    } else {
+                        ui.weak(empty_message);
+                    }
+                });
+
+                if axis.is_empty() {
+                    return;
+                }
+
+                ui.horizontal(|ui| {
+                    let last_index = axis.len() - 1;
+                    if ui
+                        .add_enabled(picked_index > 0, egui::Button::new("<"))
+                        .on_hover_text("Previous advertised forecast time")
+                        .clicked()
+                    {
+                        picked_index -= 1;
+                    }
+
+                    let spacing = ui.spacing().item_spacing.x;
+                    let position_label = format!("{} / {}", picked_index + 1, axis.len());
+                    let position_width = ui
+                        .painter()
+                        .layout_no_wrap(
+                            position_label.clone(),
+                            egui::TextStyle::Monospace.resolve(ui.style()),
+                            egui::Color32::PLACEHOLDER,
+                        )
+                        .size()
+                        .x;
+                    ui.spacing_mut().slider_width =
+                        (ui.available_width() - position_width - 44.0 - spacing * 3.0)
+                            .max(crate::panel_kit::SLIDER_TRACK_MIN_W);
+                    ui.add_enabled_ui(axis.len() > 1, |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut picked_index, 0..=last_index).show_value(false),
+                        )
+                    })
+                    .inner
+                    .on_hover_text("Scrub the advertised model forecast-time axis");
+
+                    if ui
+                        .add_enabled(picked_index < last_index, egui::Button::new(">"))
+                        .on_hover_text("Next advertised forecast time")
+                        .clicked()
+                    {
+                        picked_index += 1;
+                    }
+                    ui.monospace(format!("{} / {}", picked_index + 1, axis.len()));
+                });
+            });
+
+        if selected_index == Some(picked_index) {
+            return;
+        }
+        let Some(target) = axis.get(picked_index).map(|entry| entry.target.clone()) else {
+            return;
+        };
+        match target {
+            WorkspaceTimeScrubberTarget::Local(hour) => {
+                self.select_hour_key(hour);
+            }
+            WorkspaceTimeScrubberTarget::RemoteCatalogIndex(index) => {
+                if self.remote_selected_time != index {
+                    self.remote_selected_time = index;
+                    self.apply_remote_time_controls_change();
+                }
+            }
+        }
+    }
+
     fn local_ensemble_product_controls(&mut self, ui: &mut egui::Ui) {
         if matches!(self.local_ensemble_catalog, LocalEnsembleCatalogState::Idle)
             && self.browser.selected().is_some()
@@ -9624,6 +9767,29 @@ impl ModelDataDock {
         }
     }
 
+    fn apply_remote_time_controls_change(&mut self) {
+        self.invalidate_remote_output(true);
+        if let Some(catalog) = self.remote_profile_catalog.as_ref() {
+            self.remote_selected_variable = retain_or_first_remote_variable(
+                self.remote_selected_variable.take(),
+                &catalog.variables,
+                self.workspace_mode,
+                catalog
+                    .axis
+                    .get(self.remote_selected_time)
+                    .map(|time| time.storage_slot),
+            );
+            self.remote_selected_level_hpa = remote_selected_level(
+                self.remote_selected_level_hpa,
+                self.remote_selected_variable.as_deref(),
+                &catalog.variables,
+            );
+        }
+        if self.workspace_mode == ModelWorkspaceMode::Sounding {
+            let _ = self.install_cached_remote_sounding();
+        }
+    }
+
     fn remote_source_picker(&mut self, ui: &mut egui::Ui) {
         if self.federation_proxy_enabled {
             let verified_origins = self
@@ -9904,26 +10070,7 @@ impl ModelDataDock {
             }
         }
         if time_controls_changed {
-            self.invalidate_remote_output(true);
-            if let Some(catalog) = self.remote_profile_catalog.as_ref() {
-                self.remote_selected_variable = retain_or_first_remote_variable(
-                    self.remote_selected_variable.take(),
-                    &catalog.variables,
-                    self.workspace_mode,
-                    catalog
-                        .axis
-                        .get(self.remote_selected_time)
-                        .map(|time| time.storage_slot),
-                );
-                self.remote_selected_level_hpa = remote_selected_level(
-                    self.remote_selected_level_hpa,
-                    self.remote_selected_variable.as_deref(),
-                    &catalog.variables,
-                );
-            }
-            if self.workspace_mode == ModelWorkspaceMode::Sounding {
-                let _ = self.install_cached_remote_sounding();
-            }
+            self.apply_remote_time_controls_change();
         }
         if explicit_historical_relay_allowed(self.workspace_mode, true) {
             ui.add_enabled(
@@ -10138,6 +10285,7 @@ impl ModelDataDock {
         self.handle_responses();
 
         self.workspace_primary_controls(ui);
+        self.workspace_time_scrubber(ui);
 
         egui::Panel::left("model_runs")
             .resizable(true)
@@ -10460,6 +10608,50 @@ fn selected_hour_label(hour: &HourKey) -> String {
         hour.run,
         hour.time_label()
     )
+}
+
+fn local_time_scrubber_axis(
+    tree: &StoreTree,
+    selected: &HourKey,
+) -> Vec<WorkspaceTimeScrubberEntry> {
+    tree.run(&selected.model, &selected.run)
+        .map(|run| {
+            run.hours
+                .iter()
+                .map(|entry| {
+                    let hour = HourKey {
+                        model: selected.model.clone(),
+                        run: selected.run.clone(),
+                        hour: entry.hour,
+                        exact_time: entry.exact_time,
+                    };
+                    WorkspaceTimeScrubberEntry {
+                        label: hour.time_label(),
+                        target: WorkspaceTimeScrubberTarget::Local(hour),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn remote_time_scrubber_axis(
+    axis: &[crate::community_cache::RemoteTimePoint],
+) -> Vec<WorkspaceTimeScrubberEntry> {
+    axis.iter()
+        .enumerate()
+        .map(|(index, time)| WorkspaceTimeScrubberEntry {
+            target: WorkspaceTimeScrubberTarget::RemoteCatalogIndex(index),
+            label: remote_time_label(time),
+        })
+        .collect()
+}
+
+fn time_scrubber_selected_index(
+    axis: &[WorkspaceTimeScrubberEntry],
+    selected: &WorkspaceTimeScrubberTarget,
+) -> Option<usize> {
+    axis.iter().position(|entry| &entry.target == selected)
 }
 
 fn display_product_level_label(variable: &str) -> String {
@@ -12539,15 +12731,10 @@ fn remote_temporal_summary_ui(ui: &mut egui::Ui, result: &rw_query::TemporalGrid
 }
 
 fn remote_time_label(time: &crate::community_cache::RemoteTimePoint) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(time.valid_unix, 0).map_or_else(
-        || format!("slot {} · valid {}", time.storage_slot, time.valid_unix),
-        |valid| {
-            format!(
-                "slot {} · {} UTC",
-                time.storage_slot,
-                valid.format("%Y-%m-%d %H:%M")
-            )
-        },
+    format!(
+        "{} · {}",
+        rw_ui::format_lead_seconds(time.lead_seconds),
+        rw_ui::format_valid_unix(time.valid_unix)
     )
 }
 
@@ -15544,6 +15731,97 @@ mod tests {
             }],
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn local_time_scrubber_uses_sparse_manifest_axis() {
+        let tree = tree_with_runs("hrrr", &[("20260814_00z", &[0, 3, 9, 18])]);
+        let selected = HourKey {
+            model: "hrrr".to_owned(),
+            run: "20260814_00z".to_owned(),
+            hour: 9,
+            exact_time: None,
+        };
+
+        let axis = local_time_scrubber_axis(&tree, &selected);
+        let hours = axis
+            .iter()
+            .map(|entry| match &entry.target {
+                WorkspaceTimeScrubberTarget::Local(hour) => hour.hour,
+                WorkspaceTimeScrubberTarget::RemoteCatalogIndex(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(hours, vec![0, 3, 9, 18]);
+        assert_eq!(
+            time_scrubber_selected_index(&axis, &WorkspaceTimeScrubberTarget::Local(selected),),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn local_time_scrubber_preserves_exact_time_metadata() {
+        let first = rw_store::RwsExactTime::new(1_800, 1_786_492_800);
+        let second = rw_store::RwsExactTime::new(9_900, 1_786_500_900);
+        let tree = exact_formula_tree(&[(4, first), (17, second)]);
+        let selected = HourKey {
+            model: "wrf".to_owned(),
+            run: "research".to_owned(),
+            hour: 17,
+            exact_time: Some(second),
+        };
+
+        let axis = local_time_scrubber_axis(&tree, &selected);
+        let first_key = HourKey {
+            model: "wrf".to_owned(),
+            run: "research".to_owned(),
+            hour: 4,
+            exact_time: Some(first),
+        };
+
+        assert_eq!(axis.len(), 2);
+        assert_eq!(axis[0].label, first_key.time_label());
+        assert_eq!(
+            time_scrubber_selected_index(&axis, &WorkspaceTimeScrubberTarget::Local(selected),),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn remote_time_scrubber_uses_catalog_order_not_sparse_storage_slots() {
+        let catalog_axis = vec![
+            crate::community_cache::RemoteTimePoint {
+                storage_slot: 2,
+                lead_seconds: 0,
+                valid_unix: 0,
+            },
+            crate::community_cache::RemoteTimePoint {
+                storage_slot: 11,
+                lead_seconds: 5_400,
+                valid_unix: 5_400,
+            },
+            crate::community_cache::RemoteTimePoint {
+                storage_slot: 42,
+                lead_seconds: 12_600,
+                valid_unix: 12_600,
+            },
+        ];
+
+        let axis = remote_time_scrubber_axis(&catalog_axis);
+        let targets = axis
+            .iter()
+            .map(|entry| entry.target.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            targets,
+            vec![
+                WorkspaceTimeScrubberTarget::RemoteCatalogIndex(0),
+                WorkspaceTimeScrubberTarget::RemoteCatalogIndex(1),
+                WorkspaceTimeScrubberTarget::RemoteCatalogIndex(2),
+            ]
+        );
+        assert_eq!(axis[1].label, "+01:30:00 · 1970-01-01 01:30:00Z");
     }
 
     #[test]

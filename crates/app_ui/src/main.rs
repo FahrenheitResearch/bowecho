@@ -21827,7 +21827,7 @@ impl eframe::App for ViewerApp {
         // Drain the flexible-download worker every frame, not just while its
         // UI is visible — closing the Model window mid-download used to
         // stall progress reporting until reopened.
-        self.pump_ingest_responses();
+        self.pump_ingest_responses(&ctx);
         self.poll_surface_obs(&ctx);
         self.river_gauges.poll();
         if self.sync_surface_obs_hour_loop_visibility(Instant::now()) {
@@ -26631,8 +26631,8 @@ impl ViewerApp {
     fn radar_quick_playback_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Keep the quick surface compact for both the primary view and a
         // focused independent pane. The detailed status/record/sweep controls
-        // remain in Advanced; this surface owns transport plus one directly
-        // clickable, horizontally bounded frame strip.
+        // remain in Advanced; this surface owns transport plus the full-width
+        // frame scrubber users rely on to move through loaded history.
         let target = self
             .focused_extra_pane_loop_slot()
             .map(LoopTimelineTarget::ExtraPane)
@@ -26709,34 +26709,21 @@ impl ViewerApp {
             self.loop_speed_combo_ui(ui, ctx, speed_id);
         });
 
-        let strip_id = match target {
-            LoopTimelineTarget::Primary => egui::Id::new("radar_quick_frame_strip"),
-            LoopTimelineTarget::ExtraPane(slot) => egui::Id::new(("radar_quick_frame_strip", slot)),
-        };
-        let time_zone = self.time_zone();
-        let now_utc = Utc::now();
-        let clicked_frame = match target {
-            LoopTimelineTarget::Primary => compact_loaded_frame_strip(
-                ui,
-                &self.primary.history,
-                selected_frame_index,
-                time_zone,
-                now_utc,
-                strip_id,
-            ),
-            LoopTimelineTarget::ExtraPane(slot) => self.extra_panes.get(slot).and_then(|pane| {
-                compact_loaded_frame_strip(
-                    ui,
-                    &pane.engine.history,
-                    selected_frame_index,
-                    time_zone,
-                    now_utc,
-                    strip_id,
-                )
-            }),
-        };
-        if let Some(index) = clicked_frame {
-            next_frame_index = Some(index);
+        // A slider remains usable at narrow sidebar widths and gives every
+        // loaded frame an immediate, stable position. Timestamp cards made
+        // this panel taller and hid most frames behind horizontal scrolling.
+        let mut slider_index = selected_frame_index;
+        let slider_changed = ui
+            .add_enabled_ui(frame_count > 1, |ui| {
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - PANEL_BUTTON_HEIGHT).max(panel_kit::SLIDER_TRACK_MIN_W);
+                ui.add(egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false))
+            })
+            .inner
+            .on_hover_text("Scrub loaded radar frame history")
+            .changed();
+        if slider_changed {
+            next_frame_index = Some(slider_index);
         }
 
         if let Some(delta) = timeline_step_delta {
@@ -34444,7 +34431,11 @@ impl ViewerApp {
         include_f01: bool,
         ctx: &egui::Context,
     ) {
-        if self.model_ingest_rx.is_some() {
+        if model_ingest_start_conflict(
+            self.model_ingest_rx.is_some(),
+            self.download_panel.is_running(),
+        ) {
+            self.status = "A model download is already running".to_owned();
             return;
         }
         let hours_label = if include_f01 { "f00–f01" } else { "f00" };
@@ -35511,7 +35502,9 @@ impl ViewerApp {
                                 .id_salt("model_window_download_scroll")
                                 .max_height(380.0)
                                 .show(ui, |ui| {
-                                    events.extend(self.download_panel.ui(ui));
+                                    ui.add_enabled_ui(self.model_ingest_rx.is_none(), |ui| {
+                                        events.extend(self.download_panel.ui(ui));
+                                    });
                                 });
                         });
                 });
@@ -35577,24 +35570,26 @@ impl ViewerApp {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Fetch f00 from the newest published HRRR cycle; include f01 only when you need the next forecast hour.",
+                        "Fetch f00 from the newest HRRR cycle complete for both prs+sfc; include f01 only when you need the next forecast hour.",
                     )
                     .small()
                     .weak(),
                 );
                 ui.add_space(3.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Processing");
-                    egui::ComboBox::from_id_salt("quick_hrrr_processing")
-                        .selected_text(processing.label())
-                        .show_ui(ui, |ui| {
-                            for choice in QuickHrrrProcessing::ALL {
-                                ui.selectable_value(&mut processing, choice, choice.label())
-                                    .on_hover_text(choice.description());
-                            }
-                        });
-                    ui.checkbox(&mut include_f01, "Include f01")
-                        .on_hover_text("Fetch f00 and f01 instead of analysis hour f00 only");
+                ui.add_enabled_ui(!fetching && !running, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Processing");
+                        egui::ComboBox::from_id_salt("quick_hrrr_processing")
+                            .selected_text(processing.label())
+                            .show_ui(ui, |ui| {
+                                for choice in QuickHrrrProcessing::ALL {
+                                    ui.selectable_value(&mut processing, choice, choice.label())
+                                        .on_hover_text(choice.description());
+                                }
+                            });
+                        ui.checkbox(&mut include_f01, "Include f01")
+                            .on_hover_text("Fetch f00 and f01 instead of analysis hour f00 only");
+                    });
                 });
                 ui.horizontal_wrapped(|ui| {
                     let hour_label = if include_f01 { "f00–f01" } else { "f00" };
@@ -35607,7 +35602,7 @@ impl ViewerApp {
                             ),
                         )
                         .on_hover_text(format!(
-                            "Fetch {hour_label} from the newest available HRRR cycle using {}. Heavy/eCAPE processing is always off.",
+                            "Fetch {hour_label} from one newest complete HRRR prs+sfc cycle using {}. Heavy/eCAPE processing is always off.",
                             processing.label(),
                         ))
                         .on_disabled_hover_text("A model download is already running")
@@ -35886,6 +35881,24 @@ impl ViewerApp {
                     if self.download_panel.spec() != &spec {
                         self.download_panel.set_spec(spec.clone());
                     }
+                    if model_ingest_start_conflict(
+                        self.model_ingest_rx.is_some(),
+                        self.download_panel.is_running(),
+                    ) {
+                        self.status = "A model download is already running".to_owned();
+                        continue;
+                    }
+                    let hours = match rw_ingest::ingest_hour::parse_hours(&spec.hours) {
+                        Ok(hours) => hours,
+                        Err(err) => {
+                            self.download_panel.set_spec_error(err.to_string());
+                            continue;
+                        }
+                    };
+                    // Latch synchronously with the click. Waiting for the
+                    // worker's Started response left a multi-frame window in
+                    // which another detailed or quick start could overlap it.
+                    self.download_panel.begin_run(&hours);
                     ingest.send(ingest_worker::IngestRequest::Start(spec));
                 }
                 rw_ui::DownloadEvent::CancelRequested => {
@@ -35895,71 +35908,84 @@ impl ViewerApp {
         }
     }
 
-    fn pump_ingest_responses(&mut self) {
+    fn pump_ingest_responses(&mut self, ctx: &egui::Context) {
         let mut rescan = false;
-        if let Some(ingest) = &self.ingest {
-            while let Some(response) = ingest.try_recv() {
-                match response {
-                    ingest_worker::IngestResponse::Estimate(result) => match *result {
-                        Ok(view) => self.download_panel.set_estimate(view),
-                        Err(message) => self.download_panel.set_spec_error(message),
-                    },
-                    ingest_worker::IngestResponse::Availability(view) => {
-                        if view.matches(self.download_panel.spec()) {
-                            self.download_panel.set_availability(view);
-                        }
+        let mut disconnected = false;
+        loop {
+            let response = match self.ingest.as_ref().map(|ingest| ingest.try_recv()) {
+                Some(ingest_worker::IngestPoll::Response(response)) => response,
+                Some(ingest_worker::IngestPoll::Empty) | None => break,
+                Some(ingest_worker::IngestPoll::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            };
+            match response {
+                ingest_worker::IngestResponse::Estimate(result) => match *result {
+                    Ok(view) => self.download_panel.set_estimate(view),
+                    Err(message) => self.download_panel.set_spec_error(message),
+                },
+                ingest_worker::IngestResponse::Availability(view) => {
+                    if view.matches(self.download_panel.spec()) {
+                        self.download_panel.set_availability(view);
                     }
-                    ingest_worker::IngestResponse::Latest { model, date, cycle } => {
-                        if model != self.download_panel.spec().model {
-                            continue;
-                        }
-                        self.download_panel.set_latest(date, cycle);
-                        let spec =
-                            normalize_model_download_spec(self.download_panel.spec().clone());
-                        if self.download_panel.spec() != &spec {
-                            self.download_panel.set_spec(spec.clone());
-                        }
-                        sync_run_pickers(&mut self.download_panel, &spec);
+                }
+                ingest_worker::IngestResponse::Latest { model, date, cycle } => {
+                    if model != self.download_panel.spec().model {
+                        continue;
+                    }
+                    self.download_panel.set_latest(date, cycle);
+                    let spec = normalize_model_download_spec(self.download_panel.spec().clone());
+                    if self.download_panel.spec() != &spec {
+                        self.download_panel.set_spec(spec.clone());
+                    }
+                    sync_run_pickers(&mut self.download_panel, &spec);
+                    if let Some(ingest) = &self.ingest {
                         ingest.send(ingest_worker::IngestRequest::Estimate(spec));
                     }
-                    ingest_worker::IngestResponse::LatestFailed { model, message } => {
-                        if model == self.download_panel.spec().model {
-                            self.download_panel.set_probing_failed(message);
-                        }
+                }
+                ingest_worker::IngestResponse::LatestFailed { model, message } => {
+                    if model == self.download_panel.spec().model {
+                        self.download_panel.set_probing_failed(message);
                     }
-                    ingest_worker::IngestResponse::Started { hours } => {
-                        self.download_panel.begin_run(&hours);
-                    }
-                    ingest_worker::IngestResponse::StageStarted { hour, stage } => {
-                        self.download_panel.apply_stage_started(hour, stage);
-                    }
-                    ingest_worker::IngestResponse::StageDone { hour, stage, ms } => {
-                        self.download_panel.apply_stage_done(hour, stage, ms);
-                    }
-                    ingest_worker::IngestResponse::Note(message) => {
-                        self.download_panel.apply_note(message);
-                    }
-                    ingest_worker::IngestResponse::HourDone(done) => {
-                        self.download_panel.apply_hour_done(done);
-                        rescan = true;
-                    }
-                    ingest_worker::IngestResponse::Finished => {
-                        self.download_panel.finish_run(Ok(()));
-                        rescan = true;
-                    }
-                    ingest_worker::IngestResponse::Cancelled => {
-                        self.download_panel.finish_cancelled();
-                        rescan = true;
-                    }
-                    ingest_worker::IngestResponse::Failed(message) => {
-                        if self.download_panel.is_running() {
-                            self.download_panel.finish_run(Err(message));
-                        } else {
-                            self.download_panel.set_spec_error(message);
-                        }
+                }
+                ingest_worker::IngestResponse::Started { hours } => {
+                    self.download_panel.begin_run(&hours);
+                }
+                ingest_worker::IngestResponse::StageStarted { hour, stage } => {
+                    self.download_panel.apply_stage_started(hour, stage);
+                }
+                ingest_worker::IngestResponse::StageDone { hour, stage, ms } => {
+                    self.download_panel.apply_stage_done(hour, stage, ms);
+                }
+                ingest_worker::IngestResponse::Note(message) => {
+                    self.download_panel.apply_note(message);
+                }
+                ingest_worker::IngestResponse::HourDone(done) => {
+                    self.download_panel.apply_hour_done(done);
+                    rescan = true;
+                }
+                ingest_worker::IngestResponse::Finished => {
+                    self.download_panel.finish_run(Ok(()));
+                    rescan = true;
+                }
+                ingest_worker::IngestResponse::Cancelled => {
+                    self.download_panel.finish_cancelled();
+                    rescan = true;
+                }
+                ingest_worker::IngestResponse::Failed(message) => {
+                    if self.download_panel.is_running() {
+                        self.download_panel.finish_run(Err(message));
+                    } else {
+                        self.download_panel.set_spec_error(message);
                     }
                 }
             }
+        }
+        if disconnected {
+            fail_download_for_ingest_worker_disconnect(&mut self.download_panel);
+            self.ingest = None;
+            self.ensure_ingest_worker_started(ctx);
         }
         if rescan {
             // New hours on disk: refresh the model dock + retention pass.
@@ -47093,6 +47119,21 @@ fn draw_halo_text(
     painter.text(position, align, text, font, text_color);
 }
 
+const INGEST_WORKER_STOPPED_MESSAGE: &str =
+    "Model download worker stopped unexpectedly. Retry the download.";
+
+fn fail_download_for_ingest_worker_disconnect(panel: &mut rw_ui::DownloadPanel) {
+    if panel.is_running() {
+        panel.finish_run(Err(INGEST_WORKER_STOPPED_MESSAGE.to_owned()));
+    } else {
+        panel.set_spec_error(INGEST_WORKER_STOPPED_MESSAGE.to_owned());
+    }
+}
+
+fn model_ingest_start_conflict(quick_running: bool, detailed_running: bool) -> bool {
+    quick_running || detailed_running
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QuickHrrrProcessing {
     Sounding,
@@ -47161,10 +47202,10 @@ fn quick_hrrr_hours(include_f01: bool) -> std::ops::RangeInclusive<u16> {
 
 /// In-process one-click HRRR ingest via the rw-ingest library (typed
 /// per-stage progress + cooperative cancel; atomic writes mean cancel never
-/// leaves a partial hour). The quick path is deliberately narrow: the newest
-/// plausible HRRR cycle, f00 with optional f01, and either sounding processing
-/// or full derived processing with eCAPE/heavy disabled. Custom model/cycle/
-/// hour downloads remain in the detailed download panel.
+/// leaves a partial hour). The quick path is deliberately narrow: one newest
+/// run proven complete for both HRRR prs+sfc at f00, f00 with optional f01,
+/// and either sounding processing or full derived processing with eCAPE/heavy
+/// disabled. Custom model/cycle/hour downloads remain in the detailed panel.
 fn run_model_ingest(
     processing: QuickHrrrProcessing,
     include_f01: bool,
@@ -47184,81 +47225,95 @@ fn run_model_ingest(
     let CACHE: &str = &cache_str;
     let label = model.as_str().to_uppercase();
     let model_slug = model.as_str().replace('-', "_");
-    let now = Utc::now();
-    let candidates = ingest_worker::recent_cycle_candidates(
-        now,
-        rustwx_models::model_summary(model).cycle_hours_utc,
-        ingest_worker::publication_lag_minutes(model),
-        2,
-    );
     let report = |line: String| {
         let _ = progress.send(line);
         ctx.request_repaint();
     };
-    let mut last_error = format!("{label}: no plausible cycle candidates");
-    'candidates: for (date, cycle_hour) in candidates {
-        let Ok(cycle) = rustwx_core::CycleSpec::new(&date, cycle_hour) else {
-            continue;
-        };
-        let profile = processing.ingest_profile();
-        let run_slug = format!("{date}_{cycle_hour:02}z");
-        let progress_sink = std::sync::Mutex::new(progress.clone());
-        let ctx_sink = ctx.clone();
-        let stage_label = label.clone();
-        let on_event = move |event: rw_ingest::IngestEvent| {
-            if let rw_ingest::IngestEvent::StageStarted { hour, stage } = event
-                && let Ok(sender) = progress_sink.lock()
-            {
-                let _ = sender.send(format!("{stage_label} f{hour:02}: {stage:?}…"));
-                ctx_sink.request_repaint();
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("cancelled".to_owned());
+    }
+    let availability_hour = u16::from(include_f01);
+    report(format!(
+        "{label}: finding newest complete prs+sfc run through f{availability_hour:02}…"
+    ));
+    let date_yyyymmdd = Utc::now().format("%Y%m%d").to_string();
+    let latest = rustwx_models::latest_available_run_for_products_at_forecast_hour(
+        model,
+        None,
+        &date_yyyymmdd,
+        &["prs", "sfc"],
+        availability_hour,
+    )
+    .map_err(|err| {
+        format!(
+            "{label}: latest complete prs+sfc run through f{availability_hour:02} probe failed: {err}"
+        )
+    })?;
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("cancelled".to_owned());
+    }
+
+    let cycle = latest.cycle;
+    let source = latest.source;
+    let date = cycle.date_yyyymmdd.clone();
+    let cycle_hour = cycle.hour_utc;
+    let profile = processing.ingest_profile();
+    let run_slug = format!("{date}_{cycle_hour:02}z");
+    report(format!(
+        "{label}: selected {date} {cycle_hour:02}z via {source}"
+    ));
+    let progress_sink = std::sync::Mutex::new(progress.clone());
+    let ctx_sink = ctx.clone();
+    let stage_label = label.clone();
+    let on_event = move |event: rw_ingest::IngestEvent| {
+        if let rw_ingest::IngestEvent::StageStarted { hour, stage } = event
+            && let Ok(sender) = progress_sink.lock()
+        {
+            let _ = sender.send(format!("{stage_label} f{hour:02}: {stage:?}…"));
+            ctx_sink.request_repaint();
+        }
+    };
+    let config = rw_ingest::IngestConfig {
+        model,
+        cycle: &cycle,
+        source_override: Some(source),
+        cache_root: std::path::Path::new(CACHE),
+        use_cache: true,
+        store_root: std::path::Path::new(STORE),
+        model_slug: &model_slug,
+        run_slug: &run_slug,
+        profile: &profile,
+        verify: false,
+        progress: &on_event,
+        cancel,
+    };
+    for hour in quick_hrrr_hours(include_f01) {
+        match rw_ingest::ingest_hour_serial(&config, hour) {
+            Ok(_) => {
+                report(format!("{label} {date} {cycle_hour:02}z f{hour:02} stored"));
             }
-        };
-        let config = rw_ingest::IngestConfig {
-            model,
-            cycle: &cycle,
-            source_override: None,
-            cache_root: std::path::Path::new(CACHE),
-            use_cache: true,
-            store_root: std::path::Path::new(STORE),
-            model_slug: &model_slug,
-            run_slug: &run_slug,
-            profile: &profile,
-            verify: false,
-            progress: &on_event,
-            cancel,
-        };
-        for hour in quick_hrrr_hours(include_f01) {
-            match rw_ingest::ingest_hour_serial(&config, hour) {
-                Ok(_) => {
-                    report(format!("{label} {date} {cycle_hour:02}z f{hour:02} stored"));
-                }
-                Err(rw_ingest::IngestError::Cancelled) => {
-                    return Err("cancelled".to_owned());
-                }
-                Err(err) => {
-                    last_error = format!("{label}: {err}");
-                    // This cycle likely isn't published yet — try the
-                    // previous one (unless some hours already landed, in
-                    // which case report the partial truthfully).
-                    if hour == 0 {
-                        continue 'candidates;
-                    }
-                    prune_model_store(STORE, keep_runs);
-                    return Ok(format!(
-                        "{label} {date} {cycle_hour:02}z: f00–f{:02} stored (f{hour:02} failed: {last_error})",
-                        hour - 1
-                    ));
-                }
+            Err(rw_ingest::IngestError::Cancelled) => {
+                return Err("cancelled".to_owned());
+            }
+            Err(err) => {
+                prune_model_store(STORE, keep_runs);
+                let landed = if hour == 0 {
+                    String::new()
+                } else {
+                    " after f00 stored".to_owned()
+                };
+                return Err(format!(
+                    "{label} {date} {cycle_hour:02}z f{hour:02} failed{landed}: {err}"
+                ));
             }
         }
-        prune_model_store(STORE, keep_runs);
-        let hours = if include_f01 { "f00–f01" } else { "f00" };
-        return Ok(format!(
-            "{label} {date} {cycle_hour:02}z {hours} ingested · {}",
-            processing.label()
-        ));
     }
-    Err(last_error)
+    prune_model_store(STORE, keep_runs);
+    let hours = if include_f01 { "f00–f01" } else { "f00" };
+    Ok(format!(
+        "{label} {date} {cycle_hour:02}z {hours} ingested · {}",
+        processing.label()
+    ))
 }
 
 /// Keep only the newest `keep` run directories under store/<model>/
@@ -50501,107 +50556,6 @@ fn live_chunk_readout_row(ui: &mut egui::Ui, readout: Option<String>) -> egui::R
     ui.add(egui::Label::new(egui::RichText::new(text).weak()).truncate())
 }
 
-const COMPACT_PLAYBACK_FRAME_WIDTH: f32 = 88.0;
-const COMPACT_PLAYBACK_FRAME_HEIGHT: f32 = 40.0;
-
-fn compact_loaded_frame_strip(
-    ui: &mut egui::Ui,
-    frames: &[FrameHistoryEntry],
-    selected_index: usize,
-    time_zone: DisplayTimeZone,
-    now_utc: DateTime<Utc>,
-    strip_id: egui::Id,
-) -> Option<usize> {
-    if frames.is_empty() {
-        return None;
-    }
-
-    let selected_index = selected_index.min(frames.len() - 1);
-    let selected_signature = (
-        selected_index,
-        frames[selected_index]
-            .identity
-            .scan_time_utc
-            .timestamp_millis(),
-    );
-    let selection_memory_id = strip_id.with("selected_frame");
-    let selection_changed = ui.ctx().data_mut(|data| {
-        let previous = data.get_temp::<(usize, i64)>(selection_memory_id);
-        data.insert_temp(selection_memory_id, selected_signature);
-        previous != Some(selected_signature)
-    });
-
-    let mut clicked_index = None;
-    egui::ScrollArea::horizontal()
-        .id_salt(strip_id)
-        .auto_shrink([false, true])
-        .max_height(COMPACT_PLAYBACK_FRAME_HEIGHT + 12.0)
-        .stick_to_right(true)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (index, frame) in frames.iter().enumerate() {
-                    let selected = index == selected_index;
-                    let label = compact_playback_frame_label(
-                        frame.identity.scan_time_utc,
-                        frame.status,
-                        selected,
-                        time_zone,
-                    );
-                    let mut text = egui::RichText::new(label).monospace();
-                    if selected {
-                        text = text.strong();
-                    }
-                    let response = ui.add_sized(
-                        egui::vec2(
-                            COMPACT_PLAYBACK_FRAME_WIDTH,
-                            COMPACT_PLAYBACK_FRAME_HEIGHT,
-                        ),
-                        egui::Button::selectable(selected, text),
-                    );
-                    if selected && selection_changed {
-                        response.scroll_to_me(Some(egui::Align::Center));
-                    }
-                    let selected_label = if selected { "Selected " } else { "" };
-                    if response
-                        .on_hover_text(format!(
-                            "{selected_label}frame {} of {}\n{}\nClick, or focus with Tab and press Enter/Space. Shift+wheel or drag the bar to scan loaded frames.",
-                            index + 1,
-                            frames.len(),
-                            frame_status_text(frame, now_utc, time_zone)
-                        ))
-                        .clicked()
-                    {
-                        clicked_index = Some(index);
-                    }
-                }
-            });
-        });
-    clicked_index
-}
-
-fn playback_frame_completion_label(status: FrameStatus) -> &'static str {
-    match status {
-        FrameStatus::Local => "LOCAL",
-        FrameStatus::Preview | FrameStatus::LivePartial => "BUILDING",
-        FrameStatus::LiveComplete | FrameStatus::Complete => "COMPLETE",
-        FrameStatus::Stale => "STALE",
-    }
-}
-
-fn compact_playback_frame_label(
-    scan_time_utc: DateTime<Utc>,
-    status: FrameStatus,
-    selected: bool,
-    time_zone: DisplayTimeZone,
-) -> String {
-    let selected_marker = if selected { "\u{25b6}" } else { "" };
-    format!(
-        "{selected_marker}{}\n{}",
-        time_zone.format_hm(scan_time_utc),
-        playback_frame_completion_label(status)
-    )
-}
-
 fn compact_frame_label(
     frame: &FrameHistoryEntry,
     now_utc: DateTime<Utc>,
@@ -51001,41 +50955,6 @@ fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn playback_frame_completion_labels_partial_data_as_building_only() {
-        for status in [FrameStatus::Preview, FrameStatus::LivePartial] {
-            assert_eq!(playback_frame_completion_label(status), "BUILDING");
-        }
-        for status in [FrameStatus::LiveComplete, FrameStatus::Complete] {
-            assert_eq!(playback_frame_completion_label(status), "COMPLETE");
-        }
-        assert_eq!(playback_frame_completion_label(FrameStatus::Local), "LOCAL");
-        assert_eq!(playback_frame_completion_label(FrameStatus::Stale), "STALE");
-    }
-
-    #[test]
-    fn compact_playback_frame_label_exposes_time_status_and_textual_selection() {
-        let scan_time = Utc.with_ymd_and_hms(2026, 8, 13, 17, 58, 45).unwrap();
-        assert_eq!(
-            compact_playback_frame_label(
-                scan_time,
-                FrameStatus::LivePartial,
-                true,
-                DisplayTimeZone::Utc,
-            ),
-            "\u{25b6}17:58Z\nBUILDING"
-        );
-        assert_eq!(
-            compact_playback_frame_label(
-                scan_time,
-                FrameStatus::Complete,
-                false,
-                DisplayTimeZone::Utc,
-            ),
-            "17:58Z\nCOMPLETE"
-        );
-    }
 
     #[test]
     fn floating_window_accent_tints_surface_and_owns_title_and_outline() {
@@ -76109,6 +76028,28 @@ mod tests {
             "quick processing must never enable eCAPE/heavy"
         );
         assert_eq!(QuickHrrrProcessing::FullNoHeavy.profile_slug(), "full");
+    }
+
+    #[test]
+    fn model_ingest_start_latch_blocks_quick_and_detailed_overlap() {
+        assert!(!model_ingest_start_conflict(false, false));
+        assert!(model_ingest_start_conflict(true, false));
+        assert!(model_ingest_start_conflict(false, true));
+        assert!(model_ingest_start_conflict(true, true));
+    }
+
+    #[test]
+    fn ingest_worker_disconnect_finishes_a_latched_detailed_run_as_failed() {
+        let mut panel = rw_ui::DownloadPanel::new(default_download_spec("hrrr"));
+        panel.begin_run(&[0, 1]);
+
+        fail_download_for_ingest_worker_disconnect(&mut panel);
+
+        assert!(matches!(
+            panel.run_state(),
+            rw_ui::DownloadRunState::Failed(message)
+                if message == INGEST_WORKER_STOPPED_MESSAGE
+        ));
     }
 
     #[test]

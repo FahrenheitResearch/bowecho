@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -81,6 +81,18 @@ pub enum IngestResponse {
     Failed(String),
 }
 
+/// Result of a non-blocking poll of the ingest worker response channel.
+///
+/// `Empty` means the worker is still connected but has not produced another
+/// response yet. `Disconnected` means every response sender has gone away, so
+/// the UI must terminate any active run instead of leaving it spinning.
+#[derive(Debug)]
+pub enum IngestPoll {
+    Response(IngestResponse),
+    Empty,
+    Disconnected,
+}
+
 /// Handle to the ingest worker thread.
 pub struct IngestWorker {
     tx: Sender<IngestRequest>,
@@ -120,8 +132,8 @@ impl IngestWorker {
     }
 
     /// Non-blocking poll for the next response (drain once per frame).
-    pub fn try_recv(&self) -> Option<IngestResponse> {
-        self.rx.try_recv().ok()
+    pub fn try_recv(&self) -> IngestPoll {
+        poll_response(&self.rx)
     }
 
     /// Request cancellation of the running ingest. Takes effect at the
@@ -129,6 +141,14 @@ impl IngestWorker {
     /// the request queue so it lands while a run is in progress.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn poll_response(receiver: &Receiver<IngestResponse>) -> IngestPoll {
+    match receiver.try_recv() {
+        Ok(response) => IngestPoll::Response(response),
+        Err(TryRecvError::Empty) => IngestPoll::Empty,
+        Err(TryRecvError::Disconnected) => IngestPoll::Disconnected,
     }
 }
 
@@ -857,6 +877,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn response_poll_distinguishes_empty_from_disconnected() {
+        let (sender, receiver) = channel::<IngestResponse>();
+
+        assert!(matches!(poll_response(&receiver), IngestPoll::Empty));
+
+        sender
+            .send(IngestResponse::Finished)
+            .expect("test receiver is connected");
+        assert!(matches!(
+            poll_response(&receiver),
+            IngestPoll::Response(IngestResponse::Finished)
+        ));
+
+        drop(sender);
+        assert!(matches!(poll_response(&receiver), IngestPoll::Disconnected));
+    }
+
     /// Field repro: GFS Latest/Download did nothing with no error. Drives
     /// the REAL worker thread with a gfs spec exactly like the panel does
     /// and requires a response for every request — a worker panic shows up
@@ -876,8 +914,12 @@ mod tests {
         let recv = |what: &str| -> IngestResponse {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
-                if let Some(response) = worker.try_recv() {
-                    return response;
+                match worker.try_recv() {
+                    IngestPoll::Response(response) => return response,
+                    IngestPoll::Empty => {}
+                    IngestPoll::Disconnected => {
+                        panic!("{what}: ingest worker disconnected before responding")
+                    }
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
