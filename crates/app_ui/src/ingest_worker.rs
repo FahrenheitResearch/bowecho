@@ -3,8 +3,8 @@
 //! that wires the two together is this shell — rw-ui stays free of ingest
 //! dependencies.
 //!
-//! One control thread owns a request channel (estimate / probe / latest /
-//! start); responses stream back as plain data and every response fires
+//! One control thread owns a request channel (estimate / probe / start);
+//! responses stream back as plain data and every response fires
 //! the `notify` hook (`ctx.request_repaint`). Cancellation bypasses the
 //! queue: [`IngestWorker::cancel`] flips a shared `AtomicBool` the ingest
 //! flow checks at stage boundaries.
@@ -39,8 +39,6 @@ pub enum IngestRequest {
     Estimate(DownloadSpec),
     /// Probe which forecast hours of the spec's run exist upstream.
     Probe(DownloadSpec),
-    /// Find the newest available run for the spec's model.
-    Latest(DownloadSpec),
     /// Run the download/ingest.
     Start(DownloadSpec),
 }
@@ -51,15 +49,6 @@ pub enum IngestResponse {
     /// `Err` carries a spec/validation problem for the panel's error slot.
     Estimate(Box<Result<EstimateView, String>>),
     Availability(AvailabilityView),
-    Latest {
-        model: String,
-        date: String,
-        cycle: u8,
-    },
-    LatestFailed {
-        model: String,
-        message: String,
-    },
     /// A run began over these hours.
     Started {
         hours: Vec<u16>,
@@ -202,9 +191,6 @@ fn worker_loop(
                     Arc::clone(&notify),
                 );
             }
-            IngestRequest::Latest(spec) => {
-                spawn_latest_task(spec, responses.clone(), Arc::clone(&notify));
-            }
             IngestRequest::Start(spec) => {
                 run_download(&mut state, &spec, responses, notify.as_ref(), cancel);
             }
@@ -238,35 +224,6 @@ fn spawn_probe_task(
             available: Vec::new(),
             note: Some(format!("availability probe could not start: {err}")),
         }));
-        notify_on_fail();
-    }
-}
-
-fn spawn_latest_task(
-    spec: DownloadSpec,
-    responses: Sender<IngestResponse>,
-    notify: Arc<dyn Fn() + Send + Sync + 'static>,
-) {
-    let model = spec.model.clone();
-    let fallback_model = model.clone();
-    let worker_responses = responses.clone();
-    let notify_on_fail = Arc::clone(&notify);
-    let spawn_result = std::thread::Builder::new()
-        .name("rw-ingest-latest".to_string())
-        .spawn(move || {
-            throttle::set_current_thread_background_priority();
-            let response = match find_latest(&spec) {
-                Ok((date, cycle)) => IngestResponse::Latest { model, date, cycle },
-                Err(message) => IngestResponse::LatestFailed { model, message },
-            };
-            let _ = worker_responses.send(response);
-            notify();
-        });
-    if let Err(err) = spawn_result {
-        let _ = responses.send(IngestResponse::LatestFailed {
-            model: fallback_model,
-            message: format!("latest-run probe could not start: {err}"),
-        });
         notify_on_fail();
     }
 }
@@ -542,42 +499,7 @@ fn probe_products(model: ModelId, profile: &IngestProfile) -> Result<Vec<&'stati
         .collect())
 }
 
-fn all_ingest_products(model: ModelId) -> Result<Vec<&'static str>, String> {
-    let mut products = Vec::new();
-    for entry in rw_ingest::fetch_plan(model).map_err(|err| err.to_string())? {
-        if !products.iter().any(|seen| seen == &entry.product) {
-            products.push(entry.product);
-        }
-    }
-    if products.is_empty() {
-        return Err(format!("model '{model}' has no probeable ingest products"));
-    }
-    Ok(products)
-}
-
-/// Newest available run for the spec's model, walking back from the spec's
-/// date. Probes the whole source catalog (or the spec's pinned source):
-/// the engine prefers the newest cycle over source priority, so a run
-/// that NOMADS has published but the mirrors haven't yet still wins —
-/// the old AWS pin both lagged fresh cycles and turned one source's
-/// outage into "no working source found".
-fn find_latest(spec: &DownloadSpec) -> Result<(String, u8), String> {
-    let model: ModelId = spec
-        .model
-        .parse()
-        .map_err(|_| format!("unknown model '{}'", spec.model))?;
-    let source = source_override(spec)?;
-    let products = all_ingest_products(model)?;
-    // Rusty's model-owned helper probes the earliest supported lead.  That
-    // matters for lanes whose first complete product is not f000 (REPS and
-    // GEPS f003, AIGEFS f006, CPTEC BRAMS f001).
-    let latest =
-        rustwx_models::latest_available_run_for_products(model, source, &spec.date, &products)
-            .map_err(|err| format!("latest-run probe failed: {err}"))?;
-    Ok((latest.cycle.date_yyyymmdd, latest.cycle.hour_utc))
-}
-
-// --- One-click ("Fetch latest") ingest helpers — pure, no network. ---
+// --- Shared cache/publication-cycle helpers — pure, no network. ---
 
 /// Rough HRRR CONUS coverage test: lat 21..52.5 N, lon 134..60 W. The
 /// HRRR Lambert domain's top edge sags toward its corners (≈52.6 N at
@@ -895,14 +817,14 @@ mod tests {
         assert!(matches!(poll_response(&receiver), IngestPoll::Disconnected));
     }
 
-    /// Field repro: GFS Latest/Download did nothing with no error. Drives
+    /// Field repro: GFS Estimate/availability did nothing with no error. Drives
     /// the REAL worker thread with a gfs spec exactly like the panel does
     /// and requires a response for every request — a worker panic shows up
     /// here as a recv timeout instead of a silent no-op.
     /// `cargo test -p app_ui gfs_panel_live -- --ignored --nocapture`
     #[test]
     #[ignore = "live network probe of the GFS panel path"]
-    fn gfs_panel_live_latest_estimate_probe_all_answer() {
+    fn gfs_panel_live_estimate_and_probe_both_answer() {
         let scratch = std::env::temp_dir().join("bowecho-gfs-panel-live");
         let worker = IngestWorker::spawn(scratch, || {});
         let mut gfs = spec();
@@ -932,18 +854,6 @@ mod tests {
         worker.send(IngestRequest::Estimate(gfs.clone()));
         let estimate = recv("estimate");
         println!("estimate -> {estimate:?}");
-
-        worker.send(IngestRequest::Latest(gfs.clone()));
-        let latest = recv("latest");
-        println!("latest -> {latest:?}");
-        match &latest {
-            IngestResponse::Latest { model, date, cycle } => {
-                assert_eq!(model, "gfs");
-                gfs.date = date.clone();
-                gfs.cycle = *cycle;
-            }
-            other => panic!("Latest must answer Latest{{..}}, got {other:?}"),
-        }
 
         worker.send(IngestRequest::Probe(gfs.clone()));
         let probe = recv("probe");
@@ -999,7 +909,6 @@ mod tests {
                 .filter_map(|cycle| supported_forecast_hours(model, *cycle).first().copied())
                 .min();
             assert_eq!(first, Some(expected), "{model}");
-            assert!(!all_ingest_products(model).unwrap().is_empty(), "{model}");
         }
     }
 

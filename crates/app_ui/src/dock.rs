@@ -35,13 +35,17 @@ const TREE_ID: &str = "bowecho_workspace_tree";
 /// Map-pane share of the root split when the first viewer docks.
 const MAP_SHARE_ON_FIRST_DOCK: f32 = 0.62;
 
-/// When a viewer docks beside an anchor via [`Workspace::dock_beside`] (the
-/// model sounding beside the model plot), the anchor keeps this fraction of the
-/// resulting pair and the newcomer gets the rest. The model plot must stay the
-/// wider of the two so it remains usable next to the sounding — an even 50/50
-/// split (plus the model dock's fixed ~230 px import rail) cramped the plot.
-/// 60/40 mirrors the layout the owner otherwise had to drag to by hand.
+/// Generic anchor share when a viewer docks beside another viewer via
+/// [`Workspace::dock_beside`]. Specialized pairs can override this without
+/// changing the default placement of future dockable panes.
 const DOCK_BESIDE_ANCHOR_SHARE: f32 = 0.6;
+
+/// Model/Sounding is intentionally the reverse of the generic split: the
+/// SHARPpy board is a wide coordinated graphic, so the first insertion gives
+/// Sounding the larger 62% share of this pair. This is only consulted while a
+/// new tile is inserted; an already-docked (including restored) pane returns
+/// before any shares are touched, preserving user divider edits.
+const MODEL_SOUNDING_ANCHOR_SHARE: f32 = 0.38;
 
 /// Persisted-layout schema version (`AppSettings::workspace_layout`).
 const LAYOUT_VERSION: u32 = 1;
@@ -350,6 +354,11 @@ impl Workspace {
         if pane == WorkspacePane::Map || self.is_docked(pane) {
             return;
         }
+        let anchor_share = if pane == WorkspacePane::Sounding && anchor == WorkspacePane::Model {
+            MODEL_SOUNDING_ANCHOR_SHARE
+        } else {
+            DOCK_BESIDE_ANCHOR_SHARE
+        };
         self.sleeping.remove(&pane);
         let Some(anchor_pane) = self.tree.tiles.find_pane(&anchor) else {
             // The anchor isn't in the tree: nothing to split beside it.
@@ -376,8 +385,8 @@ impl Workspace {
             .unwrap_or(anchor_pane);
         match self.tree.tiles.parent_of(anchor_slot) {
             // Anchor already sits in a horizontal row: drop the newcomer in
-            // directly to its right, sized so the anchor keeps
-            // DOCK_BESIDE_ANCHOR_SHARE of the two (the plot stays the wider one).
+            // directly to its right, sized according to this pair's first-
+            // insertion default.
             Some(row) if is_horizontal_linear(&self.tree.tiles, row) => {
                 if let Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(linear))) =
                     self.tree.tiles.get_mut(row)
@@ -388,9 +397,8 @@ impl Workspace {
                         .position(|&c| c == anchor_slot)
                         .map_or(linear.children.len(), |i| i + 1);
                     linear.children.insert(at, child_slot);
-                    let anchor_share = linear.shares[anchor_slot];
-                    let neighbor_share =
-                        anchor_share * (1.0 - DOCK_BESIDE_ANCHOR_SHARE) / DOCK_BESIDE_ANCHOR_SHARE;
+                    let anchor_current_share = linear.shares[anchor_slot];
+                    let neighbor_share = anchor_current_share * (1.0 - anchor_share) / anchor_share;
                     linear.shares.set_share(child_slot, neighbor_share);
                 }
             }
@@ -402,7 +410,7 @@ impl Workspace {
                     egui_tiles::Container::Linear(egui_tiles::Linear::new_binary(
                         egui_tiles::LinearDir::Horizontal,
                         [anchor_slot, child_slot],
-                        DOCK_BESIDE_ANCHOR_SHARE,
+                        anchor_share,
                     )),
                 ));
                 match parent {
@@ -796,18 +804,16 @@ mod tests {
     }
 
     #[test]
-    fn dock_beside_keeps_the_anchor_wider_than_the_newcomer() {
-        // The model plot must stay usable next to the sounding: the pair splits
-        // 60/40 (anchor/newcomer), not 50/50 (owner report: an even split
-        // squeezed the plot). Applies whichever dock_beside branch runs — Model
-        // sitting in the Map|Model row (horizontal-row insert) or, dock Model
-        // first alone so it is the sole viewer, the wrap branch.
+    fn model_sounding_first_insertion_gives_sounding_the_readable_majority() {
+        // The wide SHARPpy board gets 62% of the Model/Sounding pair. Verify
+        // both dock_beside branches: Model in the Map|Model row and Model as
+        // the root cell that must be wrapped in a new horizontal split.
         let mut row = Workspace::default();
         row.dock(WorkspacePane::Model); // Map | Model horizontal row
         row.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
-        assert_neighbor_share(&row, 0.4);
+        assert_neighbor_share(&row, WorkspacePane::Model, WorkspacePane::Sounding, 0.62);
 
-        // Wrap branch: Model as the lone root (no map) still splits 60/40.
+        // Wrap branch: Model as the lone root (no map) gets the same default.
         let mut wrap = Workspace {
             tree: {
                 let mut tiles = egui_tiles::Tiles::default();
@@ -817,31 +823,50 @@ mod tests {
             ..Default::default()
         };
         wrap.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
-        assert_neighbor_share(&wrap, 0.4);
+        assert_neighbor_share(&wrap, WorkspacePane::Model, WorkspacePane::Sounding, 0.62);
     }
 
-    /// Assert the Sounding cell takes ~`expected` of the Sounding+Model pair
-    /// within their shared horizontal row.
-    fn assert_neighbor_share(workspace: &Workspace, expected: f32) {
-        let model_slot = slot_of(workspace, WorkspacePane::Model);
-        let sounding_slot = slot_of(workspace, WorkspacePane::Sounding);
+    #[test]
+    fn generic_dock_beside_keeps_the_existing_sixty_forty_default() {
+        let mut workspace = Workspace::default();
+        workspace.dock(WorkspacePane::Model);
+        workspace.dock_beside(WorkspacePane::FormulaLab, WorkspacePane::Model);
+
+        assert_neighbor_share(
+            &workspace,
+            WorkspacePane::Model,
+            WorkspacePane::FormulaLab,
+            0.4,
+        );
+    }
+
+    /// Assert `neighbor` takes ~`expected` of its pair with `anchor` within
+    /// their shared horizontal row.
+    fn assert_neighbor_share(
+        workspace: &Workspace,
+        anchor: WorkspacePane,
+        neighbor: WorkspacePane,
+        expected: f32,
+    ) {
+        let anchor_slot = slot_of(workspace, anchor);
+        let neighbor_slot = slot_of(workspace, neighbor);
         let row = workspace
             .tree
             .tiles
-            .parent_of(model_slot)
-            .expect("model has a parent row");
+            .parent_of(anchor_slot)
+            .expect("anchor has a parent row");
         let egui_tiles::Tile::Container(egui_tiles::Container::Linear(linear)) =
             workspace.tree.tiles.get(row).expect("row tile")
         else {
             panic!("shared parent is not a Linear row");
         };
-        let model_share = linear.shares[model_slot];
-        let sounding_share = linear.shares[sounding_slot];
-        let fraction = sounding_share / (model_share + sounding_share);
+        let anchor_share = linear.shares[anchor_slot];
+        let neighbor_share = linear.shares[neighbor_slot];
+        let fraction = neighbor_share / (anchor_share + neighbor_share);
         assert!(
             (fraction - expected).abs() < 1e-4,
-            "sounding should take {expected} of the pair, got {fraction} \
-             (model {model_share}, sounding {sounding_share})"
+            "{neighbor:?} should take {expected} of its pair with {anchor:?}, got {fraction} \
+             (anchor {anchor_share}, neighbor {neighbor_share})"
         );
     }
 
@@ -864,6 +889,50 @@ mod tests {
         workspace.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
         let after = serde_json::to_string(&workspace.tree).expect("serialize");
         assert_eq!(before, after, "already-docked pane is left in place");
+    }
+
+    #[test]
+    fn restored_model_sounding_share_is_not_redefaulted() {
+        let mut workspace = Workspace::default();
+        workspace.dock(WorkspacePane::Model);
+        workspace.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
+
+        let model_slot = slot_of(&workspace, WorkspacePane::Model);
+        let sounding_slot = slot_of(&workspace, WorkspacePane::Sounding);
+        let row = workspace
+            .tree
+            .tiles
+            .parent_of(model_slot)
+            .expect("model has a parent row");
+        let Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(linear))) =
+            workspace.tree.tiles.get_mut(row)
+        else {
+            panic!("shared parent is not a Linear row");
+        };
+        linear.shares.set_share(model_slot, 0.7);
+        linear.shares.set_share(sounding_slot, 0.3);
+
+        let viewers = [
+            (WorkspacePane::Model, ViewerMode::Docked),
+            (WorkspacePane::Sounding, ViewerMode::Docked),
+        ]
+        .into_iter()
+        .collect();
+        let saved = workspace.to_persisted(viewers);
+        let mut restored = Workspace::default();
+        restored.restore_persisted(&saved).expect("layout restores");
+        let before = serde_json::to_string(&restored.tree).expect("serialize");
+
+        restored.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
+
+        let after = serde_json::to_string(&restored.tree).expect("serialize");
+        assert_eq!(before, after, "restored user share must remain untouched");
+        assert_neighbor_share(
+            &restored,
+            WorkspacePane::Model,
+            WorkspacePane::Sounding,
+            0.3,
+        );
     }
 
     #[test]

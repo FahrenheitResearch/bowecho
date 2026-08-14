@@ -264,7 +264,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -275,7 +275,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -293,11 +293,11 @@ dependencies = [
  "egui_tiles",
  "flate2",
  "getrandom 0.3.4",
- "grib-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "grib-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "image",
  "keyring",
  "naga",
- "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "nexrad_io",
  "product_engine",
  "quick-xml 0.39.4",
@@ -307,21 +307,21 @@ dependencies = [
  "render2d",
  "reqwest",
  "rfd",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-io 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-products 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-io 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-products 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rustwx-sounding",
  "rusty-weather",
  "rw-community-protocol",
  "rw-community-relay",
  "rw-formula",
  "rw-glm",
- "rw-ingest 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rw-ingest 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rw-query",
- "rw-sat 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rw-sat 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rw-ui",
  "serde",
  "serde_json",
@@ -714,7 +714,7 @@ dependencies = [
  "chrono",
  "glob",
  "image",
- "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "nexrad_io",
  "radar_core",
  "render2d",
@@ -1447,11 +1447,11 @@ dependencies = [
 [[package]]
 name = "ecape-rs"
 version = "0.1.4"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "serde",
  "serde_json",
- "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
 ]
 
 [[package]]
@@ -1780,7 +1780,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2347,7 +2347,7 @@ dependencies = [
 [[package]]
 name = "grib-core"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "chrono",
  "openjp2",
@@ -2441,7 +2441,7 @@ dependencies = [
 [[package]]
 name = "hdf5-reader"
 version = "0.3.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "flate2",
  "lru 0.18.2",
@@ -3166,16 +3166,16 @@ dependencies = [
 [[package]]
 name = "metrust"
 version = "0.3.11"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "chrono",
- "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "flate2",
  "rayon",
- "wx-core 0.3.9 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "wx-radar 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "wx-core 0.3.9 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "wx-radar 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
 ]
 
 [[package]]
@@ -3344,7 +3344,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7eb7a0b389fcc97f37522c28e475de5809a40860028fb0d7fb29f91367973e9"
 dependencies = [
- "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "memmap2",
  "ndarray 0.17.2",
  "rayon",
@@ -3365,9 +3365,9 @@ dependencies = [
 [[package]]
 name = "netcrust"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
- "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "ndarray 0.17.2",
  "netcdf-reader 0.3.0",
  "thiserror 2.0.20",
@@ -3832,7 +3832,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openjp2"
 version = "0.6.1"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
@@ -4430,7 +4430,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4824,7 +4824,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4923,11 +4923,11 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "rustwx-calc"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
- "metrust 0.3.11 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "metrust 0.3.11 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rayon",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "thiserror 2.0.20",
 ]
@@ -4947,7 +4947,7 @@ dependencies = [
 [[package]]
 name = "rustwx-contour"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 
 [[package]]
 name = "rustwx-contour"
@@ -4957,7 +4957,7 @@ source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=edb9d277cc
 [[package]]
 name = "rustwx-core"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -4975,21 +4975,21 @@ dependencies = [
 [[package]]
 name = "rustwx-io"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "bincode",
  "bzip2 0.5.2",
  "flate2",
- "grib-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "grib-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rayon",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "windows-sys 0.61.2",
- "wx-core 0.3.9 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "wx-core 0.3.9 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
 ]
 
 [[package]]
@@ -5000,7 +5000,7 @@ dependencies = [
  "bincode",
  "flate2",
  "grib-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=edb9d277cce7fe1cfa1080d159053c583ca07b6a)",
- "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rayon",
  "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=edb9d277cce7fe1cfa1080d159053c583ca07b6a)",
  "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=edb9d277cce7fe1cfa1080d159053c583ca07b6a)",
@@ -5013,12 +5013,12 @@ dependencies = [
 [[package]]
 name = "rustwx-models"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "chrono",
  "rayon",
  "rustls",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "thiserror 2.0.20",
  "ureq",
@@ -5041,19 +5041,19 @@ dependencies = [
 [[package]]
 name = "rustwx-products"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "bincode",
  "chrono",
- "grib-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "grib-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "image",
  "rayon",
- "rustwx-calc 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-io 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-calc 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-io 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rustwx-regrid",
- "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "serde_json",
  "shapefile",
@@ -5083,9 +5083,9 @@ dependencies = [
 [[package]]
 name = "rustwx-regrid"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "thiserror 2.0.20",
 ]
@@ -5093,13 +5093,13 @@ dependencies = [
 [[package]]
 name = "rustwx-render"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "font8x8",
  "image",
  "rusttype",
- "rustwx-contour 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-contour 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "shapefile",
  "thiserror 2.0.20",
@@ -5123,36 +5123,36 @@ dependencies = [
 [[package]]
 name = "rustwx-sounding"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
- "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "image",
- "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "sharprs",
  "thiserror 2.0.20",
- "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
 ]
 
 [[package]]
 name = "rusty-weather"
 version = "0.5.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "chrono",
  "clap",
- "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "image",
  "libmimalloc-sys",
  "mimalloc",
  "rayon",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-io 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-products 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rw-ingest 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-io 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-products 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rw-ingest 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",
@@ -5161,7 +5161,7 @@ dependencies = [
 [[package]]
 name = "rw-community-protocol"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5174,7 +5174,7 @@ dependencies = [
 [[package]]
 name = "rw-community-relay"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5197,26 +5197,26 @@ dependencies = [
 [[package]]
 name = "rw-formula"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "sha2",
  "thiserror 2.0.20",
- "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "wrf-formula 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "wrf-formula 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
 ]
 
 [[package]]
 name = "rw-glm"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "clap",
- "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rustls",
- "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -5226,14 +5226,14 @@ dependencies = [
 [[package]]
 name = "rw-ingest"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "rayon",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-io 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-products 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-io 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-models 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-products 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde_json",
  "thiserror 2.0.20",
  "windows-sys 0.61.2",
@@ -5258,12 +5258,12 @@ dependencies = [
 [[package]]
 name = "rw-query"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "chrono",
  "chrono-tz",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "same-file",
  "serde",
  "serde_json",
@@ -5274,20 +5274,20 @@ dependencies = [
 [[package]]
 name = "rw-sat"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "base64 0.22.1",
  "bzip2 0.5.2",
  "chrono",
  "clap",
- "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "hdf5-reader 0.3.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "image",
- "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "netcrust 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rayon",
  "rustls",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rw-ingest 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rw-ingest 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -5323,13 +5323,13 @@ dependencies = [
 [[package]]
 name = "rw-store"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "bytemuck",
  "fs4",
  "memmap2",
  "rayon",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "same-file",
  "serde",
  "serde_json",
@@ -5358,18 +5358,18 @@ dependencies = [
 [[package]]
 name = "rw-ui"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "egui",
  "image",
- "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-products 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rustwx-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-products 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "rustwx-render 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "rustwx-sounding",
- "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
  "serde",
  "serde_json",
- "sharppyrs 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "sharppyrs 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
 ]
 
 [[package]]
@@ -5591,7 +5591,7 @@ dependencies = [
 [[package]]
 name = "sharppyrs"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "egui",
  "sharprs",
@@ -5609,7 +5609,7 @@ dependencies = [
 [[package]]
 name = "sharprs"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "image",
  "rusttype",
@@ -5828,7 +5828,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5991,7 +5991,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6413,7 +6413,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset 0.9.1",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7093,7 +7093,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7466,7 +7466,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wrf-core"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/ecape-rs?rev=82922534c02a888e773c50463b5a49d535606276)",
  "flate2",
@@ -7502,11 +7502,11 @@ dependencies = [
 [[package]]
 name = "wrf-formula"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "serde",
  "serde_json",
- "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
 ]
 
 [[package]]
@@ -7528,6 +7528,24 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 [[package]]
 name = "wx-core"
 version = "0.3.9"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
+dependencies = [
+ "chrono",
+ "flate2",
+ "openjp2",
+ "png 0.17.16",
+ "rayon",
+ "rustls",
+ "thiserror 2.0.20",
+ "ureq",
+ "webpki-roots 0.26.11",
+ "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+ "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+]
+
+[[package]]
+name = "wx-core"
+version = "0.3.9"
 source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
 dependencies = [
  "chrono",
@@ -7542,24 +7560,6 @@ dependencies = [
  "webpki-roots 0.26.11",
  "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
  "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
-]
-
-[[package]]
-name = "wx-core"
-version = "0.3.9"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
-dependencies = [
- "chrono",
- "flate2",
- "openjp2",
- "png 0.17.16",
- "rayon",
- "rustls",
- "thiserror 2.0.20",
- "ureq",
- "webpki-roots 0.26.11",
- "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
- "wx-math 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
 ]
 
 [[package]]
@@ -7584,7 +7584,7 @@ dependencies = [
 [[package]]
 name = "wx-field"
 version = "0.3.6"
-source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "chrono",
 ]
@@ -7592,7 +7592,7 @@ dependencies = [
 [[package]]
 name = "wx-field"
 version = "0.3.6"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
 dependencies = [
  "chrono",
 ]
@@ -7608,19 +7608,19 @@ dependencies = [
 [[package]]
 name = "wx-math"
 version = "0.3.6"
-source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
 dependencies = [
  "rayon",
- "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
+ "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
 ]
 
 [[package]]
 name = "wx-math"
 version = "0.3.6"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
+source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
 dependencies = [
  "rayon",
- "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
+ "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
 ]
 
 [[package]]
@@ -7635,6 +7635,20 @@ dependencies = [
 [[package]]
 name = "wx-radar"
 version = "0.3.6"
+source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd#17efa46c58e14474929087f9795fc114b2cd12cd"
+dependencies = [
+ "byteorder",
+ "bzip2 0.5.2",
+ "chrono",
+ "flate2",
+ "rayon",
+ "serde",
+ "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=17efa46c58e14474929087f9795fc114b2cd12cd)",
+]
+
+[[package]]
+name = "wx-radar"
+version = "0.3.6"
 source = "git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685#1b8436779832be326f24bd2acd40a908e9f54685"
 dependencies = [
  "byteorder",
@@ -7644,20 +7658,6 @@ dependencies = [
  "rayon",
  "serde",
  "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/metrust-py.git?rev=1b8436779832be326f24bd2acd40a908e9f54685)",
-]
-
-[[package]]
-name = "wx-radar"
-version = "0.3.6"
-source = "git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f#2632dc2b78c094e12a025cb89cea09ca1ab9ff8f"
-dependencies = [
- "byteorder",
- "bzip2 0.5.2",
- "chrono",
- "flate2",
- "rayon",
- "serde",
- "wx-field 0.3.6 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=2632dc2b78c094e12a025cb89cea09ca1ab9ff8f)",
 ]
 
 [[package]]

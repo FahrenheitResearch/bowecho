@@ -3551,12 +3551,6 @@ struct ViewerApp {
     gbvtd: gbvtd_retrieval::GbvtdState,
     /// Primary radar layer opacity (draw-time tint; no re-render).
     radar_opacity: f32,
-    /// Background model ingest (rw-ingest library) in flight.
-    model_ingest_rx: Option<mpsc::Receiver<std::result::Result<String, String>>>,
-    /// Live per-stage progress lines from the ingest worker.
-    model_ingest_progress_rx: Option<mpsc::Receiver<String>>,
-    /// Cooperative cancel — checked at every ingest stage boundary.
-    model_ingest_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Grid index of the last sounding request (dedupe for follow mode).
     last_sounding_request: Option<usize>,
     /// A sounding was requested to set the hail environment (H0/H-20):
@@ -9931,7 +9925,9 @@ impl ViewerApp {
             community_relay_runtime,
             community_relay_network_unmetered_confirmed: false,
             ingest: None,
-            download_panel: rw_ui::DownloadPanel::new(default_download_spec(&restored_model_slug)),
+            download_panel: explicit_model_download_panel(default_download_spec(
+                &restored_model_slug,
+            )),
             sat: None,
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
@@ -9988,9 +9984,6 @@ impl ViewerApp {
             tropical: tropical::TropicalState::default(),
             gbvtd: gbvtd_retrieval::GbvtdState::default(),
             radar_opacity: initial_radar_opacity,
-            model_ingest_rx: None,
-            model_ingest_progress_rx: None,
-            model_ingest_cancel: None,
             model_download_open: false,
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
@@ -21823,7 +21816,6 @@ impl eframe::App for ViewerApp {
         self.poll_italy_dpc_layer(&ctx);
         self.poll_taiwan_cwa_layer(&ctx);
         self.poll_grid_composite_layer(&ctx);
-        self.poll_model_ingest(&ctx);
         // Drain the flexible-download worker every frame, not just while its
         // UI is visible — closing the Model window mid-download used to
         // stall progress reporting until reopened.
@@ -26660,6 +26652,29 @@ impl ViewerApp {
         }
 
         let selected_frame_index = selected_frame_index.min(frame_count - 1);
+        let selected_frame_label = match target {
+            LoopTimelineTarget::Primary => {
+                self.primary.history.get(selected_frame_index).map(|frame| {
+                    radar_scrubber_frame_label(
+                        selected_frame_index,
+                        frame_count,
+                        frame.identity.scan_time_utc,
+                        self.displayed_primary_frame_status.unwrap_or(frame.status),
+                    )
+                })
+            }
+            LoopTimelineTarget::ExtraPane(slot) => self.extra_panes.get(slot).and_then(|pane| {
+                pane.engine.history.get(selected_frame_index).map(|frame| {
+                    radar_scrubber_frame_label(
+                        selected_frame_index,
+                        frame_count,
+                        frame.identity.scan_time_utc,
+                        pane.displayed_frame_status.unwrap_or(frame.status),
+                    )
+                })
+            }),
+        }
+        .unwrap_or_else(|| format!("Frame {}/{}", selected_frame_index + 1, frame_count));
         let can_play = match target {
             LoopTimelineTarget::Primary => self.primary_history_loop_can_step(),
             LoopTimelineTarget::ExtraPane(slot) => self.extra_pane_history_loop_can_step(slot),
@@ -26707,6 +26722,16 @@ impl ViewerApp {
                 }
             };
             self.loop_speed_combo_ui(ui, ctx, speed_id);
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("FRAME SCRUBBER")
+                    .size(10.0)
+                    .strong()
+                    .color(subhead_color()),
+            );
+            ui.label(egui::RichText::new(selected_frame_label).monospace());
         });
 
         // A slider remains usable at narrow sidebar widths and gives every
@@ -30376,9 +30401,9 @@ impl ViewerApp {
                 self.status_or_activity_label("Listing archive volumes"),
             ));
         }
-        if self.model_ingest_rx.is_some() {
+        if self.download_panel.is_running() {
             return Some(BackgroundActivity::indeterminate(
-                self.status_or_activity_label("Model ingest running"),
+                self.status_or_activity_label("Model download running"),
             ));
         }
         if self.italy_dpc_latest_rx.in_flight() {
@@ -34422,56 +34447,6 @@ impl ViewerApp {
         Some((direction, (speed_mps / KNOT_TO_MPS as f64) as f32))
     }
 
-    /// Fetch f00 (and optionally f01) from the newest published HRRR cycle
-    /// using the explicitly selected light or full-without-heavy processing
-    /// path, then prune the store to its configured run limit.
-    fn start_model_ingest(
-        &mut self,
-        processing: QuickHrrrProcessing,
-        include_f01: bool,
-        ctx: &egui::Context,
-    ) {
-        if model_ingest_start_conflict(
-            self.model_ingest_rx.is_some(),
-            self.download_panel.is_running(),
-        ) {
-            self.status = "A model download is already running".to_owned();
-            return;
-        }
-        let hours_label = if include_f01 { "f00–f01" } else { "f00" };
-        let (sender, receiver) = mpsc::channel();
-        let (progress_tx, progress_rx) = mpsc::channel();
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.model_ingest_rx = Some(receiver);
-        self.model_ingest_progress_rx = Some(progress_rx);
-        self.model_ingest_cancel = Some(Arc::clone(&cancel));
-        self.status = format!(
-            "Fetching latest HRRR {hours_label} · {}",
-            processing.label()
-        );
-        let ctx = ctx.clone();
-        let keep_runs = self.model_keep_runs as usize;
-        thread::spawn(move || {
-            // Polite-by-default (rw-ingest throttle): fetch thread + compute
-            // pool run below-normal so the UI never lags (their verified
-            // result: 0.2 ms frames at 99.8% system CPU).
-            rw_ingest::throttle::set_current_thread_background_priority();
-            let pool = rw_ingest::throttle::build_background_pool(None);
-            let result = pool.install(|| {
-                run_model_ingest(
-                    processing,
-                    include_f01,
-                    &cancel,
-                    &progress_tx,
-                    &ctx,
-                    keep_runs,
-                )
-            });
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-    }
-
     /// Request the model profile at the radar site to auto-set the hail
     /// environment (H0 / H−20). The reply is intercepted by
     /// poll_native_sounding (hail_env_pending) without opening the window.
@@ -35478,34 +35453,58 @@ impl ViewerApp {
                     ui.weak(if store_empty {
                         "Get a ready-to-use first run"
                     } else {
-                        "Latest HRRR · processing mode · archive-time match · custom setup"
+                        "Choose model, run, forecast hours, and processing"
                     });
                 })
                 .body(|ui| {
                     self.ensure_ingest_worker(&ctx);
-                    events.extend(self.model_quick_acquisition_ui(ui, &ctx));
                     self.model_upper_air_toolbar_ui(ui, &ctx);
                     ui.add_space(4.0);
-                    egui::CollapsingHeader::new("Custom download setup")
-                        .id_salt("model_window_custom_download")
-                        .default_open(false)
+                    ui.label(
+                        egui::RichText::new(
+                            "Choose a model, run, forecast hours, profile, source, and cache behavior.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    let displayed_choice = self
+                        .displayed_timeline_time_utc()
+                        .and_then(|displayed| {
+                            ingest_worker::spec_fields_for_displayed_time(
+                                &self.download_panel.spec().model,
+                                displayed,
+                            )
+                        });
+                    let match_displayed_time = ui
+                        .add_enabled(
+                            displayed_choice.is_some() && !self.download_panel.is_running(),
+                            egui::Button::new("Use displayed radar time").small(),
+                        )
+                        .on_hover_text(
+                            "Set this model run and forecast hour to the radar frame currently on screen",
+                        )
+                        .on_disabled_hover_text(if displayed_choice.is_none() {
+                            "No radar timeline frame is displayed"
+                        } else {
+                            "A model download is already running"
+                        })
+                        .clicked();
+                    if match_displayed_time && let Some((date, cycle, hours)) = displayed_choice {
+                        let mut spec = self.download_panel.spec().clone();
+                        spec.date = date;
+                        spec.cycle = cycle;
+                        spec.hours = hours;
+                        self.download_panel = explicit_model_download_panel(spec.clone());
+                        self.download_panel
+                            .set_model_options(ingest_worker_model_options());
+                        events.push(rw_ui::DownloadEvent::SpecChanged(spec));
+                    }
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("model_window_download_scroll")
+                        .max_height(380.0)
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(
-                                    "Choose a model, run, forecast hours, profile, source, and cache behavior.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.separator();
-                            egui::ScrollArea::vertical()
-                                .id_salt("model_window_download_scroll")
-                                .max_height(380.0)
-                                .show(ui, |ui| {
-                                    ui.add_enabled_ui(self.model_ingest_rx.is_none(), |ui| {
-                                        events.extend(self.download_panel.ui(ui));
-                                    });
-                                });
+                            events.extend(self.download_panel.ui(ui));
                         });
                 });
             ui.separator();
@@ -35520,150 +35519,6 @@ impl ViewerApp {
             self.persist_wrf_process_options();
             // And the virtual-radar placement/range (site popover edits).
             self.persist_wrf_synth_radar();
-        }
-        events
-    }
-
-    fn model_quick_acquisition_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-    ) -> Vec<rw_ui::DownloadEvent> {
-        let mut events = Vec::new();
-        let newest = self
-            .model_dock
-            .as_ref()
-            .and_then(|dock| dock.newest_run())
-            .map(|(model, run, hours)| format!("Newest: {model} {run} · {hours} hours"))
-            .unwrap_or_else(|| "Model store is empty".to_owned());
-        let fetching = self.model_ingest_rx.is_some();
-        let running = self.download_panel.is_running();
-        let initial_processing =
-            QuickHrrrProcessing::from_profile_slug(&self.download_panel.spec().profile);
-        let initial_include_f01 = self.download_panel.spec().hours == "0-1";
-        let mut processing = initial_processing;
-        let mut include_f01 = initial_include_f01;
-        let displayed_choice = self.displayed_timeline_time_utc().and_then(|displayed| {
-            ingest_worker::spec_fields_for_displayed_time(
-                &self.download_panel.spec().model,
-                displayed,
-            )
-        });
-        let mut fetch_latest = false;
-        let mut match_displayed_time = false;
-
-        let theme = ui_theme::theme();
-        egui::Frame::new()
-            .fill(theme.faint)
-            .stroke(egui::Stroke::new(1.0_f32, theme.hairline))
-            .corner_radius(4)
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new("LATEST HRRR")
-                            .size(11.0)
-                            .strong()
-                            .color(subhead_color()),
-                    );
-                    ui.weak(&newest);
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "Fetch f00 from the newest HRRR cycle complete for both prs+sfc; include f01 only when you need the next forecast hour.",
-                    )
-                    .small()
-                    .weak(),
-                );
-                ui.add_space(3.0);
-                ui.add_enabled_ui(!fetching && !running, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Processing");
-                        egui::ComboBox::from_id_salt("quick_hrrr_processing")
-                            .selected_text(processing.label())
-                            .show_ui(ui, |ui| {
-                                for choice in QuickHrrrProcessing::ALL {
-                                    ui.selectable_value(&mut processing, choice, choice.label())
-                                        .on_hover_text(choice.description());
-                                }
-                            });
-                        ui.checkbox(&mut include_f01, "Include f01")
-                            .on_hover_text("Fetch f00 and f01 instead of analysis hour f00 only");
-                    });
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let hour_label = if include_f01 { "f00–f01" } else { "f00" };
-                    fetch_latest = ui
-                        .add_enabled(
-                            !fetching && !running,
-                            egui::Button::new(
-                                egui::RichText::new(format!("Fetch latest HRRR {hour_label}"))
-                                    .strong(),
-                            ),
-                        )
-                        .on_hover_text(format!(
-                            "Fetch {hour_label} from one newest complete HRRR prs+sfc cycle using {}. Heavy/eCAPE processing is always off.",
-                            processing.label(),
-                        ))
-                        .on_disabled_hover_text("A model download is already running")
-                        .clicked();
-
-                    match_displayed_time = ui
-                        .add_enabled(
-                            displayed_choice.is_some() && !running,
-                            egui::Button::new("Use displayed radar time in custom setup").small(),
-                        )
-                        .on_hover_text(
-                            "Set the custom run date, cycle, and forecast hours to the radar frame currently on screen",
-                        )
-                        .on_disabled_hover_text("No radar timeline frame is displayed")
-                        .clicked();
-
-                    if fetching {
-                        ui.spinner();
-                        if ui.small_button("×").on_hover_text("Cancel fetch").clicked()
-                            && let Some(cancel) = &self.model_ingest_cancel
-                        {
-                            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                });
-            });
-
-        let quick_controls_changed =
-            processing != initial_processing || include_f01 != initial_include_f01;
-        if quick_controls_changed || fetch_latest {
-            let mut spec = self.download_panel.spec().clone();
-            spec.model = "hrrr".to_owned();
-            spec.profile = processing.profile_slug().to_owned();
-            spec.hours = quick_hrrr_hour_spec(include_f01).to_owned();
-            spec.derived = processing.derived();
-            spec.heavy = false;
-            self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
-            self.download_panel
-                .set_model_options(ingest_worker_model_options());
-            events.push(rw_ui::DownloadEvent::SpecChanged(spec));
-        }
-        if fetch_latest {
-            self.start_model_ingest(processing, include_f01, ctx);
-        }
-
-        if match_displayed_time && let Some((date, cycle, hours)) = displayed_choice {
-            let mut spec = self.download_panel.spec().clone();
-            spec.date = date;
-            spec.cycle = cycle;
-            spec.hours = hours;
-            self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
-            self.download_panel
-                .set_model_options(ingest_worker_model_options());
-            events.push(rw_ui::DownloadEvent::SpecChanged(spec));
-
-            let custom_id = ui.make_persistent_id("model_window_custom_download");
-            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                ctx, custom_id, false,
-            );
-            state.set_open(true);
-            state.store(ctx);
         }
         events
     }
@@ -35754,7 +35609,7 @@ impl ViewerApp {
         event_label: &str,
         ctx: &egui::Context,
     ) {
-        if self.model_ingest_rx.is_some() || self.download_panel.is_running() {
+        if self.download_panel.is_running() {
             self.status = "Model download already running; skipped event auto-model".to_owned();
             return;
         }
@@ -35786,7 +35641,7 @@ impl ViewerApp {
             self.model_dock = Some(self.new_model_data_dock(ctx, settings::model_store_dir()));
         }
         self.ensure_ingest_worker_started(ctx);
-        self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
+        self.download_panel = explicit_model_download_panel(spec.clone());
         self.download_panel
             .set_model_options(ingest_worker_model_options());
         sync_run_pickers(&mut self.download_panel, &spec);
@@ -35813,21 +35668,15 @@ impl ViewerApp {
             return;
         }
         self.ensure_ingest_worker_started(ctx);
-        let mut spec = self.download_panel.spec().clone();
-        // Never open empty (field bug): seed today's UTC date, then
-        // probe the newest ACTUALLY-AVAILABLE run, which corrects both
-        // date and cycle when it lands.
-        if spec.date.is_empty() {
-            spec.date = Utc::now().format("%Y%m%d").to_string();
-        }
-        spec = normalize_model_download_spec(spec);
+        // Opening acquisition is local-only. Normalize persisted values and
+        // estimate disk use, but do not probe providers until the user asks.
+        let spec = normalize_model_download_spec(self.download_panel.spec().clone());
         if self.download_panel.spec() != &spec {
             self.download_panel.set_spec(spec.clone());
         }
         sync_run_pickers(&mut self.download_panel, &spec);
         if let Some(worker) = &self.ingest {
-            worker.send(ingest_worker::IngestRequest::Estimate(spec.clone()));
-            worker.send(ingest_worker::IngestRequest::Latest(spec));
+            worker.send(ingest_worker::IngestRequest::Estimate(spec));
         }
     }
 
@@ -35852,12 +35701,11 @@ impl ViewerApp {
                         self.download_panel.set_spec(spec.clone());
                     }
                     if model_changed {
-                        // Model switch: persist the pick and snap date/cycle
-                        // to the model's newest available run (cadences
-                        // differ — an HRRR 07z is no GFS cycle).
+                        // Persist the model pick. Normalization above selects
+                        // a valid scheduled cycle locally; provider probes
+                        // remain explicit user actions.
                         self.app_settings.model_slug = spec.model.clone();
                         let _ = self.app_settings.save();
-                        ingest.send(ingest_worker::IngestRequest::Latest(spec.clone()));
                     }
                     sync_run_pickers(&mut self.download_panel, &spec);
                     ingest.send(ingest_worker::IngestRequest::Estimate(spec));
@@ -35869,22 +35717,19 @@ impl ViewerApp {
                     }
                     ingest.send(ingest_worker::IngestRequest::Probe(spec));
                 }
-                rw_ui::DownloadEvent::LatestRequested(spec) => {
-                    let spec = normalize_model_download_spec(spec);
-                    if self.download_panel.spec() != &spec {
-                        self.download_panel.set_spec(spec.clone());
-                    }
-                    ingest.send(ingest_worker::IngestRequest::Latest(spec));
+                rw_ui::DownloadEvent::LatestRequested(_) => {
+                    // BowEcho hides this action and never starts a network
+                    // latest-run scan. Keep this fail-closed arm because the
+                    // shared rw-ui event enum also serves other applications.
+                    self.download_panel
+                        .set_probing_failed("Choose the run date and cycle explicitly".to_owned());
                 }
                 rw_ui::DownloadEvent::StartRequested(spec) => {
                     let spec = normalize_model_download_spec(spec);
                     if self.download_panel.spec() != &spec {
                         self.download_panel.set_spec(spec.clone());
                     }
-                    if model_ingest_start_conflict(
-                        self.model_ingest_rx.is_some(),
-                        self.download_panel.is_running(),
-                    ) {
+                    if self.download_panel.is_running() {
                         self.status = "A model download is already running".to_owned();
                         continue;
                     }
@@ -35897,7 +35742,7 @@ impl ViewerApp {
                     };
                     // Latch synchronously with the click. Waiting for the
                     // worker's Started response left a multi-frame window in
-                    // which another detailed or quick start could overlap it.
+                    // which another start could overlap it.
                     self.download_panel.begin_run(&hours);
                     ingest.send(ingest_worker::IngestRequest::Start(spec));
                 }
@@ -35928,25 +35773,6 @@ impl ViewerApp {
                 ingest_worker::IngestResponse::Availability(view) => {
                     if view.matches(self.download_panel.spec()) {
                         self.download_panel.set_availability(view);
-                    }
-                }
-                ingest_worker::IngestResponse::Latest { model, date, cycle } => {
-                    if model != self.download_panel.spec().model {
-                        continue;
-                    }
-                    self.download_panel.set_latest(date, cycle);
-                    let spec = normalize_model_download_spec(self.download_panel.spec().clone());
-                    if self.download_panel.spec() != &spec {
-                        self.download_panel.set_spec(spec.clone());
-                    }
-                    sync_run_pickers(&mut self.download_panel, &spec);
-                    if let Some(ingest) = &self.ingest {
-                        ingest.send(ingest_worker::IngestRequest::Estimate(spec));
-                    }
-                }
-                ingest_worker::IngestResponse::LatestFailed { model, message } => {
-                    if model == self.download_panel.spec().model {
-                        self.download_panel.set_probing_failed(message);
                     }
                 }
                 ingest_worker::IngestResponse::Started { hours } => {
@@ -38304,38 +38130,6 @@ impl ViewerApp {
             // arrive so the header toggle takes effect without another map
             // click. A RAOB is excluded by the helper's ownership check.
             self.refresh_current_model_sounding_for_obs_adjust();
-        }
-    }
-
-    fn poll_model_ingest(&mut self, ctx: &egui::Context) {
-        if let Some(progress) = &self.model_ingest_progress_rx {
-            while let Ok(line) = progress.try_recv() {
-                self.status = line;
-            }
-        }
-        let Some(receiver) = &self.model_ingest_rx else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(Ok(message)) => {
-                self.model_ingest_rx = None;
-                self.model_ingest_progress_rx = None;
-                self.model_ingest_cancel = None;
-                self.status = message;
-                if let Some(dock) = &mut self.model_dock {
-                    dock.rescan();
-                }
-                ctx.request_repaint();
-            }
-            Ok(Err(err)) => {
-                self.model_ingest_rx = None;
-                self.model_ingest_progress_rx = None;
-                self.model_ingest_cancel = None;
-                self.status = format!("Model ingest failed: {err}");
-                ctx.request_repaint();
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.model_ingest_rx = None,
         }
     }
 
@@ -47130,192 +46924,6 @@ fn fail_download_for_ingest_worker_disconnect(panel: &mut rw_ui::DownloadPanel) 
     }
 }
 
-fn model_ingest_start_conflict(quick_running: bool, detailed_running: bool) -> bool {
-    quick_running || detailed_running
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QuickHrrrProcessing {
-    Sounding,
-    FullNoHeavy,
-}
-
-impl QuickHrrrProcessing {
-    const ALL: [Self; 2] = [Self::Sounding, Self::FullNoHeavy];
-
-    fn from_profile_slug(profile: &str) -> Self {
-        if profile == "full" {
-            Self::FullNoHeavy
-        } else {
-            Self::Sounding
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Sounding => "Sounding processing",
-            Self::FullNoHeavy => "Full processing (no heavy)",
-        }
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::Sounding => {
-                "Sounding volumes plus the seven required surface fields; no derived or heavy stages"
-            }
-            Self::FullNoHeavy => {
-                "All model fields and normal derived diagnostics; eCAPE/heavy processing stays off"
-            }
-        }
-    }
-
-    fn profile_slug(self) -> &'static str {
-        match self {
-            Self::Sounding => "sounding",
-            Self::FullNoHeavy => "full",
-        }
-    }
-
-    fn derived(self) -> bool {
-        self == Self::FullNoHeavy
-    }
-
-    fn ingest_profile(self) -> rw_ingest::ingest_profile::IngestProfile {
-        match self {
-            Self::Sounding => rw_ingest::ingest_profile::IngestProfile::sounding(),
-            Self::FullNoHeavy => {
-                let mut profile = rw_ingest::ingest_profile::IngestProfile::full();
-                profile.heavy = false;
-                profile
-            }
-        }
-    }
-}
-
-fn quick_hrrr_hour_spec(include_f01: bool) -> &'static str {
-    if include_f01 { "0-1" } else { "0" }
-}
-
-fn quick_hrrr_hours(include_f01: bool) -> std::ops::RangeInclusive<u16> {
-    0..=if include_f01 { 1 } else { 0 }
-}
-
-/// In-process one-click HRRR ingest via the rw-ingest library (typed
-/// per-stage progress + cooperative cancel; atomic writes mean cancel never
-/// leaves a partial hour). The quick path is deliberately narrow: one newest
-/// run proven complete for both HRRR prs+sfc at f00, f00 with optional f01,
-/// and either sounding processing or full derived processing with eCAPE/heavy
-/// disabled. Custom model/cycle/hour downloads remain in the detailed panel.
-fn run_model_ingest(
-    processing: QuickHrrrProcessing,
-    include_f01: bool,
-    cancel: &std::sync::atomic::AtomicBool,
-    progress: &mpsc::Sender<String>,
-    ctx: &egui::Context,
-    keep_runs: usize,
-) -> std::result::Result<String, String> {
-    let model = rustwx_core::ModelId::Hrrr;
-    let store_dir = settings::model_store_dir();
-    let cache_dir = settings::model_cache_dir();
-    let store_str = store_dir.to_string_lossy();
-    let cache_str = cache_dir.to_string_lossy();
-    #[allow(non_snake_case)]
-    let STORE: &str = &store_str;
-    #[allow(non_snake_case)]
-    let CACHE: &str = &cache_str;
-    let label = model.as_str().to_uppercase();
-    let model_slug = model.as_str().replace('-', "_");
-    let report = |line: String| {
-        let _ = progress.send(line);
-        ctx.request_repaint();
-    };
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err("cancelled".to_owned());
-    }
-    let availability_hour = u16::from(include_f01);
-    report(format!(
-        "{label}: finding newest complete prs+sfc run through f{availability_hour:02}…"
-    ));
-    let date_yyyymmdd = Utc::now().format("%Y%m%d").to_string();
-    let latest = rustwx_models::latest_available_run_for_products_at_forecast_hour(
-        model,
-        None,
-        &date_yyyymmdd,
-        &["prs", "sfc"],
-        availability_hour,
-    )
-    .map_err(|err| {
-        format!(
-            "{label}: latest complete prs+sfc run through f{availability_hour:02} probe failed: {err}"
-        )
-    })?;
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err("cancelled".to_owned());
-    }
-
-    let cycle = latest.cycle;
-    let source = latest.source;
-    let date = cycle.date_yyyymmdd.clone();
-    let cycle_hour = cycle.hour_utc;
-    let profile = processing.ingest_profile();
-    let run_slug = format!("{date}_{cycle_hour:02}z");
-    report(format!(
-        "{label}: selected {date} {cycle_hour:02}z via {source}"
-    ));
-    let progress_sink = std::sync::Mutex::new(progress.clone());
-    let ctx_sink = ctx.clone();
-    let stage_label = label.clone();
-    let on_event = move |event: rw_ingest::IngestEvent| {
-        if let rw_ingest::IngestEvent::StageStarted { hour, stage } = event
-            && let Ok(sender) = progress_sink.lock()
-        {
-            let _ = sender.send(format!("{stage_label} f{hour:02}: {stage:?}…"));
-            ctx_sink.request_repaint();
-        }
-    };
-    let config = rw_ingest::IngestConfig {
-        model,
-        cycle: &cycle,
-        source_override: Some(source),
-        cache_root: std::path::Path::new(CACHE),
-        use_cache: true,
-        store_root: std::path::Path::new(STORE),
-        model_slug: &model_slug,
-        run_slug: &run_slug,
-        profile: &profile,
-        verify: false,
-        progress: &on_event,
-        cancel,
-    };
-    for hour in quick_hrrr_hours(include_f01) {
-        match rw_ingest::ingest_hour_serial(&config, hour) {
-            Ok(_) => {
-                report(format!("{label} {date} {cycle_hour:02}z f{hour:02} stored"));
-            }
-            Err(rw_ingest::IngestError::Cancelled) => {
-                return Err("cancelled".to_owned());
-            }
-            Err(err) => {
-                prune_model_store(STORE, keep_runs);
-                let landed = if hour == 0 {
-                    String::new()
-                } else {
-                    " after f00 stored".to_owned()
-                };
-                return Err(format!(
-                    "{label} {date} {cycle_hour:02}z f{hour:02} failed{landed}: {err}"
-                ));
-            }
-        }
-    }
-    prune_model_store(STORE, keep_runs);
-    let hours = if include_f01 { "f00–f01" } else { "f00" };
-    Ok(format!(
-        "{label} {date} {cycle_hour:02}z {hours} ingested · {}",
-        processing.label()
-    ))
-}
-
 /// Keep only the newest `keep` run directories under store/<model>/
 /// (`keep == 0` = unlimited, never deletes).
 fn prune_model_store(store_root: &str, keep: usize) {
@@ -47462,14 +47070,16 @@ fn normalize_model_download_spec(mut spec: rw_ui::DownloadSpec) -> rw_ui::Downlo
     let Ok(model) = spec.model.parse::<rustwx_core::ModelId>() else {
         return spec;
     };
+    if spec.date.trim().is_empty() {
+        spec.date = Utc::now().format("%Y%m%d").to_string();
+    }
+    spec.cycle = valid_model_download_cycle(model, spec.cycle, Utc::now().hour() as u8);
+    let summary = rustwx_models::model_summary(model);
     let source_supported = spec.source.eq_ignore_ascii_case("auto")
-        || rustwx_models::model_summary(model)
-            .sources
-            .iter()
-            .any(|source| {
-                source.id.to_string().eq_ignore_ascii_case(&spec.source)
-                    && rw_ingest::model_source_ingest_supported(model, source.id)
-            });
+        || summary.sources.iter().any(|source| {
+            source.id.to_string().eq_ignore_ascii_case(&spec.source)
+                && rw_ingest::model_source_ingest_supported(model, source.id)
+        });
     if !source_supported {
         spec.source = "auto".to_owned();
     }
@@ -47478,6 +47088,24 @@ fn normalize_model_download_spec(mut spec: rw_ui::DownloadSpec) -> rw_ui::Downlo
         spec.hours = hours;
     }
     spec
+}
+
+fn valid_model_download_cycle(
+    model: rustwx_core::ModelId,
+    requested_cycle: u8,
+    current_utc_hour: u8,
+) -> u8 {
+    let cycles = rustwx_models::model_summary(model).cycle_hours_utc;
+    if cycles.contains(&requested_cycle) {
+        return requested_cycle;
+    }
+    cycles
+        .iter()
+        .rev()
+        .copied()
+        .find(|cycle| *cycle <= current_utc_hour)
+        .or_else(|| cycles.first().copied())
+        .unwrap_or(requested_cycle)
 }
 
 fn apply_model_download_capability_constraints(
@@ -48568,6 +48196,16 @@ fn default_download_spec(model_slug: &str) -> rw_ui::DownloadSpec {
         cache_dir: settings::model_cache_dir().to_string_lossy().into_owned(),
         ..rw_ui::DownloadSpec::default()
     })
+}
+
+/// BowEcho's model downloader is deliberately explicit-run only. Opening the
+/// panel or changing models never searches providers, and the network-backed
+/// Latest action is hidden; users choose date/cycle/hours themselves or use
+/// the bounded Check availability action.
+fn explicit_model_download_panel(spec: rw_ui::DownloadSpec) -> rw_ui::DownloadPanel {
+    let mut panel = rw_ui::DownloadPanel::new(spec);
+    panel.set_latest_action_visible(false);
+    panel
 }
 
 pub(crate) fn normalize_event_track_model_slug(model_slug: &str) -> String {
@@ -50565,6 +50203,21 @@ fn compact_frame_label(
         "{} {}",
         time_zone.format_hm(frame.identity.scan_time_utc),
         short_frame_status_label(frame.status, frame.identity.scan_time_utc, now_utc)
+    )
+}
+
+fn radar_scrubber_frame_label(
+    selected_index: usize,
+    frame_count: usize,
+    scan_time_utc: DateTime<Utc>,
+    status: FrameStatus,
+) -> String {
+    format!(
+        "Frame {}/{} · {} · {}",
+        selected_index + 1,
+        frame_count,
+        scan_time_utc.format("%H:%M:%SZ"),
+        status.label().to_ascii_uppercase()
     )
 }
 
@@ -62483,6 +62136,16 @@ mod tests {
     }
 
     #[test]
+    fn radar_scrubber_label_identifies_frame_time_and_status() {
+        let scan_time = Utc.with_ymd_and_hms(2026, 8, 14, 18, 57, 0).unwrap();
+
+        assert_eq!(
+            radar_scrubber_frame_label(1, 7, scan_time, FrameStatus::Stale),
+            "Frame 2/7 · 18:57:00Z · STALE"
+        );
+    }
+
+    #[test]
     fn loop_playback_toggle_requires_multiple_frames() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
@@ -73728,7 +73391,7 @@ mod tests {
             community_relay_runtime: None,
             community_relay_network_unmetered_confirmed: false,
             ingest: None,
-            download_panel: rw_ui::DownloadPanel::new(default_download_spec("hrrr")),
+            download_panel: explicit_model_download_panel(default_download_spec("hrrr")),
             sat: None,
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
@@ -73785,9 +73448,6 @@ mod tests {
             tropical: tropical::TropicalState::default(),
             gbvtd: gbvtd_retrieval::GbvtdState::default(),
             radar_opacity: 1.0,
-            model_ingest_rx: None,
-            model_ingest_progress_rx: None,
-            model_ingest_cancel: None,
             model_download_open: false,
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
@@ -76007,40 +75667,8 @@ mod tests {
     }
 
     #[test]
-    fn quick_hrrr_modes_pin_f00_optional_f01_and_never_heavy() {
-        assert_eq!(quick_hrrr_hour_spec(false), "0");
-        assert_eq!(quick_hrrr_hours(false).collect::<Vec<_>>(), vec![0]);
-        assert_eq!(quick_hrrr_hour_spec(true), "0-1");
-        assert_eq!(quick_hrrr_hours(true).collect::<Vec<_>>(), vec![0, 1]);
-
-        let sounding = QuickHrrrProcessing::Sounding.ingest_profile();
-        assert!(!sounding.derived);
-        assert!(!sounding.heavy);
-        assert_eq!(QuickHrrrProcessing::Sounding.profile_slug(), "sounding");
-
-        let full = QuickHrrrProcessing::FullNoHeavy.ingest_profile();
-        assert!(
-            full.derived,
-            "full quick processing keeps normal diagnostics"
-        );
-        assert!(
-            !full.heavy,
-            "quick processing must never enable eCAPE/heavy"
-        );
-        assert_eq!(QuickHrrrProcessing::FullNoHeavy.profile_slug(), "full");
-    }
-
-    #[test]
-    fn model_ingest_start_latch_blocks_quick_and_detailed_overlap() {
-        assert!(!model_ingest_start_conflict(false, false));
-        assert!(model_ingest_start_conflict(true, false));
-        assert!(model_ingest_start_conflict(false, true));
-        assert!(model_ingest_start_conflict(true, true));
-    }
-
-    #[test]
     fn ingest_worker_disconnect_finishes_a_latched_detailed_run_as_failed() {
-        let mut panel = rw_ui::DownloadPanel::new(default_download_spec("hrrr"));
+        let mut panel = explicit_model_download_panel(default_download_spec("hrrr"));
         panel.begin_run(&[0, 1]);
 
         fail_download_for_ingest_worker_disconnect(&mut panel);
@@ -76053,10 +75681,9 @@ mod tests {
     }
 
     #[test]
-    fn background_activity_reports_model_ingest_status_without_panel() {
+    fn background_activity_reports_detailed_model_download_status() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        let (_sender, receiver) = mpsc::channel();
-        app.model_ingest_rx = Some(receiver);
+        app.download_panel.begin_run(&[0]);
         app.status = "HRRR 2026-06-13 12z f03 stored".to_owned();
 
         let activity = app.active_background_activity().expect("activity");
@@ -77786,6 +77413,15 @@ mod tests {
 
         assert_eq!(spec.source, "auto");
         assert!(!spec.derived && !spec.heavy);
+    }
+
+    #[test]
+    fn model_download_cycle_normalization_is_local_and_keeps_valid_picks() {
+        use rustwx_core::ModelId;
+
+        assert_eq!(valid_model_download_cycle(ModelId::Gfs, 6, 17), 6);
+        assert_eq!(valid_model_download_cycle(ModelId::Gfs, 17, 17), 12);
+        assert_eq!(valid_model_download_cycle(ModelId::Gfs, 17, 2), 0);
     }
 
     #[test]

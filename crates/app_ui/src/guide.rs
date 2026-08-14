@@ -1000,18 +1000,12 @@ fn model_data(ui: &mut egui::Ui) {
     subhead(ui, "GETTING DATA");
     action(
         ui,
-        "Latest HRRR f00 / f00–f01",
-        "— fetches f00 from the newest published HRRR cycle, with an Include f01 option. \
-         Processing is either Sounding (volumes plus the required surface fields) or Full \
-         (all normal fields and derived diagnostics). Full quick processing explicitly keeps \
-         eCAPE/heavy off. Work runs below UI priority.",
-    );
-    action(
-        ui,
         "Custom download setup",
-        "— any supported model, init date/cycle, hours spec (\"0-3\" or \"2,4,6\"), and \
-         profile, with a live size estimate before you commit. Use displayed radar time can \
-         seed this form from the radar frame currently on screen.",
+        "— choose any supported model, init date/cycle, hours spec (\"0-3\" or \"2,4,6\"), \
+         and profile, with a local size estimate before you commit. BowEcho does not silently \
+         search for the latest run when this panel opens or the model changes. Check \
+         availability is explicit, and Use displayed radar time can seed the form from the \
+         radar frame currently on screen.",
     );
     action(
         ui,

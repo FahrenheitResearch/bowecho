@@ -666,7 +666,7 @@ impl ViewerApp {
             if ui
                 .button("Download…")
                 .on_hover_text(
-                    "Open the Model window's Download section: Fetch latest one-click ingest, or any run/hours with size + compute estimates",
+                    "Open the Model window's Download section and explicitly choose a model, run, hours, and processing profile",
                 )
                 .clicked()
             {
