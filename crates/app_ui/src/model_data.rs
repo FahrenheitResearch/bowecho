@@ -9425,7 +9425,7 @@ impl ModelDataDock {
 
         egui::Frame::new()
             .fill(theme.inset)
-                .stroke(egui::Stroke::new(1.0_f32, theme.hairline))
+            .stroke(egui::Stroke::new(1.0_f32, theme.hairline))
             .corner_radius(5)
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
