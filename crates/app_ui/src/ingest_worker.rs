@@ -267,7 +267,15 @@ fn resolve_spec(
             spec.model
         ));
     }
-    let mut profile = IngestProfile::preset(&spec.profile)?;
+    // `surface` is model-shaped for provider-statistics lanes.  In
+    // particular, REPS and CMA-GEPS expose exact typed inventories that are
+    // deliberately different from the long-standing deterministic surface
+    // preset.
+    let mut profile = if spec.profile == "surface" {
+        IngestProfile::surface_for_model(model)
+    } else {
+        IngestProfile::preset(&spec.profile)?
+    };
     profile.level_step_hpa = spec.level_step_hpa;
     profile.derived = spec.derived;
     profile.heavy = spec.heavy;
@@ -527,20 +535,6 @@ fn all_ingest_products(model: ModelId) -> Result<Vec<&'static str>, String> {
     Ok(products)
 }
 
-fn latest_probe_hour(model: ModelId) -> u16 {
-    let summary = rustwx_models::model_summary(model);
-    for candidate in [6, 0, 3, 1] {
-        if summary
-            .cycle_hours_utc
-            .iter()
-            .any(|&cycle| rustwx_models::forecast_hour_supported(model, cycle, candidate))
-        {
-            return candidate;
-        }
-    }
-    0
-}
-
 /// Newest available run for the spec's model, walking back from the spec's
 /// date. Probes the whole source catalog (or the spec's pinned source):
 /// the engine prefers the newest cycle over source priority, so a run
@@ -554,14 +548,12 @@ fn find_latest(spec: &DownloadSpec) -> Result<(String, u8), String> {
         .map_err(|_| format!("unknown model '{}'", spec.model))?;
     let source = source_override(spec)?;
     let products = all_ingest_products(model)?;
-    let latest = rustwx_models::latest_available_run_for_products_at_forecast_hour(
-        model,
-        source,
-        &spec.date,
-        &products,
-        latest_probe_hour(model),
-    )
-    .map_err(|err| format!("latest-run probe failed: {err}"))?;
+    // Rusty's model-owned helper probes the earliest supported lead.  That
+    // matters for lanes whose first complete product is not f000 (REPS and
+    // GEPS f003, AIGEFS f006, CPTEC BRAMS f001).
+    let latest =
+        rustwx_models::latest_available_run_for_products(model, source, &spec.date, &products)
+            .map_err(|err| format!("latest-run probe failed: {err}"))?;
     Ok((latest.cycle.date_yyyymmdd, latest.cycle.hour_utc))
 }
 
@@ -923,6 +915,50 @@ mod tests {
         assert!(!profile.derived && !profile.heavy);
         assert_eq!(hours, vec![4, 5, 6]);
         assert_eq!(cycle.hour_utc, 0);
+    }
+
+    #[test]
+    fn resolve_spec_uses_exact_provider_statistics_surface_profiles() {
+        for (model, hour) in [
+            (ModelId::CmaGeps, 3),
+            (ModelId::Geps, 3),
+            (ModelId::Reps, 3),
+        ] {
+            let mut provider = spec();
+            provider.model = model.as_str().to_owned();
+            provider.profile = "surface".to_owned();
+            provider.hours = hour.to_string();
+
+            let (resolved_model, profile, hours, _) =
+                resolve_spec(&provider).unwrap_or_else(|error| panic!("{model}: {error}"));
+            assert_eq!(resolved_model, model);
+            assert_eq!(hours, vec![hour]);
+            assert_eq!(
+                profile,
+                IngestProfile::surface_for_model(model),
+                "{model} must retain its complete typed provider inventory"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_models_with_nonzero_start_expose_their_true_first_lead() {
+        for (model, expected) in [
+            (ModelId::BramsCptec8km, 1),
+            (ModelId::Reps, 3),
+            (ModelId::Geps, 3),
+            (ModelId::IconRu, 3),
+            (ModelId::Aigefs, 6),
+        ] {
+            let summary = rustwx_models::model_summary(model);
+            let first = summary
+                .cycle_hours_utc
+                .iter()
+                .filter_map(|cycle| supported_forecast_hours(model, *cycle).first().copied())
+                .min();
+            assert_eq!(first, Some(expected), "{model}");
+            assert!(!all_ingest_products(model).unwrap().is_empty(), "{model}");
+        }
     }
 
     #[test]

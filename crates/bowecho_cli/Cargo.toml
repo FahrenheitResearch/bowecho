@@ -8,7 +8,7 @@ license.workspace = true
 chrono.workspace = true
 glob = "0.3"
 image = { workspace = true, features = ["webp"] }
-netcrust = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "c8284329311ae7f1ca8f5524f415a18cd97d71e2" }
+netcrust = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "a0c8b90f26ad5a112048c615327e0cbf9b05f046" }
 nexrad_io = { path = "../nexrad_io" }
 radar_core = { path = "../radar_core" }
 render2d = { path = "../render2d" }

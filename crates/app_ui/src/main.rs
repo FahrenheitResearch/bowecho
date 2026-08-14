@@ -35849,7 +35849,7 @@ impl ViewerApp {
                         spec.profile = profile.to_owned();
                         spec.derived = derived;
                         spec.heavy = false;
-                        spec.hours = "0-3".to_owned();
+                        spec.hours = initial_model_download_hours(model, spec.cycle);
                     }
                     let spec = normalize_model_download_spec(spec);
                     if self.download_panel.spec() != &spec {
@@ -47321,6 +47321,8 @@ fn model_ingest_capability_short_note(capability: &rw_ingest::ModelIngestCapabil
     }];
     if capability.limitations.contains(&L::AnalysisOnly) {
         notes.push("analysis");
+    } else if capability.limitations.contains(&L::ProviderStatisticsOnly) {
+        notes.push("stats");
     } else if capability.limitations.contains(&L::SurfaceOnly) {
         notes.push("surface");
     }
@@ -47364,8 +47366,23 @@ fn model_download_cadence_hint(model: rustwx_core::ModelId, cycle: u8) -> &'stat
     use rustwx_core::ModelId;
     match model {
         ModelId::Gfs => "hourly <=120, 3-hourly 123-384",
-        ModelId::Gefs => "3-hourly <=240, 6-hourly 246-384",
-        ModelId::Aigfs | ModelId::Aigefs => "6-hourly 000-384",
+        ModelId::Gdps => "hourly 000-084, 3-hourly 087-240",
+        ModelId::GdpsGeml => "6-hourly 000-240; experimental AI emulator",
+        ModelId::CmaGeps => "3-hourly 000-078, 6-hourly 084-360; provider statistics",
+        ModelId::Rdps => "hourly 000-084",
+        ModelId::Hrdps => "hourly 000-048",
+        ModelId::Reps => "3-hourly 003-072; provider statistics",
+        ModelId::IconEu if cycle.is_multiple_of(6) => "hourly 000-078, 3-hourly 081-120",
+        ModelId::IconEu => "hourly 000-030, then 036/042/048",
+        ModelId::IconD2 => "hourly 000-048",
+        ModelId::IconRu => "3-hourly 003-072",
+        ModelId::Geps => "3-hourly 003-192, 6-hourly 198-384; provider statistics",
+        ModelId::WrfCptec7km => "hourly 000-180; South America",
+        ModelId::BramsCptec8km => "hourly 001-180; South America",
+        ModelId::Gefs if cycle == 0 => "3-hourly 000-384, 6-hourly 390-840; control member",
+        ModelId::Gefs => "3-hourly 000-240, 6-hourly 246-384; control member",
+        ModelId::Aigfs => "6-hourly 000-384",
+        ModelId::Aigefs => "6-hourly 006-384; provider mean",
         ModelId::Hgefs => "6-hourly 000-240",
         ModelId::EcmwfOpenData => {
             "00/12z: 3-hourly <=144 then 6-hourly <=360; 06/18z: 3-hourly <=144"
@@ -47417,6 +47434,12 @@ fn apply_model_download_capability_constraints(
         spec.profile = "analysis".to_owned();
         spec.derived = false;
         spec.heavy = false;
+    } else if capability.limitations.contains(&L::ProviderStatisticsOnly) {
+        let exact = rw_ingest::ingest_profile::IngestProfile::surface_for_model(model);
+        spec.profile = "surface".to_owned();
+        spec.level_step_hpa = exact.level_step_hpa;
+        spec.derived = false;
+        spec.heavy = false;
     } else if capability.limitations.contains(&L::SurfaceOnly) {
         spec.profile = "surface".to_owned();
         spec.derived = false;
@@ -47429,15 +47452,44 @@ fn apply_model_download_capability_constraints(
 
 fn default_model_download_profile(model: rustwx_core::ModelId) -> (&'static str, bool) {
     use rw_ingest::IngestCapabilityLimitation as L;
+    if model == rustwx_core::ModelId::GdpsGeml {
+        return ("sounding", false);
+    }
     let capability = rw_ingest::model_ingest_capability(model);
     if capability.limitations.contains(&L::AnalysisOnly) {
         ("analysis", false)
-    } else if capability.limitations.contains(&L::SurfaceOnly) {
+    } else if capability
+        .limitations
+        .iter()
+        .any(|limitation| matches!(limitation, L::ProviderStatisticsOnly | L::SurfaceOnly))
+    {
         ("surface", false)
     } else if capability.limitations.contains(&L::DerivedProductsDisabled) {
         ("full", false)
     } else {
         ("sounding", false)
+    }
+}
+
+fn initial_model_download_hours(model: rustwx_core::ModelId, cycle: u8) -> String {
+    let mut supported = rustwx_models::supported_forecast_hours(model, cycle);
+    if supported.is_empty()
+        && let Some(fallback_cycle) = rustwx_models::model_summary(model).cycle_hours_utc.first()
+    {
+        supported = rustwx_models::supported_forecast_hours(model, *fallback_cycle);
+    }
+    let first = supported.into_iter().take(4).collect::<Vec<_>>();
+    match first.as_slice() {
+        [] => "0".to_owned(),
+        [only] => only.to_string(),
+        values if values.windows(2).all(|pair| pair[1] == pair[0] + 1) => {
+            format!("{}-{}", values[0], values[values.len() - 1])
+        }
+        values => values
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
     }
 }
 
@@ -48453,7 +48505,7 @@ fn default_download_spec(model_slug: &str) -> rw_ui::DownloadSpec {
         profile: profile.to_owned(),
         derived,
         heavy: false,
-        hours: "0-3".to_owned(),
+        hours: initial_model_download_hours(model, rw_ui::DownloadSpec::default().cycle),
         // ABSOLUTE cache dir: the crate default ("out/cache") is relative,
         // which resolves inside the sealed read-only bundle on macOS
         // (field report: os error 30 on model downloads).
@@ -75177,17 +75229,17 @@ mod tests {
 
     #[test]
     fn layer_success_age_uses_the_supplied_clock() {
-        let now = Instant::now();
+        let installed_at = Instant::now();
         assert_eq!(
-            compact_layer_success_age(now - Duration::from_secs(20), now),
+            compact_layer_success_age(installed_at, installed_at + Duration::from_secs(20),),
             "now"
         );
         assert_eq!(
-            compact_layer_success_age(now - Duration::from_secs(3_780), now),
+            compact_layer_success_age(installed_at, installed_at + Duration::from_secs(3_780),),
             "1h 3m ago"
         );
         assert_eq!(
-            compact_layer_success_age(now - Duration::from_secs(93_600), now),
+            compact_layer_success_age(installed_at, installed_at + Duration::from_secs(93_600),),
             "1d 2h ago"
         );
     }
@@ -77706,6 +77758,18 @@ mod tests {
             "hrrr",
             "hrrr-ak",
             "gfs",
+            "gdps",
+            "gdps-geml",
+            "cma-geps",
+            "rdps",
+            "hrdps",
+            "reps",
+            "icon-eu",
+            "icon-d2",
+            "icon-ru",
+            "geps",
+            "wrf-cptec-7km",
+            "brams-cptec-8km",
             "gdas",
             "gefs",
             "aigfs",
@@ -77750,13 +77814,27 @@ mod tests {
         let nbm = default_download_spec("nbm");
         assert_eq!(
             (nbm.profile.as_str(), nbm.hours.as_str()),
-            ("surface", "1,2,3")
+            ("surface", "1-4")
         );
         assert!(!nbm.derived && !nbm.heavy);
 
         let aifs = default_download_spec("aifs");
-        assert_eq!((aifs.profile.as_str(), aifs.hours.as_str()), ("full", "0"));
+        assert_eq!(
+            (aifs.profile.as_str(), aifs.hours.as_str()),
+            ("full", "0,6,12,18")
+        );
         assert!(!aifs.derived && !aifs.heavy);
+
+        for model in ["cma-geps", "geps", "reps"] {
+            let spec = default_download_spec(model);
+            assert_eq!(spec.profile, "surface", "{model}");
+            assert_eq!(spec.level_step_hpa, 25, "{model}");
+            assert!(!spec.derived && !spec.heavy, "{model}");
+        }
+
+        let geml = default_download_spec("gdps-geml");
+        assert_eq!(geml.profile, "sounding");
+        assert!(!geml.derived && !geml.heavy);
 
         let unrestricted = default_download_spec("gfs");
         assert_eq!(unrestricted.profile, "sounding");
@@ -77772,6 +77850,43 @@ mod tests {
 
         assert_eq!(spec.source, "auto");
         assert!(!spec.derived && !spec.heavy);
+    }
+
+    #[test]
+    fn provider_statistics_normalization_restores_the_exact_safe_shape() {
+        let spec = normalize_model_download_spec(rw_ui::DownloadSpec {
+            model: "geps".to_owned(),
+            profile: "full".to_owned(),
+            derived: true,
+            heavy: true,
+            level_step_hpa: 50,
+            hours: "3-9".to_owned(),
+            ..rw_ui::DownloadSpec::default()
+        });
+
+        assert_eq!(spec.profile, "surface");
+        assert_eq!(spec.level_step_hpa, 25);
+        assert!(!spec.derived && !spec.heavy);
+        assert_eq!(spec.hours, "3,6,9");
+    }
+
+    #[test]
+    fn expanded_model_defaults_start_on_supported_native_hours() {
+        for (model, cycle, expected) in [
+            (rustwx_core::ModelId::Aigefs, 0, "6,12,18,24"),
+            (rustwx_core::ModelId::Reps, 0, "3,6,9,12"),
+            (rustwx_core::ModelId::Geps, 0, "3,6,9,12"),
+            (rustwx_core::ModelId::IconRu, 0, "3,6,9,12"),
+            (rustwx_core::ModelId::BramsCptec8km, 0, "1-4"),
+        ] {
+            assert_eq!(
+                initial_model_download_hours(model, cycle),
+                expected,
+                "{model}"
+            );
+        }
+        assert!(model_download_cadence_hint(rustwx_core::ModelId::Gefs, 0).contains("840"));
+        assert!(model_download_cadence_hint(rustwx_core::ModelId::Aigefs, 0).contains("006"));
     }
 
     #[test]
