@@ -34489,7 +34489,7 @@ impl ViewerApp {
             };
             let stale_note = if run_age > chrono::Duration::hours(3) {
                 format!(
-                    " — run is {}h old, consider Fetch latest",
+                    " — run is {}h old; use Latest, then Download in Acquire model data",
                     run_age.num_hours()
                 )
             } else {
@@ -50011,14 +50011,14 @@ fn scroll_zoom_factor(scroll: f32, zoom_speed_percent: u16) -> f32 {
 
 /// Status line when the hail-env model lookup finds no usable hour:
 /// distinguish runs-exist-but-none-covers-the-displayed-time (the era
-/// guard) from a genuinely empty store, so "Fetch latest" is only
+/// guard) from a genuinely empty store, so the acquisition prompt is only
 /// suggested when it would actually help.
 fn hail_env_no_hour_status(store_has_runs: bool) -> &'static str {
     if store_has_runs {
         "No model run covers the displayed time (store has runs for other days — \
-         Fetch latest or ingest the event day)"
+         use Latest, then Download in Acquire model data, or ingest the event day)"
     } else {
-        "No model runs in the store (Fetch latest first)"
+        "No model runs in the store (use Latest, then Download in Acquire model data)"
     }
 }
 
@@ -62930,13 +62930,13 @@ mod tests {
         assert_eq!(
             hail_env_no_hour_status(dock.newest_run().is_some()),
             "No model run covers the displayed time (store has runs for other days — \
-             Fetch latest or ingest the event day)"
+             use Latest, then Download in Acquire model data, or ingest the event day)"
         );
 
-        // Genuinely empty store keeps the Fetch-latest suggestion.
+        // Genuinely empty store keeps the explicit acquisition suggestion.
         assert_eq!(
             hail_env_no_hour_status(false),
-            "No model runs in the store (Fetch latest first)"
+            "No model runs in the store (use Latest, then Download in Acquire model data)"
         );
     }
 

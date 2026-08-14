@@ -5015,7 +5015,7 @@ impl ModelDataDock {
     pub fn newest_run(&self) -> Option<(String, String, usize)> {
         let tree = self.tree.as_ref()?;
         let model = tree.models.first()?;
-        let run = model.runs.last()?;
+        let run = model.runs.first()?;
         Some((model.model.clone(), run.run.clone(), run.hours.len()))
     }
 
@@ -16076,6 +16076,23 @@ mod tests {
         assert_eq!(selected.run, "20260814_00z");
         assert_eq!(selected.hour, 3);
         assert!(dock.pending_rescan_selection.is_none());
+    }
+
+    #[test]
+    fn newest_run_uses_the_store_trees_newest_first_order() {
+        let ctx = egui::Context::default();
+        let dock = ModelDataDock::new_for_test(
+            &ctx,
+            tree_with_runs(
+                "hrrr",
+                &[("20260814_19z", &[0]), ("20260814_00z", &[0, 1, 2, 3])],
+            ),
+        );
+
+        assert_eq!(
+            dock.newest_run(),
+            Some(("hrrr".to_owned(), "20260814_19z".to_owned(), 1))
+        );
     }
 
     #[test]
