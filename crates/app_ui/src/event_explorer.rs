@@ -421,7 +421,7 @@ impl crate::ViewerApp {
         });
     }
 
-    /// DATA-tab "Event day" row: a date field + Load that pins the
+    /// DATA-tab tornado archive: a date field + Fetch SPC that pins the
     /// reports/outlook day (the map stays put — no zoom, no site change)
     /// and a count line. Nothing here persists; the layer toggles
     /// already do.
@@ -443,9 +443,9 @@ impl crate::ViewerApp {
                 "SPC convective day (12Z-12Z): a 03Z report belongs to the PREVIOUS day's file",
             );
             if ui
-                .button("Load")
+                .button("Fetch SPC")
                 .on_hover_text(
-                    "Show this day's selected storm-report categories and tornado tracks. The map stays put and SPC outlook shading is not enabled.",
+                    "Fetch this convective day's SPC storm reports and tornado tracks, then show a clickable tornado list below. The map stays put and SPC outlook shading is not enabled.",
                 )
                 .clicked()
             {
@@ -601,7 +601,8 @@ impl crate::ViewerApp {
             self.spc_data.fetched_at = None; // outlook keys onto the new day
             // Align the archive browser so a List shows the same day.
             self.archive_date_input = date.format("%Y-%m-%d").to_string();
-            self.status = format!("Event day {date}");
+            self.status = format!("Fetching SPC tornadoes for {date}");
+            self.poll_event_day(ctx);
             ctx.request_repaint();
         }
 
@@ -641,11 +642,66 @@ impl crate::ViewerApp {
                         .failed
                         .is_some_and(|(failed_day, _)| failed_day == day) =>
                     {
-                        ui.weak(format!("{day}: fetch failed — Load retries"));
+                        ui.weak(format!("{day}: fetch failed — Fetch SPC retries"));
                     }
                     None => {
                         ui.weak(format!("{day}: waiting for reports layer"));
                     }
+                }
+            }
+        }
+
+        let tornadoes = self
+            .reports_for_display()
+            .iter()
+            .filter(|report| report.kind == spc_layers::ReportKind::Tornado)
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.event_followed_day().is_some() {
+            ui.separator();
+            if tornadoes.is_empty() {
+                if self.event_explorer.fetch.is_none() {
+                    ui.weak("No tornado reports loaded for this day");
+                }
+            } else {
+                ui.strong(format!("Tornadoes ({})", tornadoes.len()));
+                ui.weak("Click a tornado to load its nearest-radar archive loop.");
+                let mut jump = None;
+                let time_zone = self.time_zone();
+                egui::ScrollArea::vertical()
+                    .id_salt("event_day_tornado_report_list")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for report in &tornadoes {
+                            let magnitude = report
+                                .magnitude_label()
+                                .map(|value| format!(" {value}"))
+                                .unwrap_or_default();
+                            let label = format!(
+                                "{}{} · {}",
+                                time_zone.format_hm(report.time_utc),
+                                magnitude,
+                                report.location
+                            );
+                            let hover = format!(
+                                "{}\nClick to choose the nearest radar and stream the event loop as frames decode.",
+                                report.hover_text()
+                            );
+                            if panel_kit::select_row(
+                                ui,
+                                false,
+                                true,
+                                &label,
+                                Some(&hover),
+                            )
+                            .clicked()
+                            {
+                                jump = Some(report.clone());
+                            }
+                        }
+                    });
+                if let Some(report) = jump {
+                    self.jump_to_storm_report(&report, ctx);
                 }
             }
         }

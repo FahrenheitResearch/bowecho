@@ -1388,7 +1388,6 @@ impl ViewerApp {
     ) {
         self.set_intl_archive_primary_source(&provider_id, &site_id);
         self.sidebar_tab = crate::SidebarTab::Data;
-        self.archive_browse_mode = crate::ArchiveBrowseMode::SiteAndScan;
         self.set_section_open("data_archive", true);
         if self.archive_date_input.trim().is_empty() {
             self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();

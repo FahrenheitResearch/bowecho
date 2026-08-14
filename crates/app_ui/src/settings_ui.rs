@@ -568,10 +568,24 @@ impl ViewerApp {
     /// points. Everything that REPLACES or FEEDS the primary volume source
     /// lives here; layers live in LAYERS.
     pub(crate) fn data_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // The loop transport stays at the top unfolded — archive browsing
-        // shouldn't need a tab switch to play what it just loaded.
-        self.frame_history_panel(ui, ctx);
-        ui.separator();
+        // Keep playback attached to the archive controls it operates. The
+        // compact redesign briefly left the scrubber above unrelated Data
+        // sections and hid tornado browsing behind a mode switch; both made
+        // the established archive workflow needlessly hard to find.
+        self.remembered_section(ui, "data_archive", "Radar archive", true, |app, ui| {
+            app.frame_history_panel(ui, ctx);
+            ui.separator();
+            app.archive_panel(ui, ctx);
+        });
+        self.remembered_section(
+            ui,
+            "data_event_day",
+            "Tornado archive (SPC)",
+            true,
+            |app, ui| {
+                app.event_day_section(ui, ctx);
+            },
+        );
         self.remembered_section(ui, "data_packs", "Data packs", true, |app, ui| {
             app.data_packs_section(ui, ctx);
         });
@@ -584,29 +598,6 @@ impl ViewerApp {
                 app.community_case_directory_section(ui, ctx);
             },
         );
-        self.remembered_section(ui, "data_archive", "Archive", true, |app, ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(
-                    &mut app.archive_browse_mode,
-                    ArchiveBrowseMode::SiteAndScan,
-                    "Site + scan",
-                )
-                .on_hover_text("Choose a radar site and load one scan or a simple loop by time");
-                ui.selectable_value(
-                    &mut app.archive_browse_mode,
-                    ArchiveBrowseMode::EventDay,
-                    "Event day",
-                )
-                .on_hover_text(
-                    "Choose a convective day, filter report categories, then click an event to load its radar frames",
-                );
-            });
-            ui.separator();
-            match app.archive_browse_mode {
-                ArchiveBrowseMode::SiteAndScan => app.archive_panel(ui, ctx),
-                ArchiveBrowseMode::EventDay => app.event_day_section(ui, ctx),
-            }
-        });
         self.remembered_section(
             ui,
             "data_radar_coverage",

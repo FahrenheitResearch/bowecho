@@ -3399,7 +3399,6 @@ struct ViewerApp {
     pending_data_pack_scene: Option<data_packs::DataPackScene>,
     data_pack_expanded: BTreeSet<String>,
     loaded_data_pack: Option<data_packs::LoadedDataPack>,
-    archive_browse_mode: ArchiveBrowseMode,
     /// Explicit, session-only signed case-room directory browse state. The
     /// Data tab never starts a network request merely by being opened.
     community_case_browser: community_cache::CommunityCaseBrowser,
@@ -4980,6 +4979,10 @@ fn load_archive_history_objects_parallel(
             completed += 1;
             match result {
                 Ok(Ok(Some(decoded))) => {
+                    // Put the first completed frame on screen immediately.
+                    // The final batch still selects the newest frame after
+                    // the rest of the archive window finishes.
+                    let select_frame = decoded_frames.is_empty();
                     let _ = ctx.sender.send(AsyncLoadResult {
                         label: format!("L2 {site_id} loop frame"),
                         update: AsyncLoadUpdate::History(
@@ -4987,7 +4990,7 @@ fn load_archive_history_objects_parallel(
                                 frames: vec![decoded.clone()],
                                 selected_index: 0,
                             },
-                            false,
+                            select_frame,
                         ),
                     });
                     decoded_frames.push(decoded);
@@ -8847,13 +8850,6 @@ enum SidebarTab {
     Settings,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ArchiveBrowseMode {
-    #[default]
-    SiteAndScan,
-    EventDay,
-}
-
 impl SidebarTab {
     /// Stable settings slug for this tab — what `app_settings.sidebar_tab`
     /// stores so the active tab survives restarts (like `sidebar_width_pt`).
@@ -9930,7 +9926,6 @@ impl ViewerApp {
             pending_data_pack_scene: None,
             data_pack_expanded: BTreeSet::new(),
             loaded_data_pack: None,
-            archive_browse_mode: ArchiveBrowseMode::default(),
             community_case_browser: community_cache::CommunityCaseBrowser::default(),
             community_case_workspace: community_cases::CommunityCaseWorkspace::default(),
             community_relay_runtime,
@@ -20547,6 +20542,11 @@ impl ViewerApp {
                         if select_frame {
                             selected_decoded_index = Some(decoded_frames.len());
                         }
+                        // Archive-backed loops decode oldest-to-newest. Show the
+                        // first successful frame instead of leaving the map
+                        // blank until the selected (normally newest) scan is
+                        // the last one decoded.
+                        let select_streamed_frame = select_frame || decoded_frames.is_empty();
                         let _ = sender.send(AsyncLoadResult {
                             label: pack_title.clone(),
                             update: AsyncLoadUpdate::History(
@@ -20554,7 +20554,7 @@ impl ViewerApp {
                                     frames: vec![decoded.clone()],
                                     selected_index: 0,
                                 },
-                                select_frame,
+                                select_streamed_frame,
                             ),
                         });
                         decoded_frames.push(decoded);
@@ -21136,6 +21136,7 @@ impl ViewerApp {
                         if select_frame {
                             selected_decoded_index = Some(decoded_frames.len());
                         }
+                        let select_streamed_frame = select_frame || decoded_frames.is_empty();
                         let _ = sender.send(AsyncLoadResult {
                             label: format!("L2 {site_id} archive"),
                             update: AsyncLoadUpdate::History(
@@ -21143,7 +21144,7 @@ impl ViewerApp {
                                     frames: vec![decoded.clone()],
                                     selected_index: 0,
                                 },
-                                select_frame,
+                                select_streamed_frame,
                             ),
                         });
                         decoded_frames.push(decoded);
@@ -73803,7 +73804,6 @@ mod tests {
             pending_data_pack_scene: None,
             data_pack_expanded: BTreeSet::new(),
             loaded_data_pack: None,
-            archive_browse_mode: ArchiveBrowseMode::default(),
             community_case_browser: community_cache::CommunityCaseBrowser::default(),
             community_case_workspace: community_cases::CommunityCaseWorkspace::default(),
             community_relay_runtime: None,
@@ -76085,11 +76085,6 @@ mod tests {
         app.event_explorer.pinned_day = None;
         assert!(app.event_report_kind_visible(spc_layers::ReportKind::Tornado));
         assert!(app.event_report_kind_visible(spc_layers::ReportKind::Hail));
-    }
-
-    #[test]
-    fn archive_browser_defaults_to_simple_site_and_scan_mode() {
-        assert_eq!(ArchiveBrowseMode::default(), ArchiveBrowseMode::SiteAndScan);
     }
 
     #[test]

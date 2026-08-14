@@ -505,8 +505,8 @@ fn archive_loader_window(
 // ---------------------------------------------------------------------
 
 use crate::{
-    ArchiveBrowseMode, FeedSource, LowSweepLoopFilter, MAX_HISTORY_FRAME_LIMIT, SidebarTab,
-    ViewerApp, archive_browser, dock,
+    FeedSource, LowSweepLoopFilter, MAX_HISTORY_FRAME_LIMIT, SidebarTab, ViewerApp,
+    archive_browser, dock,
 };
 
 impl ViewerApp {
@@ -705,7 +705,6 @@ impl ViewerApp {
             }
             Some(LiveArchiveBarAction::BrowseArchiveDays) => {
                 self.sidebar_tab = SidebarTab::Data;
-                self.archive_browse_mode = ArchiveBrowseMode::SiteAndScan;
                 self.set_section_open("data_archive", true);
                 ctx.request_repaint();
             }
