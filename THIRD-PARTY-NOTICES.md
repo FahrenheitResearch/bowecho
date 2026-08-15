@@ -159,3 +159,40 @@ first used. The exact upstream MIT notice is included inside that downloaded
 pack as `PYTMATRIX-LICENSE.txt`. These derived lookup tables are a research
 product, have not been independently validated by BowEcho, and must not be
 treated as an operational radar calibration.
+
+## weather-contours native engine
+
+- **License:** MIT
+- **Copyright:** Copyright (c) 2026 Andrew Snyder / Fahrenheit Research
+- **Vendored source:** `vendor/weather-contours`
+- **Pristine source archive:**
+  `vendor/weather-contours/upstream/autumnplot-weather-contours-sota.zip`
+- **Source archive SHA-256:**
+  `E9B7F22646BCB2C4938A10B1CE98D33705C41BFB75A134DF28C4E8CE9730E453`
+
+BowEcho includes a modified, native-only copy of the dependency-free OIRT
+connected-isoline and COBRM indexed-isoband engine. BowEcho's copy adds stable
+degenerate-saddle behavior, exact zero-length path filtering, checked resource
+budgets, fallible large allocations, and additional validation and tests.
+
+MIT License
+
+Copyright (c) 2026 Andrew Snyder / Fahrenheit Research
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

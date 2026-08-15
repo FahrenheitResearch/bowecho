@@ -7,6 +7,7 @@
 *.lib
 *.exe
 *.zip
+!vendor/weather-contours/upstream/autumnplot-weather-contours-sota.zip
 *.download
 .DS_Store
 Thumbs.db

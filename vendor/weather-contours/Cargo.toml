@@ -1,0 +1,13 @@
+[package]
+name = "weather-contours"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "Resource-bounded connected isolines and watertight isobands for structured weather grids"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]

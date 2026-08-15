@@ -8,6 +8,7 @@ pub const QUICKLOOK_LEVELS_HPA: [u16; 3] = [500, 700, 850];
 const HEIGHT_CONTOUR_M: f32 = 20.0;
 const HEIGHT_MAJOR_M: f32 = 60.0;
 const TEMP_CONTOUR_C: f32 = 2.0;
+const MAX_UPPER_AIR_CONTOUR_LEVELS: usize = 4_096;
 
 #[derive(Clone, Debug)]
 pub struct UpperAirLayer {
@@ -140,8 +141,10 @@ pub fn build_layer(
     )?;
 
     let height_contours =
-        contour_segments(&height_m, nx, ny, HEIGHT_CONTOUR_M, Some(HEIGHT_MAJOR_M));
-    let temp_contours = contour_segments(&temp_c, nx, ny, TEMP_CONTOUR_C, Some(10.0));
+        contour_segments(&height_m, nx, ny, HEIGHT_CONTOUR_M, Some(HEIGHT_MAJOR_M))
+            .map_err(|err| format!("height_iso contours: {err}"))?;
+    let temp_contours = contour_segments(&temp_c, nx, ny, TEMP_CONTOUR_C, Some(10.0))
+        .map_err(|err| format!("temperature_iso contours: {err}"))?;
     let wind_step = wind_step_for_grid(&grid).max(1);
     let wind_count = ny.div_ceil(wind_step) * nx.div_ceil(wind_step);
     let summary = format!(
@@ -239,15 +242,20 @@ fn contour_segments(
     ny: usize,
     interval: f32,
     major_interval: Option<f32>,
-) -> Vec<ContourSegment> {
-    if values.len() != nx * ny || nx < 2 || ny < 2 || interval <= 0.0 {
-        return Vec::new();
+) -> Result<Vec<ContourSegment>, String> {
+    if nx < 2
+        || ny < 2
+        || nx.checked_mul(ny) != Some(values.len())
+        || !interval.is_finite()
+        || interval <= 0.0
+    {
+        return Ok(Vec::new());
     }
     let Some((min, max)) = finite_range(values) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if (max - min).abs() < f32::EPSILON {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut first = (min / interval).ceil() * interval;
     if first <= min + interval * 0.001 {
@@ -258,114 +266,117 @@ fn contour_segments(
         last -= interval;
     }
     if first > last {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let mut segments = Vec::new();
+
+    // Materialize the same level sequence the app-owned marching-squares loop
+    // used. In particular, retain its endpoint exclusion and f32 accumulation
+    // semantics rather than asking the contour engine to derive an interval.
+    let mut levels = Vec::new();
     let mut level = first;
     while level <= last + interval * 0.25 {
-        contour_level(values, nx, ny, level, major_interval, &mut segments);
-        level += interval;
+        if levels.len() >= MAX_UPPER_AIR_CONTOUR_LEVELS {
+            return Err(format!(
+                "upper-air contour request exceeds {MAX_UPPER_AIR_CONTOUR_LEVELS} levels"
+            ));
+        }
+        levels.push(level);
+        let next = level + interval;
+        if !next.is_finite() || next <= level {
+            return Err(format!(
+                "upper-air contour interval {interval} does not advance from level {level}"
+            ));
+        }
+        level = next;
     }
-    segments
+
+    let xs: Vec<f32> = (0..nx).map(|x| x as f32).collect();
+    let ys: Vec<f32> = (0..ny).map(|y| y as f32).collect();
+    // rw-store's read_full_3d contract returns NaN for missing and EMPTY
+    // cells. weather-contours treats every non-finite corner as missing, so
+    // no provider-specific finite fill value is admitted at this boundary.
+    let packed = weather_contours::contour_levels(values, nx, ny, &xs, &ys, &levels)
+        .map_err(|err| format!("weather-contours extraction failed: {err}"))?;
+    packed_contour_segments(&packed, major_interval)
 }
 
-fn contour_level(
-    values: &[f32],
-    nx: usize,
-    ny: usize,
-    level: f32,
+fn packed_contour_segments(
+    packed: &weather_contours::PackedContours,
     major_interval: Option<f32>,
-    out: &mut Vec<ContourSegment>,
-) {
-    for y in 0..ny - 1 {
-        for x in 0..nx - 1 {
-            let idx = |xx: usize, yy: usize| yy * nx + xx;
-            let v = [
-                values[idx(x, y)],
-                values[idx(x + 1, y)],
-                values[idx(x + 1, y + 1)],
-                values[idx(x, y + 1)],
-            ];
-            if !v.iter().all(|value| value.is_finite()) {
-                continue;
-            }
-            let p = [
-                ContourPoint {
-                    x: x as f32,
-                    y: y as f32,
-                },
-                ContourPoint {
-                    x: (x + 1) as f32,
-                    y: y as f32,
-                },
-                ContourPoint {
-                    x: (x + 1) as f32,
-                    y: (y + 1) as f32,
-                },
-                ContourPoint {
-                    x: x as f32,
-                    y: (y + 1) as f32,
-                },
-            ];
-            let edges = [(0usize, 1usize), (1, 2), (2, 3), (3, 0)];
-            let mut hits = Vec::with_capacity(4);
-            for &(a, b) in &edges {
-                if let Some(point) = edge_crossing(p[a], v[a], p[b], v[b], level) {
-                    hits.push(point);
-                }
-            }
-            let major = major_interval
-                .map(|interval| {
-                    let nearest = (level / interval).round() * interval;
-                    (level - nearest).abs() <= interval * 0.01
-                })
-                .unwrap_or(false);
-            match hits.as_slice() {
-                [a, b] => out.push(ContourSegment {
-                    level,
-                    a: *a,
-                    b: *b,
-                    major,
-                }),
-                [a, b, c, d] => {
-                    out.push(ContourSegment {
-                        level,
-                        a: *a,
-                        b: *b,
-                        major,
-                    });
-                    out.push(ContourSegment {
-                        level,
-                        a: *c,
-                        b: *d,
-                        major,
-                    });
-                }
-                _ => {}
-            }
+) -> Result<Vec<ContourSegment>, String> {
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(packed.stats.segment_count)
+        .map_err(|_| {
+            format!(
+                "could not allocate {} upper-air contour segments",
+                packed.stats.segment_count
+            )
+        })?;
+    for path in 0..packed.path_count() {
+        let Some(&level_index) = packed.path_level_indices.get(path) else {
+            continue;
+        };
+        let Some(&level) = packed.levels.get(level_index as usize) else {
+            continue;
+        };
+        let Some((&start, &end)) = packed
+            .path_offsets
+            .get(path)
+            .zip(packed.path_offsets.get(path + 1))
+        else {
+            continue;
+        };
+        let (start, end) = (start as usize, end as usize);
+        if !level.is_finite() || end <= start || end > packed.point_count() {
+            continue;
+        }
+
+        let major = major_interval
+            .filter(|interval| interval.is_finite() && *interval > 0.0)
+            .map(|interval| {
+                let nearest = (level / interval).round() * interval;
+                (level - nearest).abs() <= interval * 0.01
+            })
+            .unwrap_or(false);
+        for point in start..end - 1 {
+            push_packed_segment(packed, point, point + 1, level, major, &mut segments);
+        }
+        if packed.path_is_closed(path) && end - start >= 2 {
+            push_packed_segment(packed, end - 1, start, level, major, &mut segments);
         }
     }
+    Ok(segments)
 }
 
-fn edge_crossing(
-    a: ContourPoint,
-    va: f32,
-    b: ContourPoint,
-    vb: f32,
+fn push_packed_segment(
+    packed: &weather_contours::PackedContours,
+    a_index: usize,
+    b_index: usize,
     level: f32,
+    major: bool,
+    out: &mut Vec<ContourSegment>,
+) {
+    let Some(a) = packed_point(packed, a_index) else {
+        return;
+    };
+    let Some(b) = packed_point(packed, b_index) else {
+        return;
+    };
+    if a == b {
+        return;
+    }
+    out.push(ContourSegment { level, a, b, major });
+}
+
+fn packed_point(
+    packed: &weather_contours::PackedContours,
+    point_index: usize,
 ) -> Option<ContourPoint> {
-    if (va - vb).abs() < f32::EPSILON {
-        return None;
-    }
-    let crosses = (va < level && vb >= level) || (vb < level && va >= level);
-    if !crosses {
-        return None;
-    }
-    let t = ((level - va) / (vb - va)).clamp(0.0, 1.0);
-    Some(ContourPoint {
-        x: a.x + (b.x - a.x) * t,
-        y: a.y + (b.y - a.y) * t,
-    })
+    let float_index = point_index.checked_mul(2)?;
+    let x = *packed.vertices.get(float_index)?;
+    let y = *packed.vertices.get(float_index + 1)?;
+    (x.is_finite() && y.is_finite()).then_some(ContourPoint { x, y })
 }
 
 fn finite_range(values: &[f32]) -> Option<(f32, f32)> {
@@ -423,12 +434,97 @@ mod tests {
     }
 
     #[test]
-    fn marching_squares_draws_simple_gradient() {
+    fn packed_contours_draws_simple_gradient() {
         let values = vec![0.0, 1.0, 0.0, 1.0];
-        let segments = contour_segments(&values, 2, 2, 0.5, None);
+        let segments = contour_segments(&values, 2, 2, 0.5, None).unwrap();
         assert_eq!(segments.len(), 1);
         let segment = segments[0];
         assert!((segment.a.x - 0.5).abs() < 1e-6);
         assert!((segment.b.x - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn packed_adapter_emits_open_and_closes_closed_paths() {
+        let packed = weather_contours::PackedContours {
+            levels: vec![1.0, 2.0],
+            vertices: vec![
+                0.0, 0.0, 1.0, 0.0, // open path
+                10.0, 10.0, 11.0, 10.0, 11.0, 11.0, // closed path
+            ],
+            path_offsets: vec![0, 2, 5],
+            path_level_indices: vec![0, 1],
+            path_flags: vec![0, weather_contours::CLOSED_PATH_FLAG],
+            stats: weather_contours::ContourStats::default(),
+        };
+
+        let segments = packed_contour_segments(&packed, Some(2.0)).unwrap();
+        assert_eq!(segments.len(), 4);
+        assert_eq!(segments[0].a, ContourPoint { x: 0.0, y: 0.0 });
+        assert_eq!(segments[0].b, ContourPoint { x: 1.0, y: 0.0 });
+        assert!(!segments[0].major);
+        assert!(segments[1..].iter().all(|segment| segment.major));
+        assert_eq!(segments[3].a, ContourPoint { x: 11.0, y: 11.0 });
+        assert_eq!(segments[3].b, ContourPoint { x: 10.0, y: 10.0 });
+    }
+
+    #[test]
+    fn packed_adapter_filters_collapsed_and_non_finite_segments() {
+        let packed = weather_contours::PackedContours {
+            levels: vec![1.0],
+            vertices: vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, f32::NAN, 0.0],
+            path_offsets: vec![0, 4],
+            path_level_indices: vec![0],
+            path_flags: vec![0],
+            stats: weather_contours::ContourStats::default(),
+        };
+
+        let segments = packed_contour_segments(&packed, None).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].a, ContourPoint { x: 0.0, y: 0.0 });
+        assert_eq!(segments[0].b, ContourPoint { x: 1.0, y: 0.0 });
+        assert!(segments.iter().all(|segment| {
+            segment.a.x.is_finite()
+                && segment.a.y.is_finite()
+                && segment.b.x.is_finite()
+                && segment.b.y.is_finite()
+                && segment.a != segment.b
+        }));
+    }
+
+    #[test]
+    fn contour_adapter_preserves_level_and_major_semantics() {
+        let values = vec![0.0, 10.0, 0.0, 10.0];
+        let segments = contour_segments(&values, 2, 2, 2.0, Some(4.0)).unwrap();
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| (segment.level, segment.major))
+                .collect::<Vec<_>>(),
+            vec![(2.0, false), (4.0, true), (6.0, false), (8.0, true)]
+        );
+        assert!(segments.iter().all(|segment| segment.a != segment.b));
+    }
+
+    #[test]
+    fn contour_adapter_rejects_a_non_progressing_level_sequence() {
+        let minimum = 1.0e20_f32;
+        let maximum = f32::from_bits(minimum.to_bits() + 4);
+        let error =
+            contour_segments(&[minimum, maximum, minimum, maximum], 2, 2, 1.0, None).unwrap_err();
+        assert!(error.contains("does not advance"), "{error}");
+    }
+
+    #[test]
+    fn rw_store_nan_missing_cells_do_not_emit_invalid_segments() {
+        let values = [0.0, 1.0, f32::NAN, 3.0, 0.0, 1.0, 2.0, 3.0];
+        let segments = contour_segments(&values, 4, 2, 0.5, None).unwrap();
+        assert!(!segments.is_empty());
+        assert!(segments.iter().all(|segment| {
+            segment.a.x.is_finite()
+                && segment.a.y.is_finite()
+                && segment.b.x.is_finite()
+                && segment.b.y.is_finite()
+                && segment.a != segment.b
+        }));
     }
 }

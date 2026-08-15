@@ -338,6 +338,7 @@ dependencies = [
  "tiff",
  "tokio",
  "ui_core",
+ "weather-contours",
  "windows-sys 0.61.2",
  "winresource",
  "wrf-core 0.1.0 (git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=9874474d9566a7536a90f457a48be30caa5f973a)",
@@ -6812,6 +6813,10 @@ dependencies = [
  "once_cell",
  "pkg-config",
 ]
+
+[[package]]
+name = "weather-contours"
+version = "0.2.0"
 
 [[package]]
 name = "web-sys"
