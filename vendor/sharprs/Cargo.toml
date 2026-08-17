@@ -1,0 +1,56 @@
+[package]
+name = "sharprs"
+version = "0.1.0"
+edition = "2021"
+description = "Sounding/Hodograph Analysis and Research Program — Rust port of SHARPpy's sharptab"
+license = "MIT AND BSD-3-Clause"
+repository = "https://github.com/FahrenheitResearch/rusty-weather"
+
+[lib]
+name = "sharprs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "sharprs-render"
+path = "src/main.rs"
+
+[features]
+default = []
+render-png = []
+python = ["pyo3", "numpy"]
+wasm = ["wasm-bindgen"]
+
+[dependencies]
+thiserror = "2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rusttype = "0.9"
+
+# Optional: Python bindings via PyO3
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+numpy = { version = "0.23", optional = true }
+
+# Optional: WASM/JS bindings
+wasm-bindgen = { version = "0.2", optional = true }
+
+[dev-dependencies]
+approx = "0.5"
+
+# BowEcho vendoring change (2026-08-16): BowEcho gates its own crates with
+# `cargo clippy -- -D warnings`, and cargo applies the workspace clippy driver
+# to EVERY workspace member — including this vendored crate. Upstream sharprs
+# is not clean at that level (36 lib lints at import: too_many_arguments,
+# excessive_precision, if_same_then_else, manual_range_contains, …). Rewriting
+# vendored science code to satisfy style lints would destroy the byte-for-byte
+# diff against rusty-weather@cf0ca36 that makes this vendoring auditable, so
+# the package opts ITSELF out of the lint gate instead. This is scoped to this
+# one package; every BowEcho-owned crate keeps -D warnings unchanged.
+# Remove this block if the vendored source is ever cleaned up. See PATCHES.md.
+[lints.rust]
+warnings = "allow"
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+
+[profile.release]
+lto = true
+opt-level = 3

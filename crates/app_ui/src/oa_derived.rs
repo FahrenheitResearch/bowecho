@@ -342,7 +342,7 @@ const SPECS: &[CompositeSpec] = &[
         (0.0, 600.0),
     ),
     spec(
-        "Eff shear",
+        "Eff bulk shear",
         "kt",
         "Wind Shear",
         Some("bulk_shear_0_6km"),
@@ -497,6 +497,13 @@ const SPECS: &[CompositeSpec] = &[
         (0.0, 300.0),
     ),
     spec("Eff inflow base", "m", "Wind Shear", None, (0.0, 3000.0)),
+    spec(
+        "Eff inflow shear",
+        "kt",
+        "Wind Shear",
+        Some("bulk_shear_0_6km"),
+        (0.0, 80.0),
+    ),
     spec("Mean wind 0-6km", "kt", "Wind Shear", None, (0.0, 80.0)),
     spec("Bunkers RM speed", "kt", "Wind Shear", None, (0.0, 60.0)),
     spec("Bunkers LM speed", "kt", "Wind Shear", None, (0.0, 60.0)),
@@ -792,8 +799,13 @@ fn spec_value(name: &str, p: &sharprs::render::compositor::ComputedParams, ex: &
         "EHI 0-1km" => f(p.ehi01),
         "EHI 0-3km" => f(p.ehi03),
         "Eff SRH" => f(p.effective_srh),
-        // effective_bwd is stored in m/s (compositor converts); display kt.
-        "Eff shear" => f(p.effective_bwd.map(|v| v / KT_TO_MS)),
+        // Both effective-layer shears are stored in m/s; display kt. The
+        // names follow the sounding table's vocabulary, where "Effective
+        // Bulk Shear" is the effective bulk wind difference (inflow base ->
+        // half the depth to the MU EL) and "Effective Inflow Shear" is the
+        // shear across the inflow layer itself.
+        "Eff bulk shear" => f(p.effective_bwd.map(|v| v / KT_TO_MS)),
+        "Eff inflow shear" => f(p.eff_shear.map(|v| v / KT_TO_MS)),
         "SRH 0-1km" => p.srh01.0 as f32,
         "SRH 0-3km" => p.srh03.0 as f32,
         "MUCAPE" => p.mupcl.bplus as f32,
@@ -1229,5 +1241,402 @@ mod tests {
         // everywhere (uniform inputs).
         let full = fields[0].expand_full();
         assert_eq!(full.len(), inputs.nx * inputs.ny);
+    }
+
+    /// The HRRR point sounding sharppyrs ships as its golden fixture
+    /// (36.68°N 95.66°W, 2026-06-25 06z F018) — a real model column with a
+    /// deep effective inflow layer, copied verbatim from that crate's
+    /// `testdata/hrrr_example.rs` so both implementations analyze byte-for-byte
+    /// identical input.
+    fn hrrr_kbvo_sounding() -> sharppyrs::SoundingData {
+        sharppyrs::SoundingData {
+            pres: vec![
+                985.8, 975.0, 950.0, 925.0, 900.0, 875.0, 850.0, 825.0, 800.0, 775.0, 750.0, 725.0,
+                700.0, 675.0, 650.0, 625.0, 600.0, 575.0, 550.0, 525.0, 500.0, 475.0, 450.0, 425.0,
+                400.0, 375.0, 350.0, 325.0, 300.0, 275.0, 250.0, 225.0, 200.0, 175.0, 150.0, 125.0,
+                100.0, 75.0, 50.0,
+            ],
+            hght: vec![
+                213.51339721679688,
+                310.502197265625,
+                540.55712890625,
+                775.928466796875,
+                1016.1875610351562,
+                1261.655517578125,
+                1512.6800537109375,
+                1769.573486328125,
+                2032.5953369140625,
+                2302.38818359375,
+                2579.57421875,
+                2864.239501953125,
+                3156.391845703125,
+                3457.74072265625,
+                3767.03076171875,
+                4086.14111328125,
+                4415.43603515625,
+                4756.08935546875,
+                5110.24853515625,
+                5476.9296875,
+                5860.0302734375,
+                6256.8681640625,
+                6671.98388671875,
+                7106.837890625,
+                7562.14111328125,
+                8040.9287109375,
+                8546.40234375,
+                9081.7255859375,
+                9651.3251953125,
+                10260.05078125,
+                10913.732421875,
+                11621.001953125,
+                12392.541015625,
+                13242.4150390625,
+                14188.244140625,
+                15284.6171875,
+                16634.470703125,
+                18388.3046875,
+                20905.138671875,
+            ],
+            tmpc: vec![
+                27.166253662109398,
+                26.73785400390625,
+                26.321624755859375,
+                24.69580078125,
+                22.928131103515625,
+                21.05621337890625,
+                19.1776123046875,
+                17.550933837890625,
+                15.977386474609375,
+                14.38116455078125,
+                12.66644287109375,
+                10.86541748046875,
+                9.091461181640625,
+                7.057037353515625,
+                4.884246826171875,
+                2.462188720703125,
+                0.486236572265625,
+                -1.251922607421875,
+                -3.009368896484375,
+                -4.9248046875,
+                -7.23626708984375,
+                -9.766204833984375,
+                -12.420257568359375,
+                -15.093414306640625,
+                -17.978759765625,
+                -21.136749267578125,
+                -24.5872802734375,
+                -28.24627685546875,
+                -31.993133544921875,
+                -36.24822998046875,
+                -41.21965026855469,
+                -46.25970458984375,
+                -52.4495849609375,
+                -59.24462890625,
+                -66.33905029296875,
+                -67.38008117675781,
+                -65.44467163085938,
+                -64.0802001953125,
+                -58.01991271972656,
+            ],
+            dwpc: vec![
+                23.465356445312523,
+                22.610382080078125,
+                21.294158935546875,
+                20.248138427734375,
+                19.10125732421875,
+                18.41229248046875,
+                17.66229248046875,
+                16.340362548828125,
+                14.72479248046875,
+                13.157073974609375,
+                11.799896240234375,
+                10.030914306640625,
+                7.831939697265625,
+                5.2469482421875,
+                2.956085205078125,
+                1.66229248046875,
+                0.03729248046875,
+                -1.96270751953125,
+                -4.71270751953125,
+                -8.33770751953125,
+                -11.71270751953125,
+                -15.33770751953125,
+                -18.58770751953125,
+                -23.40020751953125,
+                -28.90020751953125,
+                -31.58770751953125,
+                -29.21270751953125,
+                -31.58770751953125,
+                -35.08770751953125,
+                -39.77520751953125,
+                -45.40020751953125,
+                -50.15020751953125,
+                -63.58770751953125,
+                -74.33770751953125,
+                -78.83770751953125,
+                -79.71270751953125,
+                -81.03324890136719,
+                -81.02520751953125,
+                -81.02520751953125,
+            ],
+            wdir: vec![
+                104.60573810089315,
+                138.4558563232422,
+                164.28582763671875,
+                171.779541015625,
+                177.2738800048828,
+                183.77174377441406,
+                190.67617797851562,
+                198.77003479003906,
+                208.36819458007812,
+                219.11795043945312,
+                228.00775146484375,
+                234.8870849609375,
+                240.7722625732422,
+                240.48626708984375,
+                242.9276123046875,
+                250.9413604736328,
+                259.2303771972656,
+                266.01019287109375,
+                270.7851257324219,
+                275.0746765136719,
+                277.2320556640625,
+                278.1169738769531,
+                276.0415954589844,
+                272.3275451660156,
+                268.81414794921875,
+                267.2091369628906,
+                268.7153625488281,
+                271.86041259765625,
+                278.75,
+                292.636962890625,
+                311.5157470703125,
+                328.4579772949219,
+                337.0023193359375,
+                329.3992614746094,
+                314.789306640625,
+                296.55194091796875,
+                293.8990173339844,
+                287.2645568847656,
+                97.38957214355469,
+            ],
+            wspd: vec![
+                4.906037628303065,
+                10.943281173706055,
+                21.63814353942871,
+                27.339815139770508,
+                29.368289947509766,
+                29.07607650756836,
+                28.314294815063477,
+                27.803192138671875,
+                27.638057708740234,
+                27.571807861328125,
+                26.856725692749023,
+                25.70720100402832,
+                23.986652374267578,
+                21.34491539001465,
+                19.908233642578125,
+                21.591846466064453,
+                25.936294555664062,
+                32.476280212402344,
+                36.65385818481445,
+                39.96938705444336,
+                41.354278564453125,
+                42.6301155090332,
+                44.219573974609375,
+                46.13201904296875,
+                47.8463134765625,
+                48.702327728271484,
+                48.98480987548828,
+                48.8314094543457,
+                47.35453414916992,
+                45.13577651977539,
+                45.340389251708984,
+                41.565120697021484,
+                36.321983337402344,
+                39.186214447021484,
+                52.992671966552734,
+                44.226234436035156,
+                29.563827514648438,
+                4.533064365386963,
+                9.24278450012207,
+            ],
+            omeg: Some(vec![
+                0.0,
+                -0.4323129653930664,
+                -1.3790178298950195,
+                -1.8084402084350586,
+                -1.9566125869750977,
+                -1.9744071960449219,
+                -1.9750938415527344,
+                -1.9902076721191406,
+                -2.0170440673828125,
+                -2.006511688232422,
+                -1.904571533203125,
+                -1.6951675415039062,
+                -1.4294052124023438,
+                -0.9965896606445312,
+                -0.5760574340820312,
+                -0.11753463745117188,
+                0.24896240234375,
+                0.5164413452148438,
+                0.6187515258789062,
+                0.6002998352050781,
+                0.5252838134765625,
+                0.4488372802734375,
+                0.43321990966796875,
+                0.5521163940429688,
+                0.7316207885742188,
+                0.9387054443359375,
+                0.98828125,
+                0.6303482055664062,
+                -0.00026702880859375,
+                -0.5542945861816406,
+                -1.0112495422363281,
+                -1.2430343627929688,
+                -0.985260009765625,
+                -0.4290752410888672,
+                -0.2476654052734375,
+                -0.255340576171875,
+                -0.15076017379760742,
+                0.1661156415939331,
+                0.23698043823242188,
+            ]),
+            latitude: Some(36.675168663242175),
+            longitude: Some(-95.65655745938363),
+            missing: None,
+        }
+    }
+
+    /// BowEcho analyses every sounding twice: the sounding window runs
+    /// sharppyrs, the OA mesoanalysis map runs sharprs' compositor. Both are
+    /// SHARPpy ports of the *same* algorithms over the *same* column, so the
+    /// two must agree. This pins the two inputs the composite parameters are
+    /// most sensitive to — the Bunkers storm motion, which sets every
+    /// storm-relative quantity, and the effective bulk wind difference, a bare
+    /// multiplicative term in SCP/STP(CIN)/VTP whose 10 and 12.5 m/s cutoffs
+    /// zero the entire composite when EBWD comes out too small.
+    ///
+    /// sharppyrs is the oracle: its values are the ones the sounding window
+    /// already displays and the ones its own golden fixture records.
+    #[test]
+    fn compositor_matches_sharppyrs_storm_motion_and_ebwd() {
+        let data = hrrr_kbvo_sounding();
+
+        // -- oracle: the sounding window's analysis --------------------------
+        let oracle = sharppyrs::Profile::new(data.clone()).expect("sharppyrs profile builds");
+        let dv = sharppyrs::DerivedParams::compute(&oracle);
+        assert!(
+            oracle.ebottom.is_finite() && oracle.etop.is_finite(),
+            "fixture must have an effective inflow layer to compare against"
+        );
+        let oracle_ebwd_kt = dv.ebwd.0.hypot(dv.ebwd.1);
+        let oracle_eff_shear_kt = dv.eff_shear.0.hypot(dv.eff_shear.1);
+        assert!(
+            (oracle_ebwd_kt - oracle_eff_shear_kt).abs() > 5.0,
+            "fixture must separate EBWD ({oracle_ebwd_kt:.2} kt) from the \
+             inflow-layer shear ({oracle_eff_shear_kt:.2} kt), else the test \
+             cannot tell the two apart"
+        );
+
+        // -- subject: the OA map layer's analysis ----------------------------
+        let station = sharprs::profile::StationInfo {
+            station_id: "OA".to_owned(),
+            latitude: data.latitude.unwrap_or(f64::NAN),
+            longitude: data.longitude.unwrap_or(f64::NAN),
+            elevation: f64::NAN,
+            datetime: String::new(),
+        };
+        let profile = sharprs::profile::Profile::new(
+            &data.pres,
+            &data.hght,
+            &data.tmpc,
+            &data.dwpc,
+            &data.wdir,
+            &data.wspd,
+            data.omeg.as_deref().unwrap_or(&[]),
+            station,
+        )
+        .expect("sharprs profile builds");
+        let p = sharprs::render::compositor::compute_all_params(&profile);
+
+        // Measured agreement on this column is exact to every printed digit;
+        // 0.1% leaves headroom for the two crates' slightly different
+        // thermodynamic normalizations reaching the MU parcel EL, and the
+        // defects this guards against are 46-49% errors.
+        const TOL: f64 = 0.001;
+        let mut report: Vec<String> = Vec::new();
+        let mut bad: Vec<String> = Vec::new();
+        let mut check = |what: &str, map: f64, sounding: f64, tol: f64| {
+            let rel = (map - sounding).abs() / sounding.abs().max(1.0);
+            let row = format!(
+                "{what}: map {map:.4}, sounding {sounding:.4}, off by {:.2}% (tol {:.1}%)",
+                rel * 100.0,
+                tol * 100.0
+            );
+            // A non-finite ratio means one side produced NaN, which must fail
+            // rather than silently compare equal.
+            if !rel.is_finite() || rel > tol {
+                bad.push(row.clone());
+            }
+            report.push(row);
+        };
+        check("Bunkers RM u (kt)", p.rstu, oracle.srwind.0, TOL);
+        check("Bunkers RM v (kt)", p.rstv, oracle.srwind.1, TOL);
+        check("Bunkers LM u (kt)", p.lstu, oracle.srwind.2, TOL);
+        check("Bunkers LM v (kt)", p.lstv, oracle.srwind.3, TOL);
+        let map_ebwd_kt = p.effective_bwd.expect("map computes an EBWD") / KT_TO_MS;
+        check("EBWD (kt)", map_ebwd_kt, oracle_ebwd_kt, TOL);
+        // The inflow-layer shear the fix split out must survive as its own
+        // quantity and keep matching the sounding window's "Eff Inflow" row.
+        let map_eff_shear_kt = p.eff_shear.expect("map keeps the inflow-layer shear") / KT_TO_MS;
+        check(
+            "Eff Inflow shear (kt)",
+            map_eff_shear_kt,
+            oracle_eff_shear_kt,
+            TOL,
+        );
+        check(
+            "Eff SRH (m2/s2)",
+            p.effective_srh.unwrap_or(f64::NAN),
+            oracle.right_esrh,
+            TOL,
+        );
+
+        assert!(
+            bad.is_empty(),
+            "sharprs compositor disagrees with the sharppyrs sounding window:\n  {}\n\
+             full comparison:\n  {}",
+            bad.join("\n  "),
+            report.join("\n  ")
+        );
+
+        // Why the conflation was fatal rather than merely biasing: `vtp_mod`'s
+        // EBWD term is `0.0` for EBWD <= 20 m/s and multiplies straight
+        // through. Feed it the inflow-layer shear the map used to pass as
+        // EBWD and it returns an exact zero on this supercell column.
+        let vtp_from_inflow_shear = sharprs::params::composites::vtp_mod(
+            p.mlpcl.bplus,
+            p.effective_srh.expect("effective SRH"),
+            p.eff_shear.expect("inflow-layer shear"),
+            p.mlpcl.lclhght,
+            p.mlpcl.bminus,
+            p.mlpcl.b3km,
+            p.lr75.expect("700-500 lapse rate"),
+        );
+        assert_eq!(
+            vtp_from_inflow_shear,
+            Some(0.0),
+            "the pre-fix EBWD substitute must reproduce the zeroed VTP"
+        );
+
+        // The user-visible symptom, pinned directly: on a supercell column the
+        // shear-gated composites must not paint zero.
+        for (name, value) in [("SCP", p.scp), ("STP (CIN)", p.stp_cin), ("VTP", p.vtp_mod)] {
+            assert!(
+                value.is_some_and(|v| v > 0.0),
+                "{name} must be positive on this supercell column, got {value:?}"
+            );
+        }
     }
 }

@@ -17,6 +17,7 @@ members = [
     "crates/simradar_validation",
     "crates/styles",
     "crates/ui_core",
+    "vendor/sharprs",
     "vendor/weather-contours",
 ]
 resolver = "3"
@@ -79,8 +80,18 @@ strip = false
 hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "cf0ca3693650153ff0f79a0e60c3ec2da7d0af01" }
 openjp2 = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "cf0ca3693650153ff0f79a0e60c3ec2da7d0af01" }
 
-# sharppyrs pulls sharprs from its standalone repo; unify it with the
-# rusty-weather-vendored sharprs every other crate here uses so the two
-# resolve to ONE crate (identical types).
+# sharprs reaches this workspace from TWO git sources: directly from
+# rusty-weather, and transitively via sharppyrs, which pulls it from the
+# standalone sharprs repo. Both are redirected to the vendored copy in
+# vendor/sharprs so everything resolves to ONE crate (identical types) and so
+# sharprs fixes can land here without advancing the shared rusty-weather rev,
+# which would move ~30 unrelated crates at once. A [patch] table replaces
+# packages by NAME within a single source, so listing only `sharprs` under the
+# rusty-weather source leaves rw-sat, rw-store, rw-ui, rw-glm, rustwx-sounding,
+# rustwx-render, netcrust, grib-core, hdf5-reader and openjp2 pinned at
+# cf0ca36 and unmoved. See vendor/sharprs/PATCHES.md for import lineage.
 [patch."https://github.com/FahrenheitResearch/sharprs"]
-sharprs = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "cf0ca3693650153ff0f79a0e60c3ec2da7d0af01" }
+sharprs = { path = "vendor/sharprs" }
+
+[patch."https://github.com/FahrenheitResearch/rusty-weather"]
+sharprs = { path = "vendor/sharprs" }
