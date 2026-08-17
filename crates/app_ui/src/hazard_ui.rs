@@ -1854,12 +1854,13 @@ impl ViewerApp {
     pub(crate) fn hazard_overlay_shapes_for_draw(
         &self,
         rect: egui::Rect,
+        fills_enabled: bool,
     ) -> Option<Arc<HazardOverlayShapes>> {
         if !self.hazards_visible {
             return None;
         }
         self.hazard_overlay.as_ref()?;
-        Some(self.cached_hazard_overlay_shapes(rect))
+        Some(self.cached_hazard_overlay_shapes_with_fills(rect, fills_enabled))
     }
 
     pub(crate) fn draw_hazard_fills(
@@ -1979,9 +1980,22 @@ impl ViewerApp {
         }
     }
 
+    /// Fills-on shorthand. Production paints go through
+    /// `cached_hazard_overlay_shapes_with_fills`, which defers the union while
+    /// the map is dragged; this wrapper keeps the settled-frame default for
+    /// tests that do not exercise the deferral.
+    #[cfg(test)]
     pub(crate) fn cached_hazard_overlay_shapes(
         &self,
         rect: egui::Rect,
+    ) -> Arc<HazardOverlayShapes> {
+        self.cached_hazard_overlay_shapes_with_fills(rect, true)
+    }
+
+    pub(crate) fn cached_hazard_overlay_shapes_with_fills(
+        &self,
+        rect: egui::Rect,
+        fills_enabled: bool,
     ) -> Arc<HazardOverlayShapes> {
         // Polygon projection + ear-clip tessellation is cached per view key:
         // idle repaints reuse it; pan/zoom/selection/content changes rebuild.
@@ -1990,6 +2004,9 @@ impl ViewerApp {
         let frame_time = self.hazard_overlay_timeline_time();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.view_shape_key(2, rect).hash(&mut hasher);
+        // Drag frames build outline-only; the settled frame must not reuse
+        // that entry, so the flag is part of the identity.
+        fills_enabled.hash(&mut hasher);
         self.hazard_overlay_generation.hash(&mut hasher);
         self.selected_hazard_index.hash(&mut hasher);
         // Style edits must repaint: the registry signature covers every
@@ -2007,15 +2024,35 @@ impl ViewerApp {
         let mut cache = self.hazard_shape_cache.borrow_mut();
         cache
             .get_or_insert_with(key, || {
-                Arc::new(self.build_hazard_overlay_shapes(rect, frame_time))
+                Arc::new(self.build_hazard_overlay_shapes_with_fills(
+                    rect,
+                    frame_time,
+                    fills_enabled,
+                ))
             })
             .clone()
     }
 
+    /// Fills-on shorthand for tests; see `cached_hazard_overlay_shapes`.
+    #[cfg(test)]
     pub(crate) fn build_hazard_overlay_shapes(
         &self,
         rect: egui::Rect,
         frame_time: Option<DateTime<Utc>>,
+    ) -> HazardOverlayShapes {
+        self.build_hazard_overlay_shapes_with_fills(rect, frame_time, true)
+    }
+
+    /// `fills_enabled == false` skips fill collection and the same-family
+    /// scanline union entirely, keeping outlines and labels. That union is
+    /// quadratic in the visible same-family record count, which is what
+    /// stalls a far-zoom pan on a dense warning day, so it is deferred while
+    /// the map is under the pointer and paid once on the settled frame.
+    pub(crate) fn build_hazard_overlay_shapes_with_fills(
+        &self,
+        rect: egui::Rect,
+        frame_time: Option<DateTime<Utc>>,
+        fills_enabled: bool,
     ) -> HazardOverlayShapes {
         let mut out = HazardOverlayShapes {
             fill_shapes: Vec::new(),
@@ -2138,7 +2175,8 @@ impl ViewerApp {
             // Avoid all tessellation/union work when there is nothing to
             // paint; this also makes the user-facing Fill=0 setting an actual
             // performance escape hatch.
-            if fill_alpha > 0
+            if fills_enabled
+                && fill_alpha > 0
                 && !has_screen_jump
                 && let Some(fill_points) = bounded_hazard_fill_points(
                     &outline_points,
@@ -2828,12 +2866,12 @@ mod tests {
         app.map_scale = 360.0;
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
 
-        let prepared = app.hazard_overlay_shapes_for_draw(rect).unwrap();
+        let prepared = app.hazard_overlay_shapes_for_draw(rect, true).unwrap();
         let same_pane_cache_entry = app.cached_hazard_overlay_shapes(rect);
         assert!(Arc::ptr_eq(&prepared, &same_pane_cache_entry));
 
         app.hazards_visible = false;
-        assert!(app.hazard_overlay_shapes_for_draw(rect).is_none());
+        assert!(app.hazard_overlay_shapes_for_draw(rect, true).is_none());
     }
 
     #[test]

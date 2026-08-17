@@ -31834,14 +31834,18 @@ impl ViewerApp {
             ui.ctx().request_repaint();
         }
 
-        if !armed
+        // The one signal that means "this map is being panned right now":
+        // a drag on the map's own response that no armed tool has claimed.
+        // Hazard fill deferral keys off it, so a plain click, a slider drag,
+        // a timeline scrub or a window drag never blanks the fills.
+        let map_pan_drag_active = !armed
             && !annotating
             && !cross_section_handle_owns_pointer
             && !plot_box_owns_pointer
             && !vol3d_box_drag_owns_pointer
             && !gbvtd_placing
-            && response.dragged()
-        {
+            && response.dragged();
+        if map_pan_drag_active {
             let delta = response.drag_delta();
             if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
                 // Pan through the projection's own inverse: linear degree
@@ -31943,7 +31947,7 @@ impl ViewerApp {
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_radar_layer_renders(ui.ctx(), rect);
         self.request_texture_render(ui.ctx(), rect);
-        let hazard_shapes = self.hazard_overlay_shapes_for_draw(rect);
+        let hazard_shapes = self.hazard_overlay_shapes_for_draw(rect, !map_pan_drag_active);
         self.draw_hazard_fills(painter, hazard_shapes.as_deref());
         self.draw_radar_overlay_layers(ui.ctx(), painter, rect);
         // Max-value swath trail, beneath the live frame so the current echo
@@ -32307,6 +32311,10 @@ impl ViewerApp {
         let mut hovered_state = None;
         let mut hovered_cell: Option<usize> = None;
         let mut hovers: Vec<Option<egui::Pos2>> = Vec::with_capacity(cells.len());
+        // Pan is shared across panes, so one flag for the whole grid: true
+        // only if some cell's own drag is panning the camera this frame.
+        // Resolved by the interaction pass below, read by the paint pass.
+        let mut map_pan_drag_active = false;
 
         // Interaction pass: settle pan/zoom/clicks for EVERY cell first, so
         // the paint pass below renders all panes with the same final
@@ -32362,13 +32370,14 @@ impl ViewerApp {
 
             // Shared pan: dragging any cell moves every pane in sync. Vrot
             // only owns click samples, not drag navigation.
-            if !armed
+            let cell_pan_drag_active = !armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
                 && !plot_box_owns_pointer
                 && !vol3d_box_drag_owns_pointer
-                && response.dragged()
-            {
+                && response.dragged();
+            map_pan_drag_active |= cell_pan_drag_active;
+            if cell_pan_drag_active {
                 let delta = response.drag_delta();
                 if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
                     // Projection-true pan — see the single-pane handler.
@@ -32719,7 +32728,7 @@ impl ViewerApp {
                 .pane_product_cut(cell_index)
                 .unwrap_or_else(|| (self.selected_product.clone(), self.selected_cut));
             let cell_painter = ui.painter_at(cell);
-            let hazard_shapes = self.hazard_overlay_shapes_for_draw(cell);
+            let hazard_shapes = self.hazard_overlay_shapes_for_draw(cell, !map_pan_drag_active);
             self.draw_basemap(&cell_painter, cell);
             self.draw_spc_outlooks(&cell_painter, cell);
             self.draw_upper_air_layer(&cell_painter, cell);
@@ -70237,6 +70246,149 @@ mod tests {
             !app.cached_hazard_overlay_shapes(rect)
                 .outline_shapes
                 .is_empty()
+        );
+    }
+
+    /// The same-family fill union is quadratic in the visible same-family
+    /// record count, so it is skipped while the map is under the pointer and
+    /// paid once on the settled frame. Outlines must keep painting during the
+    /// drag: only the fills are deferred.
+    #[test]
+    fn hazard_overlay_defers_fill_union_while_map_is_dragged() {
+        let first = test_hazard_record(
+            "KCTP.SV.W.0201",
+            "SVR 0201",
+            "severe thunderstorm",
+            square_hazard_points(-1.0, -1.0, 1.0, 1.0),
+        );
+        let second = test_hazard_record(
+            "KCTP.SV.W.0202",
+            "SVR 0202",
+            "severe thunderstorm",
+            square_hazard_points(0.0, 0.0, 2.0, 2.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![first, second]);
+        app.map_center_lon = 0.5;
+        app.map_center_lat = 0.5;
+        app.map_scale = 115.0;
+        let rect = test_map_rect();
+
+        let settled = app.build_hazard_overlay_shapes_with_fills(rect, None, true);
+        assert!(
+            !settled.fill_shapes.is_empty(),
+            "the settled frame must pay the same-family fill union"
+        );
+        assert!(!settled.outline_shapes.is_empty());
+
+        let dragging = app.build_hazard_overlay_shapes_with_fills(rect, None, false);
+        assert!(
+            dragging.fill_shapes.is_empty(),
+            "the fill union must be deferred while the map is dragged"
+        );
+        assert!(
+            !dragging.outline_shapes.is_empty(),
+            "outlines must stay live during the drag"
+        );
+    }
+
+    /// The deferral is only safe if the outline-only build cannot be served
+    /// back for the settled frame, so `fills_enabled` is part of the shape
+    /// cache identity.
+    #[test]
+    fn hazard_shape_cache_keys_on_fill_deferral() {
+        let first = test_hazard_record(
+            "KCTP.SV.W.0203",
+            "SVR 0203",
+            "severe thunderstorm",
+            square_hazard_points(-1.0, -1.0, 1.0, 1.0),
+        );
+        let second = test_hazard_record(
+            "KCTP.SV.W.0204",
+            "SVR 0204",
+            "severe thunderstorm",
+            square_hazard_points(0.0, 0.0, 2.0, 2.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![first, second]);
+        app.map_center_lon = 0.5;
+        app.map_center_lat = 0.5;
+        app.map_scale = 115.0;
+        let rect = test_map_rect();
+
+        // Drag frame first, so a stale outline-only entry is in the cache.
+        assert!(
+            app.cached_hazard_overlay_shapes_with_fills(rect, false)
+                .fill_shapes
+                .is_empty()
+        );
+        assert!(
+            !app.cached_hazard_overlay_shapes_with_fills(rect, true)
+                .fill_shapes
+                .is_empty(),
+            "the settled frame must not reuse the drag-built outline-only entry"
+        );
+        // And the reverse: the settled entry must not leak fills into a drag.
+        assert!(
+            app.cached_hazard_overlay_shapes_with_fills(rect, false)
+                .fill_shapes
+                .is_empty()
+        );
+    }
+
+    /// Both hazard call sites gate fill deferral on the map response's own
+    /// `dragged()`, not on global pointer state, because a global "any button
+    /// is down" signal blanked every warning fill on a plain map click, on an
+    /// alpha-slider drag and on a timeline scrub. This pins the egui semantic
+    /// that makes that gate correct through a real interaction pass: a held
+    /// press that has not moved is NOT a drag, and only actual pointer travel
+    /// flips it. Driven through `egui::Context` with synthetic pointer events;
+    /// the production call sites themselves need a full paint pass, so this
+    /// covers the predicate, not the wiring.
+    #[test]
+    fn map_pan_drag_signal_ignores_a_held_click_and_fires_only_on_pointer_travel() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 400.0));
+        let map = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(300.0, 300.0));
+        let press = egui::pos2(100.0, 100.0);
+        let frames = vec![
+            // Warm-up: egui resolves interaction against the PREVIOUS frame's
+            // widget rects, so the map must exist before the press lands.
+            vec![egui::Event::PointerMoved(press)],
+            // Press without any travel: a selection click on a warning.
+            vec![egui::Event::PointerButton {
+                pos: press,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+            // Still held, still stationary.
+            vec![],
+            // Now the pointer actually travels: this is the pan.
+            vec![egui::Event::PointerMoved(press + egui::vec2(80.0, 0.0))],
+            vec![egui::Event::PointerMoved(press + egui::vec2(160.0, 0.0))],
+        ];
+        let mut dragged = Vec::new();
+        for events in frames {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let response = ui.interact(
+                    map,
+                    egui::Id::new("map-pan-drag-signal"),
+                    egui::Sense::click_and_drag(),
+                );
+                dragged.push(response.dragged());
+            });
+        }
+        assert!(
+            !dragged[0] && !dragged[1] && !dragged[2],
+            "a held click that never travels must not defer the fill union: {dragged:?}"
+        );
+        assert!(
+            dragged[3] && dragged[4],
+            "pointer travel with the button down must read as a map pan: {dragged:?}"
         );
     }
 
