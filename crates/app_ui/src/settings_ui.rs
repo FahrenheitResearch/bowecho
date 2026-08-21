@@ -7,6 +7,46 @@
 
 use crate::*;
 
+fn custom_tab_add_sections_picker(
+    ui: &mut egui::Ui,
+    tab_id: u32,
+    custom: &mut sidebar_layout::CustomTab,
+) -> egui::CollapsingResponse<()> {
+    egui::CollapsingHeader::new("Add sections")
+        .id_salt(("custom_tab_add_sections", tab_id))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.weak("Expand a category, then check each section to include on this tab.");
+            for category in sidebar_layout::BuiltinTab::ALL {
+                egui::CollapsingHeader::new(category.label())
+                    .id_salt(("custom_tab_add_sections_category", tab_id, category.slug()))
+                    .show(ui, |ui| {
+                        for spec in sidebar_layout::SECTION_SPECS
+                            .iter()
+                            .filter(|spec| spec.tab == category)
+                        {
+                            // The editor section itself remains reachable from
+                            // the fixed +Tab affordance; allowing it in a custom
+                            // tab is useful and does not recursively render.
+                            let mut chosen = custom.sections.iter().any(|slug| slug == spec.slug);
+                            let enabled = chosen
+                                || custom.sections.len() < sidebar_layout::MAX_CUSTOM_SECTIONS;
+                            if ui
+                                .add_enabled(enabled, egui::Checkbox::new(&mut chosen, spec.title))
+                                .changed()
+                            {
+                                if chosen {
+                                    custom.sections.push(spec.slug.to_owned());
+                                } else {
+                                    custom.sections.retain(|slug| slug != spec.slug);
+                                }
+                            }
+                        }
+                    });
+            }
+        })
+}
+
 impl ViewerApp {
     pub(crate) fn customization_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.open_color_tables_request {
@@ -2623,29 +2663,7 @@ impl ViewerApp {
                 }
 
                 ui.separator();
-                ui.strong("Add sections");
-                for category in BuiltinTab::ALL {
-                    ui.collapsing(category.label(), |ui| {
-                        for spec in SECTION_SPECS.iter().filter(|spec| spec.tab == category) {
-                            // The editor section itself remains reachable from
-                            // the fixed +Tab affordance; allowing it in a custom
-                            // tab is useful and does not recursively render.
-                            let mut chosen = custom.sections.iter().any(|slug| slug == spec.slug);
-                            let enabled = chosen
-                                || custom.sections.len() < sidebar_layout::MAX_CUSTOM_SECTIONS;
-                            if ui
-                                .add_enabled(enabled, egui::Checkbox::new(&mut chosen, spec.title))
-                                .changed()
-                            {
-                                if chosen {
-                                    custom.sections.push(spec.slug.to_owned());
-                                } else {
-                                    custom.sections.retain(|slug| slug != spec.slug);
-                                }
-                            }
-                        }
-                    });
-                }
+                custom_tab_add_sections_picker(ui, id, &mut custom);
 
                 edited.custom_tabs[index] = custom;
                 match tab_action {
@@ -3702,5 +3720,106 @@ impl ViewerApp {
         });
         ui.weak(format!("Store: {}", settings::model_store_dir().display()))
             .on_hover_text("Model store location (rusty-weather rw-store layout)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct PickerFrame {
+        first_header: Option<egui::Rect>,
+        first_body_rendered: bool,
+        second_body_rendered: bool,
+    }
+
+    fn picker_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(500.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn picker_pointer_input(position: egui::Pos2, pressed: bool) -> egui::RawInput {
+        picker_input(vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            },
+        ])
+    }
+
+    fn picker_frame(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        first: &mut sidebar_layout::CustomTab,
+        second: &mut sidebar_layout::CustomTab,
+    ) -> PickerFrame {
+        let mut state = PickerFrame::default();
+        let _ = ctx.run_ui(input, |ui| {
+            let first_response = custom_tab_add_sections_picker(ui, first.id, first);
+            state.first_header = Some(first_response.header_response.rect);
+            state.first_body_rendered = first_response.body_returned.is_some();
+            let second_response = custom_tab_add_sections_picker(ui, second.id, second);
+            state.second_body_rendered = second_response.body_returned.is_some();
+        });
+        state
+    }
+
+    fn click_first_picker(
+        ctx: &egui::Context,
+        position: egui::Pos2,
+        first: &mut sidebar_layout::CustomTab,
+        second: &mut sidebar_layout::CustomTab,
+    ) -> PickerFrame {
+        let _ = picker_frame(ctx, picker_pointer_input(position, true), first, second);
+        picker_frame(ctx, picker_pointer_input(position, false), first, second)
+    }
+
+    #[test]
+    fn add_sections_heading_is_clickable_and_scoped_per_custom_tab() {
+        let ctx = egui::Context::default();
+        ctx.global_style_mut(|style| style.animation_time = 0.0);
+        let mut first = sidebar_layout::CustomTab {
+            id: 1,
+            title: "First".to_owned(),
+            sections: Vec::new(),
+        };
+        let mut second = sidebar_layout::CustomTab {
+            id: 2,
+            title: "Second".to_owned(),
+            sections: Vec::new(),
+        };
+
+        let initial = picker_frame(&ctx, picker_input(Vec::new()), &mut first, &mut second);
+        assert!(initial.first_body_rendered, "the picker starts expanded");
+        assert!(initial.second_body_rendered, "each picker starts expanded");
+        let header = initial
+            .first_header
+            .expect("the Add sections disclosure must be laid out");
+
+        let collapsed = click_first_picker(&ctx, header.center(), &mut first, &mut second);
+        assert!(
+            !collapsed.first_body_rendered,
+            "clicking Add sections must collapse its section picker"
+        );
+        assert!(
+            collapsed.second_body_rendered,
+            "one custom tab's disclosure state must not affect another tab"
+        );
+
+        let reopened = click_first_picker(&ctx, header.center(), &mut first, &mut second);
+        assert!(
+            reopened.first_body_rendered,
+            "clicking Add sections again must reopen its section picker"
+        );
     }
 }
