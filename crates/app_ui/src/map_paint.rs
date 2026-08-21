@@ -205,26 +205,31 @@ impl ViewerApp {
     /// max outbound), connecting line, and a card with
     /// Vrot = (|Vin| + |Vout|) / 2, couplet diameter, and beam height.
     pub(crate) fn draw_vrot_tool(
-        &self,
+        &mut self,
         painter: &egui::Painter,
         rect: egui::Rect,
         volume: Option<&Arc<RadarVolume>>,
         product: &DisplayProduct,
         cut: usize,
+        pane_index: usize,
     ) {
         if self.vrot_points.is_empty() {
             return;
         }
-        let Some(provenance) = self.vrot_provenance.as_ref() else {
+        let Some(provenance) = self.vrot_provenance.clone() else {
             return;
         };
         let Some(volume) = volume else {
             return;
         };
-        if !provenance.matches_display(volume, product, cut) {
+        if !provenance.matches_basic_display(volume, product, cut) {
+            return;
+        }
+        let current = self.vrot_provenance_for_volume(Arc::clone(volume), product, cut, pane_index);
+        if current.as_ref() != Some(&provenance) {
             // A grid pane with a different product/tilt/source must never
-            // inherit another pane's measurement, even for the one frame
-            // before the centralized lifecycle reconciler runs.
+            // inherit another pane's measurement, even when both panes share
+            // a volume Arc but use different Analyst-v4 temporal anchors.
             return;
         }
         let positions: Vec<egui::Pos2> = self
@@ -700,6 +705,9 @@ impl ViewerApp {
         painter: &egui::Painter,
         rect: egui::Rect,
         hover: Option<egui::Pos2>,
+        product: &DisplayProduct,
+        cut: usize,
+        pane_index: usize,
     ) {
         if !self.show_inspector_card {
             return;
@@ -712,7 +720,11 @@ impl ViewerApp {
             if !rect.contains(position) {
                 return;
             }
-            (position, self.cursor_readout_at(rect, position), true)
+            (
+                position,
+                self.cursor_readout_for_pane(rect, position, product, cut, pane_index),
+                true,
+            )
         } else if let Some(position) = hover {
             (position, self.cursor_readout.clone(), false)
         } else {
@@ -808,8 +820,10 @@ impl ViewerApp {
                     .nyquist_velocity_mps
                     .map(|n| format!(" · Nyq {n:.0}"))
                     .unwrap_or_default();
-                lines.push(format!("raw VEL {base:.1} m/s{nyquist}"));
+                let base_label = inspector_base_velocity_label(readout);
+                lines.push(format!("{base_label} {base:.1} m/s{nyquist}"));
             } else if readout.product.is_signed_radial_velocity()
+                && !cursor_readout_uses_dealiased_velocity(readout)
                 && let Some(nyquist) = readout.nyquist_velocity_mps
                 && readout.value.abs() >= nyquist * 0.75
             {
@@ -1598,22 +1612,30 @@ impl ViewerApp {
     /// row, which the "right-click loads closest radar" preference otherwise
     /// makes unreachable. (Historically this gesture CLEARED the timeline
     /// even when the click landed on the station itself.)
-    pub(crate) fn toggle_inspector_pin(&mut self, rect: egui::Rect, pointer: egui::Pos2) {
+    pub(crate) fn toggle_inspector_pin(
+        &mut self,
+        rect: egui::Rect,
+        pointer: egui::Pos2,
+        pane_index: usize,
+    ) {
         if let Some((lon, lat)) = self.pinned_inspector_lonlat {
             let current = self.lon_lat_to_screen(rect, lon, lat);
             if current.distance(pointer) <= 14.0 {
                 self.pinned_inspector_lonlat = None;
+                self.pinned_inspector_pane = None;
                 self.pinned_obs_chart_station = None;
                 self.status = "Released fixed map probe".to_owned();
                 return;
             }
         }
         if let Some(ob) = self.surface_ob_near_screen(rect, pointer, OBS_TIMELINE_PIN_CLICK_PX) {
-            self.pin_obs_history(&ob);
+            self.pin_obs_history(&ob, pane_index);
             return;
         }
         let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
         self.pinned_inspector_lonlat = Some((lon, lat));
+        self.pinned_inspector_pane =
+            Some(pane_index.min(self.grid_layout.panel_count().saturating_sub(1)));
         self.pinned_obs_chart_station = None;
         self.show_inspector_card = true;
         self.app_settings.inspector_card_visible = true;
@@ -2301,7 +2323,7 @@ impl ViewerApp {
     ) -> Option<CursorReadout> {
         let product = self.selected_product.clone();
         let cut = self.selected_cut;
-        self.cursor_readout_for(rect, position, &product, cut)
+        self.cursor_readout_for_pane(rect, position, &product, cut, 0)
     }
 
     pub(crate) fn clear_vrot_measurement(&mut self) {
@@ -2314,31 +2336,57 @@ impl ViewerApp {
         volume: Arc<RadarVolume>,
         product: &DisplayProduct,
         cut: usize,
+        pane_index: usize,
     ) -> Option<VrotProvenance> {
         if !manual_vrot_product_supported(product) {
             return None;
         }
         let elevation_deg = volume.cuts.get(cut)?.elevation_deg;
-        // Manual clicks use `cursor_readout_for`, which samples the raw or
+        // Manual clicks use `cursor_readout_for_pane`, which samples the raw or
         // dealiased MomentGrid directly. Display smoothing is raster-only and
         // therefore is deliberately not part of this value provenance.
-        let effective_dealiased = if product.uses_dealiased_velocity() {
-            self.dealiased_velocity_readout_grid(&volume, cut).is_some()
-        } else {
-            false
-        };
+        let source = self.velocity_readout_source_for_pane(&volume, product, cut, pane_index);
         Some(VrotProvenance::new(
             &volume,
             product,
             cut,
             elevation_deg,
-            VrotVelocityMode::for_product(
+            source.mode,
+        ))
+    }
+
+    fn velocity_readout_source_for_pane(
+        &mut self,
+        volume: &Arc<RadarVolume>,
+        product: &DisplayProduct,
+        cut: usize,
+        pane_index: usize,
+    ) -> VelocityReadoutSource {
+        let render_dealiased = self.product_render_uses_dealiased_velocity(product);
+        let (dealiased_grid, dealias_context) = if render_dealiased {
+            let (previous_volume, dealias_env, context) =
+                self.dealias_inputs_for_pane_volume(pane_index, volume);
+            let grid = self.dealiased_velocity_readout_grid_with_inputs(
+                volume,
+                cut,
+                previous_volume.as_ref(),
+                dealias_env.as_ref(),
+                context,
+            );
+            (grid, Some(context))
+        } else {
+            (None, None)
+        };
+        VelocityReadoutSource {
+            mode: VrotVelocityMode::for_source(
                 product,
-                effective_dealiased,
-                self.dealias_engine,
+                render_dealiased,
+                dealiased_grid.is_some(),
+                dealias_context,
                 self.current_storm_motion(),
             ),
-        ))
+            dealiased_grid,
+        }
     }
 
     fn active_vrot_provenance(&mut self) -> Option<VrotProvenance> {
@@ -2354,7 +2402,7 @@ impl ViewerApp {
         } else {
             self.extra_pane_display_volume(pane_index - 1)
         }?;
-        self.vrot_provenance_for_volume(volume, &product, cut)
+        self.vrot_provenance_for_volume(volume, &product, cut, pane_index)
     }
 
     pub(crate) fn reconcile_vrot_source(&mut self) {
@@ -2378,12 +2426,14 @@ impl ViewerApp {
         position: egui::Pos2,
         product: &DisplayProduct,
         cut: usize,
+        pane_index: usize,
     ) {
         if !manual_vrot_product_supported(product) {
             self.status = "Vrot tool needs VEL, DVEL, SRV, or DSRV".to_owned();
             return;
         }
-        let Some(readout) = self.cursor_readout_for(rect, position, product, cut) else {
+        let Some(readout) = self.cursor_readout_for_pane(rect, position, product, cut, pane_index)
+        else {
             self.status = "No velocity gate under Vrot click".to_owned();
             return;
         };
@@ -2432,14 +2482,15 @@ impl ViewerApp {
         };
     }
 
-    /// Readout for an arbitrary product/tilt — lets every grid pane report
-    /// ITS OWN data under the cursor instead of the primary pane's.
-    pub(crate) fn cursor_readout_for(
+    /// Readout for an arbitrary pane/product/tilt — every grid pane reports
+    /// the exact velocity source used by its own render request.
+    pub(crate) fn cursor_readout_for_pane(
         &mut self,
         rect: egui::Rect,
         position: egui::Pos2,
         product: &DisplayProduct,
         cut_index: usize,
+        pane_index: usize,
     ) -> Option<CursorReadout> {
         let volume = self
             .volume
@@ -2456,12 +2507,20 @@ impl ViewerApp {
         let cut = volume.cuts.get(selected_cut)?;
         let base_moment = selected_product.base_moment();
         let source_grid = cut.moments.get(&base_moment)?;
-        let dealiased_grid = selected_product
-            .uses_dealiased_velocity()
-            .then(|| self.dealiased_velocity_readout_grid(&volume, selected_cut))
-            .flatten();
-        let effective_dealiased = dealiased_grid.is_some();
-        let grid = dealiased_grid.as_deref().unwrap_or(source_grid);
+        let velocity_source = if manual_vrot_product_supported(&selected_product) {
+            Some(self.velocity_readout_source_for_pane(
+                &volume,
+                &selected_product,
+                selected_cut,
+                pane_index,
+            ))
+        } else {
+            None
+        };
+        let grid = velocity_source
+            .as_ref()
+            .and_then(|source| source.dealiased_grid.as_deref())
+            .unwrap_or(source_grid);
         let (radar_lat, radar_lon) = self.loaded_volume_location()?;
         // Probe the gate ACTUALLY RENDERED under the cursor: invert the
         // raster's screen mapping (planar ENU about the radar, rotated by
@@ -2491,7 +2550,10 @@ impl ViewerApp {
         let base_value = grid
             .scaled_value(row, gate)
             .filter(|value| value.is_finite())?;
-        let raw = (!selected_product.uses_dealiased_velocity())
+        let effective_dealiased = velocity_source
+            .as_ref()
+            .is_some_and(|source| source.mode.effective_dealiased);
+        let raw = (!effective_dealiased)
             .then(|| grid_raw_value(grid, row, gate))
             .flatten();
         let radial = cut.radials.get(radial_index)?;
@@ -2501,18 +2563,13 @@ impl ViewerApp {
             base_value
         };
         let storm_motion = self.current_storm_motion();
-        let vrot_provenance = manual_vrot_product_supported(&selected_product).then(|| {
+        let vrot_provenance = velocity_source.as_ref().map(|source| {
             VrotProvenance::new(
                 &volume,
                 &selected_product,
                 selected_cut,
                 cut.elevation_deg,
-                VrotVelocityMode::for_product(
-                    &selected_product,
-                    effective_dealiased,
-                    self.dealias_engine,
-                    storm_motion,
-                ),
+                source.mode,
             )
         });
         let vrot = vrot_provenance.clone().and_then(|provenance| {

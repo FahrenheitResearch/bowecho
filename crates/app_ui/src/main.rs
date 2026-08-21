@@ -3340,6 +3340,10 @@ struct ViewerApp {
     /// Floating inspector card at the cursor (Shift+click pins it to a spot).
     show_inspector_card: bool,
     pinned_inspector_lonlat: Option<(f32, f32)>,
+    /// Grid pane that owns the fixed probe for this session. Without this a
+    /// pin placed on an independent radar silently fell back to pane 0 as soon
+    /// as the pointer left the originating pane.
+    pinned_inspector_pane: Option<usize>,
     pinned_obs_chart_station: Option<String>,
     /// Bumped on every hazard_overlay assignment — exact invalidation for the
     /// hazard shape cache (content proxies like record counts can alias).
@@ -8848,26 +8852,30 @@ struct VrotToolPoint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VrotVelocityMode {
     storm_relative: bool,
-    requested_dealiased: bool,
+    /// The exact render decision, including plain VEL's Auto-dealias toggle.
+    render_dealiased: bool,
     effective_dealiased: bool,
-    dealias_engine: Option<DealiasEngine>,
+    /// Engine + Analyst-v4 temporal/model anchors used by the rendered grid.
+    /// Raw velocity has no dealias context because changing an unused engine
+    /// cannot change its gate values.
+    dealias_context: Option<DealiasContextKey>,
     storm_motion_direction_millideg: Option<i32>,
     storm_motion_speed_millimps: Option<i32>,
 }
 
 impl VrotVelocityMode {
-    fn for_product(
+    fn for_source(
         product: &DisplayProduct,
+        render_dealiased: bool,
         effective_dealiased: bool,
-        dealias_engine: DealiasEngine,
+        dealias_context: Option<DealiasContextKey>,
         storm_motion: StormMotion,
     ) -> Self {
-        let requested_dealiased = product.uses_dealiased_velocity();
         Self {
             storm_relative: product.is_storm_relative_velocity(),
-            requested_dealiased,
-            effective_dealiased: requested_dealiased && effective_dealiased,
-            dealias_engine: (requested_dealiased && effective_dealiased).then_some(dealias_engine),
+            render_dealiased,
+            effective_dealiased: render_dealiased && effective_dealiased,
+            dealias_context: render_dealiased.then_some(dealias_context).flatten(),
             storm_motion_direction_millideg: product
                 .is_storm_relative_velocity()
                 .then(|| (storm_motion.direction_deg.rem_euclid(360.0) * 1_000.0).round() as i32),
@@ -8880,7 +8888,7 @@ impl VrotVelocityMode {
     fn label(self) -> &'static str {
         match (
             self.storm_relative,
-            self.requested_dealiased,
+            self.render_dealiased,
             self.effective_dealiased,
         ) {
             (false, false, _) => "raw velocity",
@@ -8899,6 +8907,14 @@ impl VrotVelocityMode {
             self.storm_motion_speed_millimps? as f32 / 1_000.0,
         ))
     }
+}
+
+/// The velocity grid and identity used by cursor/manual probes. The raster
+/// can additionally smooth or mask these native gates, but it and this source
+/// must always agree on raw-vs-dealiased data and Analyst-v4 anchors.
+struct VelocityReadoutSource {
+    dealiased_grid: Option<Arc<MomentGrid>>,
+    mode: VrotVelocityMode,
 }
 
 /// Identity of the exact displayed velocity field behind a Vrot result.
@@ -8949,7 +8965,7 @@ impl VrotProvenance {
         label
     }
 
-    fn matches_display(
+    fn matches_basic_display(
         &self,
         volume: &Arc<RadarVolume>,
         product: &DisplayProduct,
@@ -10102,6 +10118,7 @@ impl ViewerApp {
             display_thresholds: BTreeMap::new(),
             show_inspector_card: restored_inspector.0,
             pinned_inspector_lonlat: None,
+            pinned_inspector_pane: None,
             pinned_obs_chart_station: None,
             hazard_overlay_generation: 0,
             hazard_record_metadata_cache: std::cell::RefCell::new(None),
@@ -17712,6 +17729,15 @@ impl ViewerApp {
         self.active_pane = self
             .active_pane
             .min(self.grid_layout.panel_count().saturating_sub(1));
+        self.pinned_inspector_pane = if self.pinned_inspector_lonlat.is_some() {
+            Some(
+                self.pinned_inspector_pane
+                    .unwrap_or(0)
+                    .min(self.grid_layout.panel_count().saturating_sub(1)),
+            )
+        } else {
+            None
+        };
         // Rescale the dealiased-grid memo for the current pane count. This is
         // headroom for distinct same-sweep grids or distinct Analyst v4
         // contexts; panes sharing an exact v4 context share one volume entry.
@@ -19515,23 +19541,56 @@ impl ViewerApp {
         volume: &Arc<RadarVolume>,
         cut_index: usize,
     ) -> Option<Arc<MomentGrid>> {
-        let volume_ptr = Arc::as_ptr(volume) as usize;
+        self.dealiased_velocity_readout_grid_for_pane(volume, cut_index, 0)
+            .map(|(grid, _)| grid)
+    }
+
+    /// Resolve the same dealias grid/context as the pane's render request.
+    /// Pane 0 is primary; higher indices are 1-based entries in
+    /// `extra_panes`. An independently owned pane must use its own temporal
+    /// history rather than the primary history that happens to be restored in
+    /// `self` outside the pane paint context.
+    fn dealiased_velocity_readout_grid_for_pane(
+        &mut self,
+        volume: &Arc<RadarVolume>,
+        cut_index: usize,
+        pane_index: usize,
+    ) -> Option<(Arc<MomentGrid>, DealiasContextKey)> {
         let (previous_volume, dealias_env, context) =
-            self.primary_dealias_inputs_for_volume(volume);
-        let anchored = self.dealias_engine == DealiasEngine::Analyst3d;
+            self.dealias_inputs_for_pane_volume(pane_index, volume);
+        let grid = self.dealiased_velocity_readout_grid_with_inputs(
+            volume,
+            cut_index,
+            previous_volume.as_ref(),
+            dealias_env.as_ref(),
+            context,
+        )?;
+        Some((grid, context))
+    }
+
+    fn dealiased_velocity_readout_grid_with_inputs(
+        &mut self,
+        volume: &Arc<RadarVolume>,
+        cut_index: usize,
+        previous_volume: Option<&Arc<RadarVolume>>,
+        dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
+        context: DealiasContextKey,
+    ) -> Option<Arc<MomentGrid>> {
+        let volume_ptr = Arc::as_ptr(volume) as usize;
+        let anchored = context.engine == DealiasEngine::Analyst3d;
         // The witness proves the pointer identities below still name these
         // exact inputs (a dead witness means an address was recycled).
         let witness = DealiasGridWitness::with_anchors(
             volume,
-            anchored.then_some(previous_volume.as_ref()).flatten(),
-            anchored.then_some(dealias_env.as_ref()).flatten(),
+            anchored.then_some(previous_volume).flatten(),
+            anchored.then_some(dealias_env).flatten(),
         );
         if let Some(cache) = &self.dealiased_readout_cache
             && cache.volume_ptr == volume_ptr
             && cache.reference_volume_ptr == context.reference_volume_ptr
             && cache.dealias_env_ptr == context.dealias_env_ptr
             && cache.cut_index == cut_index
-            && cache.dealias_engine == self.dealias_engine
+            && cache.dealias_engine == context.engine
             && cache.witness.alive()
         {
             return Some(Arc::clone(&cache.grid));
@@ -19542,17 +19601,17 @@ impl ViewerApp {
         // scrubbing/looping reuses their grids instead of re-dealiasing here.
         let grid = resolve_dealiased_grid(
             volume,
-            previous_volume.as_ref(),
-            dealias_env.as_ref(),
+            previous_volume,
+            dealias_env,
             cut_index,
-            self.dealias_engine,
+            context.engine,
         )?;
         self.dealiased_readout_cache = Some(DealiasedReadoutCache {
             volume_ptr,
             reference_volume_ptr: context.reference_volume_ptr,
             dealias_env_ptr: context.dealias_env_ptr,
             cut_index,
-            dealias_engine: self.dealias_engine,
+            dealias_engine: context.engine,
             witness,
             grid,
         });
@@ -19571,16 +19630,45 @@ impl ViewerApp {
         Option<Arc<EnvironmentalWindProfile>>,
         DealiasContextKey,
     ) {
+        self.dealias_inputs_for_pane_volume(0, volume)
+    }
+
+    fn dealias_inputs_for_pane_volume(
+        &self,
+        pane_index: usize,
+        volume: &Arc<RadarVolume>,
+    ) -> (
+        Option<Arc<RadarVolume>>,
+        Option<Arc<EnvironmentalWindProfile>>,
+        DealiasContextKey,
+    ) {
         let anchored = self.dealias_engine == DealiasEngine::Analyst3d;
-        let previous_volume = anchored
-            .then(|| {
+        let previous_volume = if !anchored {
+            None
+        } else if let Some(pane) = pane_index
+            .checked_sub(1)
+            .and_then(|pane_slot| self.extra_panes.get(pane_slot))
+        {
+            if pane.owns_radar() && pane.volume.is_some() {
+                previous_dealias_reference_volume(
+                    &pane.engine.history,
+                    pane.engine.cursor.index,
+                    volume,
+                )
+            } else {
                 previous_dealias_reference_volume(
                     &self.primary.history,
                     self.primary.cursor.index,
                     volume,
                 )
-            })
-            .flatten();
+            }
+        } else {
+            previous_dealias_reference_volume(
+                &self.primary.history,
+                self.primary.cursor.index,
+                volume,
+            )
+        };
         let dealias_env = anchored
             .then(|| self.dealias_env_profile_for_volume(volume))
             .flatten();
@@ -28689,6 +28777,7 @@ impl ViewerApp {
                     .clicked()
                 {
                     self.pinned_inspector_lonlat = None;
+                    self.pinned_inspector_pane = None;
                     self.pinned_obs_chart_station = None;
                     self.status = "Released fixed map probe".to_owned();
                     ctx.request_repaint();
@@ -31257,6 +31346,15 @@ impl ViewerApp {
         Some((product, cut))
     }
 
+    fn inspector_grid_pane(&self, hovered_pane: Option<usize>) -> usize {
+        let pane = if self.pinned_inspector_lonlat.is_some() {
+            self.pinned_inspector_pane.unwrap_or(0)
+        } else {
+            hovered_pane.unwrap_or(0)
+        };
+        pane.min(self.grid_layout.panel_count().saturating_sub(1))
+    }
+
     /// Render the workspace tile tree (map pane + docked viewer panes).
     /// Borrow split (docs/docking-spike.md §3.2, the Rerun pattern): the
     /// tree is mem::replaced off `self` for the pass so the behavior can
@@ -31288,6 +31386,7 @@ impl ViewerApp {
         self.grid_layout = PanelLayout::One;
         self.extra_panes.clear();
         self.active_pane = 0;
+        self.pinned_inspector_pane = self.pinned_inspector_lonlat.map(|_| 0);
         self.app_settings.grid_pane_count = PanelLayout::One.panel_count();
         self.app_settings.workspace_layout = None;
 
@@ -32536,12 +32635,15 @@ impl ViewerApp {
         self.draw_glm(painter, rect);
         self.draw_surface_obs(painter, rect);
         self.draw_surface_obs_clock(painter, rect);
+        let vrot_volume = self.volume.clone();
+        let vrot_product = self.selected_product.clone();
         self.draw_vrot_tool(
             painter,
             rect,
-            self.volume.as_ref(),
-            &self.selected_product,
+            vrot_volume.as_ref(),
+            &vrot_product,
             self.selected_cut,
+            0,
         );
         self.draw_placefiles(painter, rect);
         self.draw_map_annotations(painter, rect);
@@ -32573,7 +32675,7 @@ impl ViewerApp {
             && let Some(pointer) = response.interact_pointer_pos()
         {
             // Shift+click pins the inspector card to this geo point.
-            self.toggle_inspector_pin(rect, pointer);
+            self.toggle_inspector_pin(rect, pointer, 0);
         }
 
         if !armed
@@ -32778,7 +32880,7 @@ impl ViewerApp {
             {
                 let product = self.selected_product.clone();
                 let cut = self.selected_cut;
-                self.add_vrot_tool_point(rect, pointer, &product, cut);
+                self.add_vrot_tool_point(rect, pointer, &product, cut, 0);
             }
             if response.secondary_clicked() {
                 self.clear_vrot_measurement();
@@ -32839,7 +32941,15 @@ impl ViewerApp {
         self.draw_vol3d_map_box_drag(painter, rect);
         self.draw_plot_domain_map_box(painter, rect, true);
         self.draw_center_crosshair(painter, rect);
-        self.draw_cursor_inspector(painter, rect, response.hover_pos());
+        let inspector_product = self.selected_product.clone();
+        self.draw_cursor_inspector(
+            painter,
+            rect,
+            response.hover_pos(),
+            &inspector_product,
+            self.selected_cut,
+            0,
+        );
         self.show_community_feed_menu(ui, rect);
 
         if self.texture.is_none()
@@ -32990,7 +33100,9 @@ impl ViewerApp {
                             .volume
                             .as_deref()
                             .and_then(|v| best_cut_for_product(v, preferred, &product));
-                        cut.and_then(|cut| self.cursor_readout_for(cell, position, &product, cut))
+                        cut.and_then(|cut| {
+                            self.cursor_readout_for_pane(cell, position, &product, cut, cell_index)
+                        })
                     } else {
                         None
                     };
@@ -33025,7 +33137,7 @@ impl ViewerApp {
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 // Shift+click pins the inspector from any grid pane.
-                self.toggle_inspector_pin(cell, pointer);
+                self.toggle_inspector_pin(cell, pointer, cell_index);
             }
             if !armed
                 && !vrot_armed
@@ -33269,7 +33381,7 @@ impl ViewerApp {
                     let (product, cut) = self
                         .pane_product_cut(cell_index)
                         .unwrap_or_else(|| (self.selected_product.clone(), self.selected_cut));
-                    self.add_vrot_tool_point(cell, pointer, &product, cut);
+                    self.add_vrot_tool_point(cell, pointer, &product, cut, cell_index);
                 }
                 if pane_was_active && response.secondary_clicked() {
                     self.clear_vrot_measurement();
@@ -33412,17 +33524,21 @@ impl ViewerApp {
                 pane_volume.as_ref(),
                 &pane_product,
                 pane_cut,
+                cell_index,
             );
             self.pane_info_bar(ui, &cell_painter, cell, cell_index, &pane_product, pane_cut);
             self.draw_raw_velocity_tag_for_product(&cell_painter, cell, &pane_product, 34.0);
             // The inspector card follows the hovered pane (its readout now
             // reflects that pane's product); the pinned card stays geo-true.
-            let inspector_cell = hovered_cell.unwrap_or(0);
+            let inspector_cell = self.inspector_grid_pane(hovered_cell);
             if cell_index == inspector_cell {
                 self.draw_cursor_inspector(
                     &cell_painter,
                     cell,
                     hovers.get(cell_index).copied().flatten(),
+                    &pane_product,
+                    pane_cut,
+                    cell_index,
                 );
             }
 
@@ -34575,9 +34691,11 @@ impl ViewerApp {
             .map(|(_, ob)| ob.clone())
     }
 
-    fn pin_obs_history(&mut self, ob: &obs::SurfaceOb) {
+    fn pin_obs_history(&mut self, ob: &obs::SurfaceOb, pane_index: usize) {
         self.pinned_obs_chart_station = Some(ob.station_id.clone());
         self.pinned_inspector_lonlat = Some((ob.lon, ob.lat));
+        self.pinned_inspector_pane =
+            Some(pane_index.min(self.grid_layout.panel_count().saturating_sub(1)));
         self.show_inspector_card = true;
     }
 
@@ -34851,7 +34969,13 @@ impl ViewerApp {
                 format!("{} {}", ob.station_id, ob.network)
             };
             if ui.button(format!("Pin {label} 3h timeline")).clicked() {
-                self.pin_obs_history(ob);
+                let pane_index = if self.grid_layout == PanelLayout::One {
+                    0
+                } else {
+                    self.active_pane
+                        .min(self.grid_layout.panel_count().saturating_sub(1))
+                };
+                self.pin_obs_history(ob, pane_index);
                 ui.close();
             }
             if self.pinned_obs_chart_station.as_deref() == Some(ob.station_id.as_str())
@@ -47813,6 +47937,21 @@ fn vrot_display_scale_unit(display_unit: (&str, f32), unit_system: units::Units)
     }
 }
 
+fn cursor_readout_uses_dealiased_velocity(readout: &CursorReadout) -> bool {
+    readout
+        .vrot_provenance
+        .as_ref()
+        .is_some_and(|source| source.velocity_mode.effective_dealiased)
+}
+
+fn inspector_base_velocity_label(readout: &CursorReadout) -> &'static str {
+    if cursor_readout_uses_dealiased_velocity(readout) {
+        "DVEL"
+    } else {
+        "raw VEL"
+    }
+}
+
 fn format_vrot_card_line(
     probe: &VrotProbe,
     display_unit: (&'static str, f32),
@@ -53827,10 +53966,11 @@ mod tests {
             product: DisplayProduct::Moment(MomentType::Velocity),
             cut: 1,
             elevation_millideg: 500,
-            velocity_mode: VrotVelocityMode::for_product(
+            velocity_mode: VrotVelocityMode::for_source(
                 &DisplayProduct::Moment(MomentType::Velocity),
                 false,
-                DealiasEngine::Region,
+                false,
+                None,
                 StormMotion {
                     direction_deg: 0.0,
                     speed_mps: 0.0,
@@ -53935,10 +54075,11 @@ mod tests {
 
         let mut product = base.clone();
         product.product = DisplayProduct::StormRelativeVelocity;
-        product.velocity_mode = VrotVelocityMode::for_product(
+        product.velocity_mode = VrotVelocityMode::for_source(
             &product.product,
             false,
-            DealiasEngine::Region,
+            false,
+            None,
             StormMotion {
                 direction_deg: 240.0,
                 speed_mps: 12.0,
@@ -53968,20 +54109,23 @@ mod tests {
     fn manual_vrot_measurement_invalidates_for_dealias_or_storm_motion_change() {
         let mut dealiased = test_vrot_provenance();
         dealiased.product = DisplayProduct::DealiasedVelocity;
-        dealiased.velocity_mode = VrotVelocityMode::for_product(
+        let region_context = DealiasContextKey::new(DealiasEngine::Region, None, None);
+        dealiased.velocity_mode = VrotVelocityMode::for_source(
             &dealiased.product,
             true,
-            DealiasEngine::Region,
+            true,
+            Some(region_context),
             StormMotion {
                 direction_deg: 0.0,
                 speed_mps: 0.0,
             },
         );
         let mut raw_fallback = dealiased.clone();
-        raw_fallback.velocity_mode = VrotVelocityMode::for_product(
+        raw_fallback.velocity_mode = VrotVelocityMode::for_source(
             &raw_fallback.product,
+            true,
             false,
-            DealiasEngine::Region,
+            Some(region_context),
             StormMotion {
                 direction_deg: 0.0,
                 speed_mps: 0.0,
@@ -53998,20 +54142,22 @@ mod tests {
 
         let mut srv = test_vrot_provenance();
         srv.product = DisplayProduct::StormRelativeVelocity;
-        srv.velocity_mode = VrotVelocityMode::for_product(
+        srv.velocity_mode = VrotVelocityMode::for_source(
             &srv.product,
             false,
-            DealiasEngine::Region,
+            false,
+            None,
             StormMotion {
                 direction_deg: 240.0,
                 speed_mps: 12.0,
             },
         );
         let mut new_motion = srv.clone();
-        new_motion.velocity_mode = VrotVelocityMode::for_product(
+        new_motion.velocity_mode = VrotVelocityMode::for_source(
             &new_motion.product,
             false,
-            DealiasEngine::Region,
+            false,
+            None,
             StormMotion {
                 direction_deg: 255.0,
                 speed_mps: 16.0,
@@ -54027,6 +54173,60 @@ mod tests {
     }
 
     #[test]
+    fn manual_vrot_measurement_invalidates_for_analyst_anchor_changes() {
+        let product = DisplayProduct::DealiasedVelocity;
+        let storm_motion = StormMotion {
+            direction_deg: 0.0,
+            speed_mps: 0.0,
+        };
+        let mut original = test_vrot_provenance();
+        original.product = product.clone();
+        original.velocity_mode = VrotVelocityMode::for_source(
+            &product,
+            true,
+            true,
+            Some(DealiasContextKey {
+                reference_volume_ptr: 101,
+                dealias_env_ptr: 201,
+                engine: DealiasEngine::Analyst3d,
+            }),
+            storm_motion,
+        );
+
+        for (label, context) in [
+            (
+                "temporal reference",
+                DealiasContextKey {
+                    reference_volume_ptr: 102,
+                    dealias_env_ptr: 201,
+                    engine: DealiasEngine::Analyst3d,
+                },
+            ),
+            (
+                "environment profile",
+                DealiasContextKey {
+                    reference_volume_ptr: 101,
+                    dealias_env_ptr: 202,
+                    engine: DealiasEngine::Analyst3d,
+                },
+            ),
+        ] {
+            let mut current = original.clone();
+            current.velocity_mode =
+                VrotVelocityMode::for_source(&product, true, true, Some(context), storm_motion);
+            let mut points = vec![test_vrot_point()];
+            let mut stored = Some(original.clone());
+            assert_eq!(
+                reconcile_vrot_measurement_source(&mut points, &mut stored, Some(&current)),
+                Some("velocity product/source changed"),
+                "{label}"
+            );
+            assert!(points.is_empty(), "{label} retained stale gate values");
+            assert!(stored.is_none(), "{label} retained stale provenance");
+        }
+    }
+
+    #[test]
     fn manual_vrot_measurement_preserves_only_its_originating_pane_volume() {
         let time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
         let origin = Arc::new(test_volume_with_site_time("KTLX", time));
@@ -54037,10 +54237,11 @@ mod tests {
             &product,
             0,
             origin.cuts[0].elevation_deg,
-            VrotVelocityMode::for_product(
+            VrotVelocityMode::for_source(
                 &product,
                 false,
-                DealiasEngine::Region,
+                false,
+                None,
                 StormMotion {
                     direction_deg: 0.0,
                     speed_mps: 0.0,
@@ -54048,13 +54249,30 @@ mod tests {
             ),
         );
 
-        assert!(provenance.matches_display(&origin, &product, 0));
-        assert!(provenance.matches_display(&Arc::clone(&origin), &product, 0));
-        assert!(
-            !provenance.matches_display(&other_pane_same_frame, &product, 0),
-            "a different pane volume with the same site/time must not inherit the overlay"
+        let same_source = VrotProvenance::new(
+            &Arc::clone(&origin),
+            &product,
+            0,
+            origin.cuts[0].elevation_deg,
+            provenance.velocity_mode,
         );
-        assert!(!provenance.matches_display(&origin, &DisplayProduct::DealiasedVelocity, 0));
+        let other_source = VrotProvenance::new(
+            &other_pane_same_frame,
+            &product,
+            0,
+            other_pane_same_frame.cuts[0].elevation_deg,
+            provenance.velocity_mode,
+        );
+        let other_product = VrotProvenance::new(
+            &origin,
+            &DisplayProduct::DealiasedVelocity,
+            0,
+            origin.cuts[0].elevation_deg,
+            provenance.velocity_mode,
+        );
+        assert_eq!(provenance, same_source);
+        assert_ne!(provenance, other_source);
+        assert_ne!(provenance, other_product);
     }
 
     #[test]
@@ -54155,6 +54373,56 @@ mod tests {
         assert!((readout.value - 11.0).abs() < 0.01, "{readout:?}");
         assert_eq!(readout.raw, None);
         assert!(app.dealiased_readout_cache.is_some());
+    }
+
+    #[test]
+    fn plain_velocity_cursor_and_vrot_follow_auto_dealias_display() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_aliased_velocity_volume()));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.unfold_velocity_display = true;
+        app.dealias_engine = DealiasEngine::Region;
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        app.map_scale = 1000.0;
+
+        let rect = test_map_rect();
+        let target_lat = 35.0 + 20.0 / 111.32;
+        let position = app.lon_lat_to_screen(rect, -97.0, target_lat);
+        let readout = app
+            .cursor_readout_at(rect, position)
+            .expect("auto-dealiased plain VEL readout");
+        let provenance = readout
+            .vrot_provenance
+            .clone()
+            .expect("velocity provenance");
+
+        assert_eq!(
+            readout.product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_eq!(readout.gate, 2);
+        assert!(
+            (readout.value - 11.0).abs() < 0.01,
+            "plain VEL cursor must sample the dealiased grid painted under Auto-dealias: {readout:?}"
+        );
+        assert!(provenance.velocity_mode.render_dealiased);
+        assert!(provenance.velocity_mode.effective_dealiased);
+        assert_eq!(
+            provenance.velocity_mode.dealias_context,
+            Some(DealiasContextKey::new(DealiasEngine::Region, None, None))
+        );
+
+        app.vrot_points.push(test_vrot_point());
+        app.vrot_provenance = Some(provenance);
+        app.unfold_velocity_display = false;
+        app.reconcile_vrot_source();
+        assert!(
+            app.vrot_points.is_empty(),
+            "turning Auto-dealias off changes the displayed value source and must clear the measurement"
+        );
+        assert!(app.vrot_provenance.is_none());
     }
 
     /// Pin for the v0.29 three-engine `DealiasEngine`: `Analyst3d` routes the
@@ -54503,7 +54771,7 @@ mod tests {
     #[test]
     fn cursor_readout_format_reports_vrot_gate_endpoints() {
         let provenance = test_vrot_provenance();
-        let readout = CursorReadout {
+        let mut readout = CursorReadout {
             site_id: "KTLX".to_owned(),
             volume_time_utc: Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap(),
             product: DisplayProduct::Moment(MomentType::Velocity),
@@ -54575,6 +54843,29 @@ mod tests {
         assert!(metric.contains("Vrot 21.0 m/s dV 42.0 m/s sep 1.25 km"));
         assert!(metric.contains("in r4/g100 210.5 -18.0 m/s"));
         assert!(metric.contains("out r6/g103 212.0 24.0 m/s"));
+
+        assert_eq!(inspector_base_velocity_label(&readout), "raw VEL");
+        let dsrv = DisplayProduct::StormRelativeDealiasedVelocity;
+        let source = readout
+            .vrot_provenance
+            .as_mut()
+            .expect("velocity provenance");
+        source.product = dsrv.clone();
+        source.velocity_mode = VrotVelocityMode::for_source(
+            &dsrv,
+            true,
+            true,
+            Some(DealiasContextKey::new(DealiasEngine::Region, None, None)),
+            StormMotion {
+                direction_deg: 240.0,
+                speed_mps: 12.0,
+            },
+        );
+        assert_eq!(
+            inspector_base_velocity_label(&readout),
+            "DVEL",
+            "DSRV's unadjusted base value is dealiased, not raw"
+        );
     }
 
     #[test]
@@ -62163,6 +62454,93 @@ mod tests {
                 "independent={independent}: dealias engine must match"
             );
         }
+    }
+
+    #[test]
+    fn independent_pane_cursor_and_vrot_use_the_pane_render_anchor() {
+        let start = Utc.with_ymd_and_hms(2026, 6, 8, 1, 0, 0).unwrap();
+        let mut primary_previous = test_dealias_pane_volume();
+        primary_previous.volume_time = start;
+        let primary_previous = Arc::new(primary_previous);
+        let mut pane_previous = test_dealias_pane_volume();
+        pane_previous.volume_time = start + chrono::Duration::minutes(1);
+        let pane_previous = Arc::new(pane_previous);
+        let mut current = test_dealias_pane_volume();
+        current.volume_time = start + chrono::Duration::minutes(5);
+        let current = Arc::new(current);
+        let history_entry = |label: &str, volume: Arc<RadarVolume>| FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from(label),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        };
+
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.dealias_engine = DealiasEngine::Analyst3d;
+        app.selected_product = DisplayProduct::DealiasedVelocity;
+        app.selected_cut = 1;
+        app.map_center_lat = current.site.latitude_deg.expect("latitude");
+        app.map_center_lon = current.site.longitude_deg.expect("longitude");
+        app.map_scale = 1_000.0;
+        app.volume = Some(Arc::clone(&current));
+        app.primary.history = [
+            history_entry("primary-previous", Arc::clone(&primary_previous)),
+            history_entry("primary-current", Arc::clone(&current)),
+        ]
+        .into_iter()
+        .collect();
+        app.primary.cursor.index = 1;
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        {
+            let pane = &mut app.extra_panes[0];
+            pane.pin = Some(SiteRef::Us {
+                level2_id: current.site.id.clone(),
+            });
+            pane.product = DisplayProduct::DealiasedVelocity;
+            pane.cut = Some(1);
+            pane.volume = Some(Arc::clone(&current));
+            pane.engine.history = [
+                history_entry("pane-previous", Arc::clone(&pane_previous)),
+                history_entry("pane-current", Arc::clone(&current)),
+            ]
+            .into_iter()
+            .collect();
+            pane.engine.cursor.index = 1;
+        }
+
+        let ctx = egui::Context::default();
+        let rect = test_map_rect();
+        let render = app
+            .extra_pane_render_request(&ctx, rect, 1)
+            .expect("independent pane render request");
+        assert_eq!(
+            render.key.dealias_reference_volume_ptr,
+            Arc::as_ptr(&pane_previous) as usize
+        );
+        assert_ne!(
+            render.key.dealias_reference_volume_ptr,
+            Arc::as_ptr(&primary_previous) as usize
+        );
+
+        let target_lat = app.map_center_lat + 0.75 / 111.32;
+        let position = app.lon_lat_to_screen(rect, app.map_center_lon, target_lat);
+        let readout = app
+            .cursor_readout_for_pane(rect, position, &DisplayProduct::DealiasedVelocity, 1, 1)
+            .expect("independent pane cursor readout");
+        let provenance = readout.vrot_provenance.expect("Vrot provenance");
+        let context = provenance
+            .velocity_mode
+            .dealias_context
+            .expect("Analyst-v4 context");
+        assert_eq!(
+            context.reference_volume_ptr, render.key.dealias_reference_volume_ptr,
+            "cursor/Vrot and the visible pane must share the pane's temporal anchor"
+        );
+        assert_eq!(context.dealias_env_ptr, render.key.dealias_env_ptr);
+        assert_eq!(context.engine, render.key.dealias_engine);
     }
 
     /// End-to-end proof on REAL PGUA (BAVI-26) volumes that opening a dual
@@ -74724,6 +75102,7 @@ mod tests {
             display_thresholds: BTreeMap::new(),
             show_inspector_card: true,
             pinned_inspector_lonlat: None,
+            pinned_inspector_pane: None,
             pinned_obs_chart_station: None,
             hazard_overlay_generation: 0,
             hazard_record_metadata_cache: std::cell::RefCell::new(None),
@@ -75278,7 +75657,7 @@ mod tests {
     fn shift_click_on_drawn_station_pins_and_releases_obs_timeline() {
         let (mut app, rect, station_px) = obs_pin_fixture();
 
-        app.toggle_inspector_pin(rect, station_px);
+        app.toggle_inspector_pin(rect, station_px, 0);
         assert_eq!(
             app.pinned_obs_chart_station.as_deref(),
             Some("KTOP"),
@@ -75290,7 +75669,7 @@ mod tests {
 
         // Second Shift+click on the pinned station releases pin AND timeline
         // — the documented "pinned — Shift+click to release" gesture.
-        app.toggle_inspector_pin(rect, station_px);
+        app.toggle_inspector_pin(rect, station_px, 0);
         assert!(app.pinned_obs_chart_station.is_none());
         assert!(app.pinned_inspector_lonlat.is_none());
     }
@@ -75298,12 +75677,12 @@ mod tests {
     #[test]
     fn shift_click_open_map_still_pins_plain_point_and_clears_timeline() {
         let (mut app, rect, station_px) = obs_pin_fixture();
-        app.pin_obs_history(&test_surface_ob("KTOP", 39.073, -95.626, "METAR"));
+        app.pin_obs_history(&test_surface_ob("KTOP", 39.073, -95.626, "METAR"), 0);
 
         // Shift+click far from both the pinned station and any drawn station
         // re-pins a plain geo point and drops the station timeline.
         let far = station_px + egui::vec2(300.0, 200.0);
-        app.toggle_inspector_pin(rect, far);
+        app.toggle_inspector_pin(rect, far, 0);
         assert!(app.pinned_obs_chart_station.is_none());
         let (lon, lat) = app.screen_to_lon_lat(rect, far);
         assert_eq!(app.pinned_inspector_lonlat, Some((lon, lat)));
@@ -75315,14 +75694,14 @@ mod tests {
         // METAR glyphs hidden: the station is not drawn, so the click must
         // not pin an invisible station's timeline — plain point pin instead.
         app.obs_show_metar = false;
-        app.toggle_inspector_pin(rect, station_px);
+        app.toggle_inspector_pin(rect, station_px, 0);
         assert!(app.pinned_obs_chart_station.is_none());
         assert!(app.pinned_inspector_lonlat.is_some());
 
         // Obs layer off entirely: same story.
         let (mut app, rect, station_px) = obs_pin_fixture();
         app.obs_enabled = false;
-        app.toggle_inspector_pin(rect, station_px);
+        app.toggle_inspector_pin(rect, station_px, 0);
         assert!(app.pinned_obs_chart_station.is_none());
         assert!(app.pinned_inspector_lonlat.is_some());
     }
@@ -75888,6 +76267,8 @@ mod tests {
     #[test]
     fn inspector_pin_uses_extra_grid_pane_geometry() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.grid_layout = PanelLayout::ThreeStacked;
+        app.sync_extra_panes();
         app.show_inspector_card = false;
         app.inspector_show_model = false;
         app.map_center_lon = -97.0;
@@ -75899,7 +76280,7 @@ mod tests {
         let pointer = extra_cell.center() + egui::vec2(32.0, -18.0);
         let expected = app.screen_to_lon_lat(extra_cell, pointer);
 
-        app.toggle_inspector_pin(extra_cell, pointer);
+        app.toggle_inspector_pin(extra_cell, pointer, 2);
 
         let (lon, lat) = app.pinned_inspector_lonlat.expect("pin set");
         assert!((lon - expected.0).abs() < 0.001);
@@ -75912,11 +76293,31 @@ mod tests {
         assert!(app.app_settings.inspector_card_visible);
         assert!(app.app_settings.inspector_show_model_value);
         assert!(app.status.starts_with("Fixed model probe at "));
+        assert_eq!(app.pinned_inspector_pane, Some(2));
+        assert_eq!(
+            app.inspector_grid_pane(None),
+            2,
+            "the fixed probe must stay on its originating pane after hover leaves"
+        );
+        assert_eq!(
+            app.inspector_grid_pane(Some(0)),
+            2,
+            "hovering the primary must not steal an extra-pane fixed probe"
+        );
 
-        app.toggle_inspector_pin(extra_cell, pointer);
+        app.toggle_inspector_pin(extra_cell, pointer, 2);
 
         assert!(app.pinned_inspector_lonlat.is_none());
+        assert!(app.pinned_inspector_pane.is_none());
         assert_eq!(app.status, "Released fixed map probe");
+
+        app.toggle_inspector_pin(extra_cell, pointer, 2);
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        assert_eq!(app.pinned_inspector_pane, Some(1));
+        app.grid_layout = PanelLayout::One;
+        app.sync_extra_panes();
+        assert_eq!(app.pinned_inspector_pane, Some(0));
     }
 
     #[test]
