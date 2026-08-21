@@ -40375,6 +40375,14 @@ impl ViewerApp {
                     self.vol3d.resample_rx = None;
                     self.vol3d.velocity_color_active = volume_box.color_data.is_some();
                     let echo_cells = volume_box.data.iter().filter(|&&value| value > 0).count();
+                    // Hierarchy occupancy telemetry. VERIFY.md asks for the
+                    // occupied-brick share alongside the volume so a slow frame
+                    // can be attributed to a dense volume rather than to a
+                    // traversal regression. It is reported per uploaded box
+                    // because the hierarchy is only rebuilt with new data
+                    // (camera, opacity and palette changes must not rebuild it).
+                    let occupancy =
+                        (1.0 - volume_box.acceleration_empty_fraction).clamp(0.0, 1.0) * 100.0;
                     let floor_label = volume_box
                         .floor_elevation_deg
                         .map(|elevation| {
@@ -40382,10 +40390,11 @@ impl ViewerApp {
                         })
                         .unwrap_or_else(|| " · no floor sweep".to_owned());
                     self.vol3d.status = format!(
-                        "{} {} km box · {} non-empty voxels{floor_label}",
+                        "{} {} km box · {} non-empty voxels · {:.0}% occupied bricks{floor_label}",
                         self.vol3d.product_label,
                         (self.vol3d.box_half_km * 2.0) as i32,
-                        echo_cells
+                        echo_cells,
+                        occupancy
                     );
                     if let Ok(mut pending) = self.vol3d.pending.lock() {
                         pending.volume = Some(volume_box);
@@ -40538,7 +40547,7 @@ impl ViewerApp {
                     thread::spawn(move || {
                         // The product moment (velocity in velocity mode) is the
                         // color source; the floor stays this moment's own PPI.
-                        let color_values = render2d::volume_box_resample_moment(
+                        let color_resample = render2d::volume_box_resample_moment_with_support(
                             &volume,
                             &resample_moment,
                             interp_policy,
@@ -40566,36 +40575,42 @@ impl ViewerApp {
                         let result = if velocity_two_box {
                             // Structure/opacity/shading from the reflectivity
                             // box; the velocity box only drives the LUT color.
-                            let structure_values = render2d::volume_box_resample_moment(
-                                &volume,
-                                &MomentType::Reflectivity,
-                                render2d::InterpPolicy::LinearAngle,
-                                center_east,
-                                center_north,
-                                half_km,
-                                vol3d::BOX_N,
-                                vol3d::BOX_NZ,
-                                vol3d::BOX_TOP_M,
-                            );
-                            match (structure_values, color_values) {
+                            let structure_resample =
+                                render2d::volume_box_resample_moment_with_support(
+                                    &volume,
+                                    &MomentType::Reflectivity,
+                                    render2d::InterpPolicy::LinearAngle,
+                                    center_east,
+                                    center_north,
+                                    half_km,
+                                    vol3d::BOX_N,
+                                    vol3d::BOX_NZ,
+                                    vol3d::BOX_TOP_M,
+                                );
+                            match (structure_resample, color_resample) {
                                 (Some(structure), Some(color)) => {
-                                    let mut volume_box = vol3d::normalize_box_with_range(
-                                        &structure,
+                                    let mut volume_box = vol3d::normalize_box_with_support(
+                                        &structure.values,
+                                        &structure.support,
                                         vol3d::BOX_N,
                                         vol3d::BOX_NZ,
                                         refl_min,
                                         refl_max,
                                     );
-                                    volume_box.color_data =
-                                        Some(vol3d::normalize_values(&color, value_min, value_max));
+                                    volume_box.color_data = Some(vol3d::normalize_values(
+                                        &color.values,
+                                        value_min,
+                                        value_max,
+                                    ));
                                     build_floor(&mut volume_box);
                                     Some(volume_box)
                                 }
                                 // No reflectivity in this feed: fall back to the
                                 // single-box velocity render (color_data None).
                                 (None, Some(color)) => {
-                                    let mut volume_box = vol3d::normalize_box_with_range(
-                                        &color,
+                                    let mut volume_box = vol3d::normalize_box_with_support(
+                                        &color.values,
+                                        &color.support,
                                         vol3d::BOX_N,
                                         vol3d::BOX_NZ,
                                         value_min,
@@ -40607,9 +40622,10 @@ impl ViewerApp {
                                 _ => None,
                             }
                         } else {
-                            color_values.map(|values| {
-                                let mut volume_box = vol3d::normalize_box_with_range(
-                                    &values,
+                            color_resample.map(|values| {
+                                let mut volume_box = vol3d::normalize_box_with_support(
+                                    &values.values,
+                                    &values.support,
                                     vol3d::BOX_N,
                                     vol3d::BOX_NZ,
                                     value_min,
@@ -40780,6 +40796,101 @@ impl ViewerApp {
         );
     }
 
+    fn vol3d_analysis_controls_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        value_min: f32,
+        value_max: f32,
+        value_suffix: &str,
+    ) {
+        ui.strong("Advanced renderer");
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Volume").clicked() {
+                self.vol3d.apply_sota_volume_preset();
+            }
+            if ui.small_button("Hybrid").clicked() {
+                self.vol3d.apply_sota_hybrid_preset();
+            }
+            if ui.small_button("Surface").clicked() {
+                self.vol3d.apply_sota_surface_preset();
+            }
+            if ui.small_button("Support").clicked() {
+                self.vol3d.apply_sota_support_preset();
+            }
+        });
+        egui::ComboBox::from_id_salt("vol3d_render_mode")
+            .selected_text(self.vol3d.render_mode.label())
+            .show_ui(ui, |ui| {
+                for mode in vol3d::Vol3dRenderMode::ALL {
+                    ui.selectable_value(&mut self.vol3d.render_mode, mode, mode.label());
+                }
+            });
+        egui::ComboBox::from_id_salt("vol3d_support_mode")
+            .selected_text(self.vol3d.support_mode.label())
+            .show_ui(ui, |ui| {
+                for mode in vol3d::SupportMode::ALL {
+                    ui.selectable_value(&mut self.vol3d.support_mode, mode, mode.label());
+                }
+            });
+        if self.vol3d.support_mode == vol3d::SupportMode::HonestFade {
+            ui.add(
+                egui::Slider::new(&mut self.vol3d.support_floor, 0.0..=0.8).text("support floor"),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.vol3d.support_fade, 0.25..=4.0).text("support fade"),
+            );
+        }
+        ui.checkbox(&mut self.vol3d.preintegration, "Segment-preintegrated transfer")
+            .on_hover_text("Reduces color/opacity banding when adaptive steps grow; disabled automatically for velocity two-box color");
+        ui.add(
+            egui::Slider::new(&mut self.vol3d.adaptive_strength, 0.0..=1.0)
+                .text("adaptive traversal"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.vol3d.jitter_strength, 0.0..=1.0)
+                .text("stable anti-banding jitter"),
+        );
+
+        if matches!(
+            self.vol3d.render_mode,
+            vol3d::Vol3dRenderMode::HybridShell | vol3d::Vol3dRenderMode::Isosurface
+        ) {
+            let mut iso = self.vol3d.iso_value.clamp(value_min, value_max);
+            ui.add(
+                egui::Slider::new(&mut iso, value_min..=value_max)
+                    .suffix(value_suffix)
+                    .text("isosurface value"),
+            );
+            self.vol3d.iso_value = iso;
+            ui.add(egui::Slider::new(&mut self.vol3d.iso_width, 0.2..=8.0).text("shell width"));
+        }
+        if self.vol3d.render_mode == vol3d::Vol3dRenderMode::OrthogonalSlices {
+            ui.add(egui::Slider::new(&mut self.vol3d.slice_x, 0.0..=1.0).text("east-west slice"));
+            ui.add(egui::Slider::new(&mut self.vol3d.slice_y, 0.0..=1.0).text("north-south slice"));
+            ui.add(egui::Slider::new(&mut self.vol3d.slice_z, 0.0..=1.0).text("horizontal slice"));
+        }
+        ui.separator();
+        ui.strong("3D crop box");
+        ui.add(egui::Slider::new(&mut self.vol3d.crop_x_min, 0.0..=0.99).text("west crop"));
+        ui.add(egui::Slider::new(&mut self.vol3d.crop_x_max, 0.01..=1.0).text("east crop"));
+        ui.add(egui::Slider::new(&mut self.vol3d.crop_y_min, 0.0..=0.99).text("south crop"));
+        ui.add(egui::Slider::new(&mut self.vol3d.crop_y_max, 0.01..=1.0).text("north crop"));
+        let (x0, x1, y0, y1) = self.vol3d.normalized_horizontal_crop();
+        self.vol3d.crop_x_min = x0;
+        self.vol3d.crop_x_max = x1;
+        self.vol3d.crop_y_min = y0;
+        self.vol3d.crop_y_max = y1;
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Beam support describes how directly the Cartesian voxel is constrained by the observed tilt stack. It is a BowEcho display aid, not official radar QC or formal uncertainty.",
+                )
+                .weak(),
+            )
+            .wrap(),
+        );
+    }
+
     /// 3D Volume Explorer body. Deep controls live in compact expandable
     /// panels so nested combo boxes do not get closed by parent popup menus.
     fn vol3d_pane_body(&mut self, ui: &mut egui::Ui) {
@@ -40850,6 +40961,20 @@ impl ViewerApp {
                 .clicked()
             {
                 self.vol3d.show_floor_controls = !self.vol3d.show_floor_controls;
+            }
+
+            if ui
+                .selectable_label(self.vol3d.show_analysis_controls, "Analysis")
+                .clicked()
+            {
+                self.vol3d.show_analysis_controls = !self.vol3d.show_analysis_controls;
+            }
+
+            if ui
+                .selectable_label(self.vol3d.show_lighting_controls, "Lighting")
+                .clicked()
+            {
+                self.vol3d.show_lighting_controls = !self.vol3d.show_lighting_controls;
             }
 
             ui.menu_button("View", |ui| {
@@ -40973,9 +41098,10 @@ impl ViewerApp {
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(format!(
-                        "{} · {} · {} · {:.1}× Z",
+                        "{} · {} / {} · {} · {:.1}× Z",
                         threshold_status,
                         self.vol3d.floor_mode.label(),
+                        self.vol3d.render_mode.label(),
                         self.vol3d.quality.label(),
                         self.vol3d.vertical_exaggeration,
                     ))
@@ -40988,7 +41114,18 @@ impl ViewerApp {
             }
         });
 
-        if self.vol3d.show_volume_controls || self.vol3d.show_floor_controls {
+        // Every stage-2 analysis control (render mode, support mode/floor/fade,
+        // preintegration, adaptive traversal, isosurface, slices, crop box) and
+        // the required beam-support disclosure live in the Analysis frame, so
+        // this gate must list it. The stage-2 patcher tried to add it by
+        // matching a one-line form of this condition that rustfmt had already
+        // split, so the replace silently no-opped and the whole Analysis panel
+        // was unreachable unless another panel happened to be open too.
+        if self.vol3d.show_volume_controls
+            || self.vol3d.show_floor_controls
+            || self.vol3d.show_analysis_controls
+            || self.vol3d.show_lighting_controls
+        {
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 if self.vol3d.show_volume_controls {
@@ -41011,6 +41148,101 @@ impl ViewerApp {
                             value_max,
                             value_suffix.as_str(),
                         );
+                    });
+                }
+                if self.vol3d.show_analysis_controls {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        self.vol3d_analysis_controls_body(
+                            ui,
+                            value_min,
+                            value_max,
+                            value_suffix.as_str(),
+                        );
+                    });
+                }
+                if self.vol3d.show_lighting_controls {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong("Positive-energy SH lighting");
+                            ui.checkbox(&mut self.vol3d.lighting.enabled, "Enabled");
+                        });
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Scalar lighting preserves radar palette hue. Shadows are a visual occupancy cue, not an optical or meteorological retrieval.",
+                                )
+                                .weak(),
+                            ),
+                        );
+                        egui::ComboBox::from_id_salt("vol3d_lighting_preset")
+                            .selected_text(self.vol3d.lighting.preset.label())
+                            .show_ui(ui, |ui| {
+                                for preset in vol3d::Vol3dLightingPreset::ALL {
+                                    ui.selectable_value(
+                                        &mut self.vol3d.lighting.preset,
+                                        preset,
+                                        preset.label(),
+                                    );
+                                }
+                            });
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.vol3d.lighting.light_azimuth_deg,
+                                0.0..=360.0,
+                            )
+                            .suffix(" deg")
+                            .text("key azimuth"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.vol3d.lighting.light_elevation_deg,
+                                5.0..=85.0,
+                            )
+                            .suffix(" deg")
+                            .text("key elevation"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.vol3d.lighting.ambient_strength,
+                                0.0..=1.5,
+                            )
+                            .text("SH ambient"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.vol3d.lighting.key_strength, 0.0..=2.0)
+                                .text("key strength"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.vol3d.lighting.rim_strength, 0.0..=0.5)
+                                .text("view rim"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.vol3d.lighting.shadow_strength,
+                                0.0..=1.0,
+                            )
+                            .text("self-shadow blend"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.vol3d.lighting.shadow_density,
+                                0.0..=12.0,
+                            )
+                            .text("shadow density"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.vol3d.lighting.shadow_steps,
+                                4..=vol3d::LIGHTING_MAX_SHADOW_STEPS,
+                            )
+                            .text("shadow steps"),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Reset lighting").clicked() {
+                                self.vol3d.lighting = vol3d::Vol3dLightingSettings::default();
+                            }
+                            ui.weak("96 x 96 x 24 cache; rebuilt only when inputs change");
+                        });
                     });
                 }
             });
@@ -41160,6 +41392,7 @@ impl ViewerApp {
                     quality: self.vol3d.quality,
                     density: self.vol3d.density,
                     shading: self.vol3d.shading,
+                    lighting: self.vol3d.lighting,
                     clip_low,
                     clip_high,
                     floor_threshold01,
@@ -41169,6 +41402,27 @@ impl ViewerApp {
                     velocity_mode,
                     ref_gate: ref_gate01,
                     couplet_emphasis,
+                    render_mode: self.vol3d.render_mode,
+                    support_mode: self.vol3d.support_mode,
+                    support_floor: self.vol3d.support_floor,
+                    support_fade: self.vol3d.support_fade,
+                    iso_value: Self::normalized_vol3d_value(
+                        self.vol3d.iso_value,
+                        value_min,
+                        value_max,
+                    ),
+                    iso_width: (self.vol3d.iso_width / (value_max - value_min).abs().max(1.0e-6))
+                        .clamp(0.001, 0.25),
+                    jitter_strength: self.vol3d.jitter_strength,
+                    preintegration: if self.vol3d.preintegration { 1.0 } else { 0.0 },
+                    crop_x_min: self.vol3d.crop_x_min,
+                    crop_x_max: self.vol3d.crop_x_max,
+                    crop_y_min: self.vol3d.crop_y_min,
+                    crop_y_max: self.vol3d.crop_y_max,
+                    slice_x: self.vol3d.slice_x,
+                    slice_y: self.vol3d.slice_y,
+                    slice_z: self.vol3d.slice_z,
+                    adaptive_strength: self.vol3d.adaptive_strength,
                     pending: Arc::clone(&self.vol3d.pending),
                 },
             ));

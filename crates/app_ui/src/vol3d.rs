@@ -13,11 +13,23 @@
 //! old apparent "floating floor" caused by the wireframe using viewport width
 //! for its vertical projection while the shader used viewport height.
 
+mod lighting;
+
+pub use lighting::{Vol3dLightingPreset, Vol3dLightingSettings};
+
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
+use lighting::{
+    LIGHT_VOLUME_N, LIGHT_VOLUME_NZ, LIGHT_WORKGROUP_SIZE, LIGHTING_ENCODE_MAX, MAX_SHADOW_STEPS,
+    combine_cache_revision,
+};
 use radar_core::{MomentGrid, MomentType, RadarVolume};
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex, mpsc};
+
+#[path = "vol3d/advanced.rs"]
+mod advanced;
+pub use advanced::{SupportMode, Vol3dRenderMode};
 
 pub const BOX_N: usize = 192;
 pub const BOX_NZ: usize = 48;
@@ -27,8 +39,12 @@ pub const FLOOR_N: usize = 512;
 pub const BOX_HALF_KM: f32 = 60.0;
 pub const BOX_TOP_M: f32 = 18_000.0;
 const MAX_SHADER_STEPS: usize = 256;
-const UNIFORM_FLOATS: usize = 28;
+const UNIFORM_FLOATS: usize = 48;
 const UNIFORM_BYTES: u64 = (UNIFORM_FLOATS * std::mem::size_of::<f32>()) as u64;
+const LIGHTING_UNIFORM_FLOATS: usize = 32;
+const LIGHTING_UNIFORM_BYTES: u64 = (LIGHTING_UNIFORM_FLOATS * std::mem::size_of::<f32>()) as u64;
+const LIGHT_VOLUME_SHADER: &str = include_str!("vol3d/light_volume.wgsl");
+pub const LIGHTING_MAX_SHADOW_STEPS: u32 = MAX_SHADOW_STEPS;
 
 pub type Vol3dVolumeKey = (String, String, i64, usize, i32, i32, i32, i32);
 
@@ -146,8 +162,10 @@ pub struct Vol3d {
     /// Optical-depth multiplier. Opacity controls each sample; density controls
     /// how quickly repeated samples accumulate into a solid echo body.
     pub density: f32,
-    /// Gradient lighting strength, 0 = flat palette color, 1 = full shading.
+    /// Blend from untouched palette color (0) to cached SH lighting (1).
     pub shading: f32,
+    /// Positive-energy environment, key-light, and pseudo-shadow controls.
+    pub lighting: Vol3dLightingSettings,
     pub quality: Vol3dQuality,
     pub floor_mode: FloorMode,
     pub floor_opacity: f32,
@@ -194,8 +212,36 @@ pub struct Vol3d {
     pub pending: Arc<Mutex<PendingUploads>>,
     /// Inline advanced control groups. These are not popup menus because egui
     /// combo boxes close immediately when nested inside a parent popup.
+    /// Second-generation renderer mode. All modes use the same source data and
+    /// palette; only integration/traversal changes.
+    pub render_mode: Vol3dRenderMode,
+    /// How the renderer exposes the beam-stack support field.
+    pub support_mode: SupportMode,
+    /// Support value below which the honest-fade path becomes transparent.
+    pub support_floor: f32,
+    pub support_fade: f32,
+    /// Physical field value used by isosurface and hybrid-shell modes.
+    pub iso_value: f32,
+    pub iso_width: f32,
+    /// Stable sub-voxel ray offset. It reduces banding without temporal shimmer.
+    pub jitter_strength: f32,
+    /// Segment-preintegrated transfer lookup for single-field DVR/hybrid.
+    pub preintegration: bool,
+    /// Horizontal crop box in normalized volume coordinates.
+    pub crop_x_min: f32,
+    pub crop_x_max: f32,
+    pub crop_y_min: f32,
+    pub crop_y_max: f32,
+    /// Orthogonal slice positions in normalized volume coordinates.
+    pub slice_x: f32,
+    pub slice_y: f32,
+    pub slice_z: f32,
+    /// 0 = fixed reference sampling inside occupied bricks; 1 = full adaptive.
+    pub adaptive_strength: f32,
+    pub show_analysis_controls: bool,
     pub show_volume_controls: bool,
     pub show_floor_controls: bool,
+    pub show_lighting_controls: bool,
 }
 
 #[derive(Default)]
@@ -215,6 +261,13 @@ pub struct VolumeBox {
     /// and every other moment): color comes from `data` itself, exactly as
     /// before.
     pub color_data: Option<Vec<u8>>,
+    /// Beam-stack interpolation support; zero is no data.
+    pub support_data: Vec<u8>,
+    /// Conservative 8x8x8 brick min/max/support hierarchy.
+    pub hierarchy_fine: Vec<u8>,
+    /// Conservative macro hierarchy aggregated from fine bricks.
+    pub hierarchy_coarse: Vec<u8>,
+    pub acceleration_empty_fraction: f32,
     /// Raw normalized dBZ for the low-level floor. Rows run south-to-north,
     /// exactly like the y dimension of `volume_box_resample`.
     pub floor_data: Option<Vec<u8>>,
@@ -243,6 +296,7 @@ impl Default for Vol3d {
             opacity: 0.55,
             density: 1.0,
             shading: 0.65,
+            lighting: Vol3dLightingSettings::default(),
             quality: Vol3dQuality::Balanced,
             floor_mode: FloorMode::LowestTilt,
             floor_opacity: 0.82,
@@ -267,8 +321,26 @@ impl Default for Vol3d {
             status: String::new(),
             lut_signature: 0,
             pending: Arc::new(Mutex::new(PendingUploads::default())),
+            render_mode: Vol3dRenderMode::DirectVolume,
+            support_mode: SupportMode::HonestFade,
+            support_floor: 0.14,
+            support_fade: 1.35,
+            iso_value: 40.0,
+            iso_width: 2.0,
+            jitter_strength: 0.72,
+            preintegration: true,
+            crop_x_min: 0.0,
+            crop_x_max: 1.0,
+            crop_y_min: 0.0,
+            crop_y_max: 1.0,
+            slice_x: 0.5,
+            slice_y: 0.5,
+            slice_z: 0.35,
+            adaptive_strength: 0.85,
+            show_analysis_controls: false,
             show_volume_controls: false,
             show_floor_controls: false,
+            show_lighting_controls: false,
         }
     }
 }
@@ -489,6 +561,46 @@ impl Vol3d {
         self.quality = Vol3dQuality::High;
     }
 
+    pub fn apply_sota_volume_preset(&mut self) {
+        self.render_mode = Vol3dRenderMode::DirectVolume;
+        self.support_mode = SupportMode::HonestFade;
+        self.preintegration = true;
+        self.adaptive_strength = 0.85;
+        self.jitter_strength = 0.72;
+    }
+
+    pub fn apply_sota_hybrid_preset(&mut self) {
+        self.render_mode = Vol3dRenderMode::HybridShell;
+        self.support_mode = SupportMode::HonestFade;
+        self.iso_value = 40.0;
+        self.iso_width = 2.0;
+        self.preintegration = true;
+        self.adaptive_strength = 0.9;
+    }
+
+    pub fn apply_sota_surface_preset(&mut self) {
+        self.render_mode = Vol3dRenderMode::Isosurface;
+        self.support_mode = SupportMode::HonestFade;
+        self.iso_value = 45.0;
+        self.preintegration = false;
+        self.adaptive_strength = 1.0;
+    }
+
+    pub fn apply_sota_support_preset(&mut self) {
+        self.render_mode = Vol3dRenderMode::SupportInspection;
+        self.support_mode = SupportMode::Inspect;
+        self.preintegration = false;
+        self.adaptive_strength = 1.0;
+    }
+
+    pub fn normalized_horizontal_crop(&self) -> (f32, f32, f32, f32) {
+        let x0 = self.crop_x_min.clamp(0.0, 0.99);
+        let x1 = self.crop_x_max.clamp(x0 + 0.01, 1.0);
+        let y0 = self.crop_y_min.clamp(0.0, 0.99);
+        let y1 = self.crop_y_max.clamp(y0 + 0.01, 1.0);
+        (x0, x1, y0, y1)
+    }
+
     /// Exact CPU companion to the WGSL camera projection. Returning `None`
     /// avoids drawing annotation lines through the camera or behind it.
     pub fn project_point(&self, rect: egui::Rect, point: [f32; 3]) -> Option<egui::Pos2> {
@@ -525,6 +637,14 @@ pub fn normalize_values(values: &[f32], value_min: f32, value_max: f32) -> Vec<u
         .collect()
 }
 
+/// Build a box from values alone, treating every finite value as fully
+/// supported. Test-only since stage 2: every production path now carries the
+/// beam-stack support field and goes through `normalize_box_with_support`, and
+/// `empty_box` hand-writes its result instead of computing it. It survives as
+/// the reference those tests pin the shortcut against, so `#[cfg(test)]` rather
+/// than `#[allow(dead_code)]` - the compiler should keep telling us if a
+/// production caller ever reappears without support metadata.
+#[cfg(test)]
 pub fn normalize_box_with_range(
     values: &[f32],
     n: usize,
@@ -532,11 +652,32 @@ pub fn normalize_box_with_range(
     value_min: f32,
     value_max: f32,
 ) -> VolumeBox {
+    let support = values
+        .iter()
+        .map(|value| if value.is_finite() { 255 } else { 0 })
+        .collect::<Vec<_>>();
+    normalize_box_with_support(values, &support, n, nz, value_min, value_max)
+}
+
+pub fn normalize_box_with_support(
+    values: &[f32],
+    support: &[u8],
+    n: usize,
+    nz: usize,
+    value_min: f32,
+    value_max: f32,
+) -> VolumeBox {
+    let data = normalize_values(values, value_min, value_max);
+    let acceleration = advanced::build_acceleration(&data, support, n, nz);
     VolumeBox {
-        data: normalize_values(values, value_min, value_max),
+        data,
         n,
         nz,
         color_data: None,
+        support_data: acceleration.support,
+        hierarchy_fine: acceleration.fine_minmax,
+        hierarchy_coarse: acceleration.coarse_minmax,
+        acceleration_empty_fraction: acceleration.empty_fine_fraction,
         // Upload an empty floor with every new volume so a failed low-tilt
         // raster can never leave the prior scan painted underneath.
         floor_data: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N)]),
@@ -544,12 +685,29 @@ pub fn normalize_box_with_range(
     }
 }
 
+/// All-no-data box used to blank the render between products and while a live
+/// volume is still building.
+///
+/// It is called from the UI thread on every repaint of those waiting states, so
+/// it must not take the general path: `normalize_box_with_range` allocates a
+/// 1.7 M-voxel NaN slab and then walks the 3.4 M-texel dilated hierarchy gather
+/// only to produce zeros. Every field below is exactly what that path yields
+/// for an all-NaN input (no-data normalizes to 0, support is 0 everywhere, so
+/// every brick is unsupported and publishes an all-zero range), and
+/// `empty_box_matches_general_path` pins that equality.
 pub fn empty_box() -> VolumeBox {
+    let voxels = BOX_N.saturating_mul(BOX_N).saturating_mul(BOX_NZ);
     VolumeBox {
-        data: vec![0; BOX_N.saturating_mul(BOX_N).saturating_mul(BOX_NZ)],
+        data: vec![0; voxels],
         n: BOX_N,
         nz: BOX_NZ,
         color_data: None,
+        support_data: vec![0; voxels],
+        hierarchy_fine: vec![0; advanced::FINE_X * advanced::FINE_Y * advanced::FINE_Z * 4],
+        hierarchy_coarse: vec![0; advanced::COARSE_X * advanced::COARSE_Y * advanced::COARSE_Z * 4],
+        acceleration_empty_fraction: 1.0,
+        // Upload an empty floor with every new volume so a failed low-tilt
+        // raster can never leave the prior scan painted underneath.
         floor_data: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N)]),
         floor_elevation_deg: None,
     }
@@ -774,6 +932,32 @@ struct Uniforms {
     // 0 = show all flow at the reflectivity opacity, 1 = fade weak flow so
     // strong inbound/outbound couplets dominate.
     couplet_emphasis: f32,
+
+    // Fragment-only controls for the precomputed lighting texture.
+    rim_strength: f32,
+    light_enabled: f32,
+    light_decode_scale: f32,
+    _lighting_pad: f32,
+
+    render_mode: f32,
+    support_mode: f32,
+    support_floor: f32,
+    support_fade: f32,
+
+    iso_value: f32,
+    iso_width: f32,
+    jitter_strength: f32,
+    preintegration: f32,
+
+    crop_x_min: f32,
+    crop_x_max: f32,
+    crop_y_min: f32,
+    crop_y_max: f32,
+
+    slice_x: f32,
+    slice_y: f32,
+    slice_z: f32,
+    adaptive_strength: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -784,6 +968,13 @@ struct Uniforms {
 @group(0) @binding(5) var t_floor: texture_2d<f32>;
 @group(0) @binding(6) var s_floor: sampler;
 @group(0) @binding(7) var t_color: texture_3d<f32>;
+@group(0) @binding(8) var t_light: texture_3d<f32>;
+
+
+@group(0) @binding(9) var t_support: texture_3d<f32>;
+@group(0) @binding(10) var t_hierarchy_fine: texture_3d<f32>;
+@group(0) @binding(11) var t_hierarchy_coarse: texture_3d<f32>;
+@group(0) @binding(12) var t_preintegrated: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -801,9 +992,6 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 const MAX_STEPS: i32 = 256;
 const FLOOR_COLUMN_STEPS: i32 = 48;
-const VOLUME_DX: f32 = 1.0 / 192.0;
-const VOLUME_DZ: f32 = 1.0 / 48.0;
-
 fn box_intersect(
     ro: vec3<f32>,
     rd: vec3<f32>,
@@ -822,51 +1010,19 @@ fn box_intersect(
 }
 
 fn shaded_rgb(uvw: vec3<f32>, ray_dir: vec3<f32>, base: vec3<f32>) -> vec3<f32> {
-    if (u.shading <= 0.001) {
+    if (u.shading <= 0.001 || u.light_enabled < 0.5) {
         return base;
     }
-    let gx = textureSampleLevel(
-        t_volume,
-        s_volume,
-        uvw + vec3<f32>(VOLUME_DX, 0.0, 0.0),
-        0.0
-    ).r - textureSampleLevel(
-        t_volume,
-        s_volume,
-        uvw - vec3<f32>(VOLUME_DX, 0.0, 0.0),
-        0.0
-    ).r;
-    let gy = textureSampleLevel(
-        t_volume,
-        s_volume,
-        uvw + vec3<f32>(0.0, VOLUME_DX, 0.0),
-        0.0
-    ).r - textureSampleLevel(
-        t_volume,
-        s_volume,
-        uvw - vec3<f32>(0.0, VOLUME_DX, 0.0),
-        0.0
-    ).r;
-    let gz = textureSampleLevel(
-        t_volume,
-        s_volume,
-        uvw + vec3<f32>(0.0, 0.0, VOLUME_DZ),
-        0.0
-    ).r - textureSampleLevel(
-        t_volume,
-        s_volume,
-        uvw - vec3<f32>(0.0, 0.0, VOLUME_DZ),
-        0.0
-    ).r;
-    let gradient = vec3<f32>(gx, gy, gz * 0.55);
-    if (dot(gradient, gradient) < 0.000001) {
-        return base;
+    let cached = textureSampleLevel(t_light, s_volume, uvw, 0.0);
+    let decoded_normal = cached.rgb * 2.0 - vec3<f32>(1.0);
+    var rim = 0.0;
+    if (dot(decoded_normal, decoded_normal) > 0.01) {
+        let normal = normalize(decoded_normal);
+        let rim_facing = 1.0 - abs(dot(normal, -ray_dir));
+        rim = max(u.rim_strength, 0.0) * rim_facing * rim_facing;
     }
-    let normal = normalize(gradient);
-    let light_dir = normalize(vec3<f32>(0.40, -0.48, 0.78));
-    let diffuse = 0.45 + 0.55 * abs(dot(normal, light_dir));
-    let rim = 0.18 * pow(1.0 - abs(dot(normal, -ray_dir)), 2.0);
-    let lighting = clamp(diffuse + rim, 0.35, 1.25);
+    let lighting = clamp(cached.a * u.light_decode_scale + rim, 0.20, 2.0);
+    // Scalar illumination preserves the exact reflectivity/velocity palette hue.
     return base * mix(1.0, lighting, clamp(u.shading, 0.0, 1.0));
 }
 
@@ -907,6 +1063,157 @@ fn threshold_strength(value: f32, low: f32, high: f32, mode: f32, width: f32) ->
     return smoothstep(low, low + width, value);
 }
 
+
+const MAX_TRAVERSAL_STEPS: i32 = 1024;
+const FINE_DIMS: vec3<i32> = vec3<i32>(24, 24, 6);
+const COARSE_DIMS: vec3<i32> = vec3<i32>(6, 6, 2);
+const HUGE_T: f32 = 1.0e20;
+
+fn hash12(p: vec2<f32>) -> f32 {
+    let h = dot(p, vec2<f32>(127.1, 311.7));
+    return fract(sin(h) * 43758.5453123);
+}
+
+fn point_to_uvw(point: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        (point.x + 1.0) * 0.5,
+        (point.y + 1.0) * 0.5,
+        point.z / max(u.zspan, 0.0001)
+    );
+}
+
+fn hierarchy_coord(uvw: vec3<f32>, dims: vec3<i32>) -> vec3<i32> {
+    let scaled = vec3<i32>(floor(clamp(uvw, vec3<f32>(0.0), vec3<f32>(0.999999)) * vec3<f32>(dims)));
+    return clamp(scaled, vec3<i32>(0), dims - vec3<i32>(1));
+}
+
+fn fine_range(uvw: vec3<f32>) -> vec4<f32> {
+    return textureLoad(t_hierarchy_fine, hierarchy_coord(uvw, FINE_DIMS), 0);
+}
+
+fn coarse_range(uvw: vec3<f32>) -> vec4<f32> {
+    return textureLoad(t_hierarchy_coarse, hierarchy_coord(uvw, COARSE_DIMS), 0);
+}
+
+fn range_can_contribute(range: vec4<f32>) -> bool {
+    if (range.a <= 0.0001) {
+        return false;
+    }
+    if (u.render_mode > 1.5 && u.render_mode < 2.5) {
+        return range.g >= u.iso_value - max(u.iso_width, 0.002);
+    }
+    if (u.render_mode > 0.5 && u.render_mode < 1.5) {
+        if (range.g >= u.iso_value - max(u.iso_width, 0.002)) {
+            return true;
+        }
+    }
+    if (u.velocity_mode > 0.5) {
+        return range.g > u.ref_gate;
+    }
+    if (u.threshold_mode > 1.5) {
+        return range.r < u.threshold || range.g > u.threshold_high;
+    }
+    if (u.threshold_mode > 0.5) {
+        return range.r < u.threshold;
+    }
+    return range.g > u.threshold;
+}
+
+fn axis_cell_exit(
+    p: f32,
+    d: f32,
+    cell: i32,
+    dim: i32,
+    world_min: f32,
+    world_max: f32
+) -> f32 {
+    if (abs(d) < 0.0000001) {
+        return HUGE_T;
+    }
+    let width = (world_max - world_min) / f32(dim);
+    var boundary = world_min + f32(cell) * width;
+    if (d > 0.0) {
+        boundary = boundary + width;
+    }
+    let distance = (boundary - p) / d;
+    if (distance <= 0.000001) {
+        return HUGE_T;
+    }
+    return distance;
+}
+
+fn next_cell_exit(point: vec3<f32>, rd: vec3<f32>, dims: vec3<i32>) -> f32 {
+    let uvw = point_to_uvw(point);
+    let cell = hierarchy_coord(uvw, dims);
+    let tx = axis_cell_exit(point.x, rd.x, cell.x, dims.x, -1.0, 1.0);
+    let ty = axis_cell_exit(point.y, rd.y, cell.y, dims.y, -1.0, 1.0);
+    let tz = axis_cell_exit(point.z, rd.z, cell.z, dims.z, 0.0, u.zspan);
+    return max(min(tx, min(ty, tz)), 0.00001);
+}
+
+fn support_value(uvw: vec3<f32>) -> f32 {
+    return textureSampleLevel(t_support, s_volume, uvw, 0.0).r;
+}
+
+fn support_weight(value: f32) -> f32 {
+    if (value <= 0.0001) {
+        return 0.0;
+    }
+    if (u.support_mode > 0.5 && u.support_mode < 1.5) {
+        return 1.0;
+    }
+    let floor_value = clamp(u.support_floor, 0.0, 0.95);
+    let normalized = smoothstep(floor_value, 1.0, value);
+    return pow(max(normalized, 0.0001), max(u.support_fade, 0.05));
+}
+
+fn support_color(value: f32) -> vec3<f32> {
+    let low = vec3<f32>(0.78, 0.16, 0.15);
+    let middle = vec3<f32>(0.95, 0.69, 0.16);
+    let high = vec3<f32>(0.20, 0.82, 0.90);
+    if (value < 0.5) {
+        return mix(low, middle, value * 2.0);
+    }
+    return mix(middle, high, (value - 0.5) * 2.0);
+}
+
+fn refined_iso_t(ro: vec3<f32>, rd: vec3<f32>, ta_in: f32, tb_in: f32) -> f32 {
+    var ta = ta_in;
+    var tb = tb_in;
+    var va = textureSampleLevel(t_volume, s_volume, point_to_uvw(ro + rd * ta), 0.0).r;
+    let vb0 = textureSampleLevel(t_volume, s_volume, point_to_uvw(ro + rd * tb), 0.0).r;
+    let rising = vb0 >= va;
+    for (var iteration = 0; iteration < 6; iteration = iteration + 1) {
+        let tm = 0.5 * (ta + tb);
+        let vm = textureSampleLevel(t_volume, s_volume, point_to_uvw(ro + rd * tm), 0.0).r;
+        if (rising) {
+            if (vm < u.iso_value) {
+                ta = tm;
+                va = vm;
+            } else {
+                tb = tm;
+            }
+        } else {
+            if (vm > u.iso_value) {
+                ta = tm;
+                va = vm;
+            } else {
+                tb = tm;
+            }
+        }
+    }
+    return 0.5 * (ta + tb);
+}
+
+fn crop_contains(point: vec3<f32>, low_z: f32, high_z: f32) -> bool {
+    let x0 = mix(-1.0, 1.0, clamp(u.crop_x_min, 0.0, 0.99));
+    let x1 = mix(-1.0, 1.0, clamp(u.crop_x_max, u.crop_x_min + 0.01, 1.0));
+    let y0 = mix(-1.0, 1.0, clamp(u.crop_y_min, 0.0, 0.99));
+    let y1 = mix(-1.0, 1.0, clamp(u.crop_y_max, u.crop_y_min + 0.01, 1.0));
+    return point.x >= x0 && point.x <= x1 && point.y >= y0 && point.y <= y1
+        && point.z >= low_z && point.z <= high_z;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cy = cos(u.yaw);
@@ -927,67 +1234,225 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let clip_low_z = clamp(u.clip_low, 0.0, 0.99) * u.zspan;
     let clip_high_z = clamp(u.clip_high, u.clip_low + 0.01, 1.0) * u.zspan;
-    let hit = box_intersect(
-        eye,
-        rd,
-        vec3<f32>(-1.0, -1.0, clip_low_z),
-        vec3<f32>(1.0, 1.0, clip_high_z)
+    let crop_min = vec3<f32>(
+        mix(-1.0, 1.0, clamp(u.crop_x_min, 0.0, 0.99)),
+        mix(-1.0, 1.0, clamp(u.crop_y_min, 0.0, 0.99)),
+        clip_low_z
     );
+    let crop_max = vec3<f32>(
+        mix(-1.0, 1.0, clamp(u.crop_x_max, u.crop_x_min + 0.01, 1.0)),
+        mix(-1.0, 1.0, clamp(u.crop_y_max, u.crop_y_min + 0.01, 1.0)),
+        clip_high_z
+    );
+    let hit = box_intersect(eye, rd, crop_min, crop_max);
 
     var color = vec3<f32>(0.0);
     var accumulated = 0.0;
+
     if (hit.y > max(hit.x, 0.0)) {
         let t0 = max(hit.x, 0.0);
         let step_count = i32(clamp(u.steps, 32.0, 256.0));
-        let dt = (hit.y - t0) / f32(step_count);
-        for (var i = 0; i < MAX_STEPS; i = i + 1) {
-            if (i >= step_count) {
-                break;
+        let base_dt = (hit.y - t0) / f32(step_count);
+
+        // Orthogonal slices are analytic plane intersections rather than a
+        // sampled volume. Sort the three hit distances and composite front to back.
+        if (u.render_mode > 3.5 && u.render_mode < 4.5) {
+            var slice_t = array<f32, 3>(HUGE_T, HUGE_T, HUGE_T);
+            if (abs(rd.x) > 0.000001) {
+                slice_t[0] = (mix(-1.0, 1.0, clamp(u.slice_x, 0.0, 1.0)) - eye.x) / rd.x;
             }
-            let point = eye + rd * (t0 + (f32(i) + 0.5) * dt);
-            let uvw = vec3<f32>(
-                (point.x + 1.0) * 0.5,
-                (point.y + 1.0) * 0.5,
-                point.z / u.zspan
-            );
-            let structure = textureSampleLevel(t_volume, s_volume, uvw, 0.0).r;
-            var transfer = 0.0;
-            var lut_coord = structure;
-            var emphasis = 1.0;
-            if (u.velocity_mode > 0.5) {
-                // Structure and opacity from the co-located reflectivity box;
-                // color from the signed velocity box. The volume body takes its
-                // shape from where precipitation actually is, and each voxel is
-                // painted with its velocity.
-                transfer = smoothstep(u.ref_gate, u.ref_gate + 0.08, structure);
-                let vel = textureSampleLevel(t_color, s_volume, uvw, 0.0).r;
-                let vmag = clamp(abs(vel - 0.5) * 2.0, 0.0, 1.0);
-                emphasis = mix(1.0, vmag, clamp(u.couplet_emphasis, 0.0, 1.0));
-                lut_coord = vel;
-            } else {
-                transfer = threshold_strength(
-                    structure,
-                    u.threshold,
-                    u.threshold_high,
-                    u.threshold_mode,
-                    0.08
-                );
-                lut_coord = structure;
+            if (abs(rd.y) > 0.000001) {
+                slice_t[1] = (mix(-1.0, 1.0, clamp(u.slice_y, 0.0, 1.0)) - eye.y) / rd.y;
             }
-            if (transfer <= 0.0) {
-                continue;
+            if (abs(rd.z) > 0.000001) {
+                slice_t[2] = (clamp(u.slice_z, 0.0, 1.0) * u.zspan - eye.z) / rd.z;
             }
-            let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(lut_coord, 0.5), 0.0);
-            var alpha = palette.a * u.opacity * transfer * emphasis;
-            alpha = 1.0 - pow(
-                max(1.0 - alpha, 0.0001),
-                dt * 28.0 * max(u.density, 0.05)
-            );
-            let sample_rgb = shaded_rgb(uvw, rd, palette.rgb);
-            color = color + (1.0 - accumulated) * alpha * sample_rgb;
-            accumulated = accumulated + (1.0 - accumulated) * alpha;
-            if (accumulated > 0.985) {
-                break;
+            if (slice_t[1] < slice_t[0]) { let temp = slice_t[0]; slice_t[0] = slice_t[1]; slice_t[1] = temp; }
+            if (slice_t[2] < slice_t[1]) { let temp = slice_t[1]; slice_t[1] = slice_t[2]; slice_t[2] = temp; }
+            if (slice_t[1] < slice_t[0]) { let temp = slice_t[0]; slice_t[0] = slice_t[1]; slice_t[1] = temp; }
+            for (var slice_index = 0; slice_index < 3; slice_index = slice_index + 1) {
+                let sample_t = slice_t[slice_index];
+                if (sample_t < t0 || sample_t > hit.y) { continue; }
+                let point = eye + rd * sample_t;
+                if (!crop_contains(point, clip_low_z, clip_high_z)) { continue; }
+                let uvw = point_to_uvw(point);
+                let structure = textureSampleLevel(t_volume, s_volume, uvw, 0.0).r;
+                let support = support_value(uvw);
+                if (support <= 0.0001) { continue; }
+                var lut_coord = structure;
+                var transfer = threshold_strength(structure, u.threshold, u.threshold_high, u.threshold_mode, 0.08);
+                if (u.velocity_mode > 0.5) {
+                    transfer = smoothstep(u.ref_gate, u.ref_gate + 0.08, structure);
+                    lut_coord = textureSampleLevel(t_color, s_volume, uvw, 0.0).r;
+                }
+                if (transfer <= 0.0) { continue; }
+                let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(lut_coord, 0.5), 0.0);
+                let weight = support_weight(support);
+                let alpha = palette.a * u.opacity * transfer * max(weight, 0.15) * 0.72;
+                var rgb = shaded_rgb(uvw, rd, palette.rgb);
+                if (u.support_mode > 1.5) { rgb = support_color(support); }
+                color = color + (1.0 - accumulated) * alpha * rgb;
+                accumulated = accumulated + (1.0 - accumulated) * alpha;
+            }
+        } else {
+            let jitter = (hash12(in.pos.xy) - 0.5) * clamp(u.jitter_strength, 0.0, 1.0);
+            var t = t0 + max(jitter * base_dt, 0.0);
+            var previous_t = t;
+            var previous_structure = textureSampleLevel(
+                t_volume, s_volume, point_to_uvw(eye + rd * t), 0.0
+            ).r;
+            var have_previous = false;
+            var shell_drawn = false;
+            var maximum_value = -1.0;
+            var maximum_lut = 0.0;
+            var maximum_support = 0.0;
+            var maximum_uvw = vec3<f32>(0.5);
+
+            for (var iteration = 0; iteration < MAX_TRAVERSAL_STEPS; iteration = iteration + 1) {
+                if (t > hit.y || accumulated > 0.992) { break; }
+                let point = eye + rd * t;
+                let uvw = point_to_uvw(point);
+                let coarse = coarse_range(uvw);
+                if (!range_can_contribute(coarse)) {
+                    t = t + next_cell_exit(point, rd, COARSE_DIMS) + 0.00002;
+                    have_previous = false;
+                    continue;
+                }
+                let fine = fine_range(uvw);
+                if (!range_can_contribute(fine)) {
+                    t = t + next_cell_exit(point, rd, FINE_DIMS) + 0.00002;
+                    have_previous = false;
+                    continue;
+                }
+
+                let structure = textureSampleLevel(t_volume, s_volume, uvw, 0.0).r;
+                let support = support_value(uvw);
+                if (support <= 0.0001) {
+                    t = t + base_dt;
+                    have_previous = false;
+                    continue;
+                }
+
+                var transfer = 0.0;
+                var lut_coord = structure;
+                var emphasis = 1.0;
+                if (u.velocity_mode > 0.5) {
+                    transfer = smoothstep(u.ref_gate, u.ref_gate + 0.08, structure);
+                    let velocity = textureSampleLevel(t_color, s_volume, uvw, 0.0).r;
+                    let magnitude = clamp(abs(velocity - 0.5) * 2.0, 0.0, 1.0);
+                    emphasis = mix(1.0, magnitude, clamp(u.couplet_emphasis, 0.0, 1.0));
+                    lut_coord = velocity;
+                } else {
+                    transfer = threshold_strength(
+                        structure, u.threshold, u.threshold_high, u.threshold_mode, 0.08
+                    );
+                }
+
+                // Maximum projection keeps the strongest contributing structure
+                // while preserving velocity color at that same voxel.
+                if (u.render_mode > 2.5 && u.render_mode < 3.5) {
+                    let candidate = transfer * emphasis;
+                    if (candidate > 0.0 && structure > maximum_value) {
+                        maximum_value = structure;
+                        maximum_lut = lut_coord;
+                        maximum_support = support;
+                        maximum_uvw = uvw;
+                    }
+                } else {
+                    let crossed_iso = have_previous
+                        && ((previous_structure < u.iso_value && structure >= u.iso_value)
+                            || (previous_structure > u.iso_value && structure <= u.iso_value));
+                    if (crossed_iso && (u.render_mode > 0.5 && u.render_mode < 2.5)) {
+                        let surface_t = refined_iso_t(eye, rd, previous_t, t);
+                        let surface_uvw = point_to_uvw(eye + rd * surface_t);
+                        let surface_support = support_value(surface_uvw);
+                        if (surface_support > 0.0001) {
+                            var surface_lut = textureSampleLevel(t_volume, s_volume, surface_uvw, 0.0).r;
+                            if (u.velocity_mode > 0.5) {
+                                surface_lut = textureSampleLevel(t_color, s_volume, surface_uvw, 0.0).r;
+                            }
+                            let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(surface_lut, 0.5), 0.0);
+                            let support_scale = support_weight(surface_support);
+                            let shell_alpha = mix(0.78, 0.38, select(0.0, 1.0, u.render_mode < 1.5))
+                                * max(support_scale, 0.1);
+                            var shell_rgb = shaded_rgb(surface_uvw, rd, palette.rgb);
+                            if (u.support_mode > 1.5 || u.render_mode > 4.5) {
+                                shell_rgb = support_color(surface_support);
+                            }
+                            color = color + (1.0 - accumulated) * shell_alpha * shell_rgb;
+                            accumulated = accumulated + (1.0 - accumulated) * shell_alpha;
+                            shell_drawn = true;
+                            if (u.render_mode > 1.5 && u.render_mode < 2.5) {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (transfer > 0.0 && (u.render_mode < 1.5 || u.render_mode > 4.5)) {
+                        let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(lut_coord, 0.5), 0.0);
+                        let support_scale = support_weight(support);
+                        var sample_rgb = palette.rgb;
+                        var alpha = 0.0;
+                        let use_preintegration = u.preintegration > 0.5
+                            && u.velocity_mode < 0.5
+                            && u.render_mode < 1.5
+                            && have_previous;
+                        if (use_preintegration) {
+                            let segment = textureSampleLevel(
+                                t_preintegrated,
+                                s_lut,
+                                vec2<f32>(previous_structure, structure),
+                                0.0
+                            );
+                            sample_rgb = segment.rgb;
+                            alpha = 1.0 - pow(
+                                max(1.0 - segment.a, 0.0001),
+                                max((t - previous_t) * 28.0 * u.density, 0.01)
+                            );
+                        } else {
+                            let raw_alpha = palette.a * u.opacity * transfer * emphasis;
+                            alpha = 1.0 - pow(
+                                max(1.0 - raw_alpha, 0.0001),
+                                base_dt * 28.0 * max(u.density, 0.05)
+                            );
+                        }
+                        alpha = alpha * support_scale;
+                        sample_rgb = shaded_rgb(uvw, rd, sample_rgb);
+                        if (u.support_mode > 1.5 || u.render_mode > 4.5) {
+                            sample_rgb = support_color(support);
+                        }
+                        color = color + (1.0 - accumulated) * alpha * sample_rgb;
+                        accumulated = accumulated + (1.0 - accumulated) * alpha;
+                    }
+                }
+
+                previous_t = t;
+                previous_structure = structure;
+                have_previous = true;
+
+                let interval_width = fine.g - fine.r;
+                let edge_value = select(u.threshold, u.iso_value, u.render_mode > 0.5 && u.render_mode < 2.5);
+                let proximity = 1.0 - clamp(abs(structure - edge_value) / 0.12, 0.0, 1.0);
+                let detail = clamp(interval_width * 4.5, 0.0, 1.0);
+                let adaptive = max(detail, proximity);
+                let target_factor = mix(2.25, 0.55, adaptive);
+                let factor = mix(1.0, target_factor, clamp(u.adaptive_strength, 0.0, 1.0));
+                var step_dt = base_dt * factor;
+                if (u.render_mode > 2.5 && u.render_mode < 3.5) {
+                    step_dt = min(step_dt, base_dt * 0.85);
+                }
+                step_dt = min(step_dt, next_cell_exit(point, rd, FINE_DIMS) + 0.00002);
+                t = t + max(step_dt, base_dt * 0.35);
+            }
+
+            if (u.render_mode > 2.5 && u.render_mode < 3.5 && maximum_value >= 0.0) {
+                let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(maximum_lut, 0.5), 0.0);
+                let support_scale = support_weight(maximum_support);
+                let alpha = clamp(u.opacity * max(support_scale, 0.1), 0.08, 1.0);
+                var rgb = shaded_rgb(maximum_uvw, rd, palette.rgb);
+                if (u.support_mode > 1.5) { rgb = support_color(maximum_support); }
+                color = rgb * alpha;
+                accumulated = alpha;
             }
         }
     }
@@ -1000,10 +1465,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         if (floor_t > 0.0) {
             let point = eye + rd * floor_t;
             if (abs(point.x) <= 1.0 && abs(point.y) <= 1.0) {
-                let floor_uv = vec2<f32>(
-                    (point.x + 1.0) * 0.5,
-                    (point.y + 1.0) * 0.5
-                );
+                let floor_uv = vec2<f32>((point.x + 1.0) * 0.5, (point.y + 1.0) * 0.5);
                 var value = textureSampleLevel(t_floor, s_floor, floor_uv, 0.0).r;
                 // Column-max projects the reflectivity structure column onto the
                 // floor; in velocity mode that column lives in t_volume and
@@ -1013,19 +1475,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     value = column_max(floor_uv);
                 }
                 let floor_transfer = threshold_strength(
-                    value,
-                    u.floor_threshold,
-                    u.floor_threshold_high,
-                    u.floor_threshold_mode,
-                    0.04
+                    value, u.floor_threshold, u.floor_threshold_high,
+                    u.floor_threshold_mode, 0.04
                 );
                 if (floor_transfer > 0.0) {
-                    let palette = textureSampleLevel(
-                        t_lut,
-                        s_lut,
-                        vec2<f32>(value, 0.5),
-                        0.0
-                    );
+                    let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(value, 0.5), 0.0);
                     let alpha = palette.a * u.floor_opacity * floor_transfer;
                     color = color + (1.0 - accumulated) * alpha * palette.rgb;
                     accumulated = accumulated + (1.0 - accumulated) * alpha;
@@ -1042,6 +1496,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // than letting the fixed-function blend multiply alpha a second time.
     return vec4<f32>(color / accumulated, accumulated);
 }
+
 "#;
 
 /// GPU resources, created once at startup and stored in egui-wgpu's callback
@@ -1054,6 +1509,17 @@ pub struct Vol3dResources {
     lut_tex: wgpu::Texture,
     floor_tex: wgpu::Texture,
     color_tex: wgpu::Texture,
+    light_pipeline: wgpu::ComputePipeline,
+    light_bind_group: wgpu::BindGroup,
+    light_uniforms: wgpu::Buffer,
+    volume_generation: u64,
+    last_lighting_revision: Option<u64>,
+    support_tex: wgpu::Texture,
+    hierarchy_fine_tex: wgpu::Texture,
+    hierarchy_coarse_tex: wgpu::Texture,
+    preintegrated_tex: wgpu::Texture,
+    lut_cpu: Mutex<Vec<u8>>,
+    preintegration_signature: Mutex<u64>,
 }
 
 /// One-time GPU setup (eframe custom-3D pattern: call from the app
@@ -1064,9 +1530,19 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
         label: Some("vol3d"),
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
     });
+    let light_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("vol3d-light-volume"),
+        source: wgpu::ShaderSource::Wgsl(LIGHT_VOLUME_SHADER.into()),
+    });
     let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("vol3d-uniforms"),
         size: UNIFORM_BYTES,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let light_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vol3d-light-uniforms"),
+        size: LIGHTING_UNIFORM_BYTES,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1125,6 +1601,77 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D3,
         format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let light_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vol3d-light-volume"),
+        size: wgpu::Extent3d {
+            width: LIGHT_VOLUME_N,
+            height: LIGHT_VOLUME_N,
+            depth_or_array_layers: LIGHT_VOLUME_NZ,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+
+    let support_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vol3d-support"),
+        size: wgpu::Extent3d {
+            width: BOX_N as u32,
+            height: BOX_N as u32,
+            depth_or_array_layers: BOX_NZ as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let hierarchy_fine_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vol3d-hierarchy-fine"),
+        size: wgpu::Extent3d {
+            width: advanced::FINE_X as u32,
+            height: advanced::FINE_Y as u32,
+            depth_or_array_layers: advanced::FINE_Z as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let hierarchy_coarse_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vol3d-hierarchy-coarse"),
+        size: wgpu::Extent3d {
+            width: advanced::COARSE_X as u32,
+            height: advanced::COARSE_Y as u32,
+            depth_or_array_layers: advanced::COARSE_Z as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let preintegrated_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vol3d-preintegrated-transfer"),
+        size: wgpu::Extent3d {
+            width: 256,
+            height: 256,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -1208,6 +1755,56 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 12,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1254,6 +1851,36 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
                     &color_tex.create_view(&Default::default()),
                 ),
             },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(
+                    &light_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(
+                    &support_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(
+                    &hierarchy_fine_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(
+                    &hierarchy_coarse_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(
+                    &preintegrated_tex.create_view(&Default::default()),
+                ),
+            },
         ],
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1286,6 +1913,87 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
         multiview_mask: None,
         cache: None,
     });
+
+    let light_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("vol3d-light-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                },
+                count: None,
+            },
+        ],
+    });
+    let light_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("vol3d-light-bg"),
+        layout: &light_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(
+                    &volume_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(
+                    &light_tex.create_view(&Default::default()),
+                ),
+            },
+        ],
+    });
+    let light_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("vol3d-light-pl"),
+        bind_group_layouts: &[Some(&light_layout)],
+        immediate_size: 0,
+    });
+    let light_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("vol3d-light-pipeline"),
+        layout: Some(&light_pipeline_layout),
+        module: &light_shader,
+        entry_point: Some("cs_main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
     render_state
         .renderer
         .write()
@@ -1298,6 +2006,17 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
             lut_tex,
             floor_tex,
             color_tex,
+            light_pipeline,
+            light_bind_group,
+            light_uniforms,
+            volume_generation: 0,
+            last_lighting_revision: None,
+            support_tex,
+            hierarchy_fine_tex,
+            hierarchy_coarse_tex,
+            preintegrated_tex,
+            lut_cpu: Mutex::new(vec![0; 256 * 4]),
+            preintegration_signature: Mutex::new(u64::MAX),
         });
 }
 
@@ -1323,6 +2042,7 @@ pub struct Vol3dCallback {
     pub quality: Vol3dQuality,
     pub density: f32,
     pub shading: f32,
+    pub lighting: Vol3dLightingSettings,
     pub clip_low: f32,
     pub clip_high: f32,
     pub floor_threshold01: f32,
@@ -1336,6 +2056,41 @@ pub struct Vol3dCallback {
     pub ref_gate: f32,
     /// Couplet emphasis 0..1 for velocity mode.
     pub couplet_emphasis: f32,
+    // Second-generation analysis parameters. These mirror the matching fields
+    // on `Vol3d`, except where the shader needs a different domain than the UI
+    // (see `iso_value`/`iso_width`/`preintegration` below). The two enums are
+    // carried as enums, not floats, so `shader_value()` stays the single place
+    // that defines the uniform encoding; a float here would let a UI change
+    // silently disagree with the WGSL branch numbering.
+    pub render_mode: Vol3dRenderMode,
+    pub support_mode: SupportMode,
+    /// Support value below which the honest-fade path becomes transparent.
+    pub support_floor: f32,
+    pub support_fade: f32,
+    /// Isosurface level, NORMALIZED to the active palette range. The UI holds
+    /// the physical value (dBZ, m/s, dB, ...) because that is what a forecaster
+    /// reasons about; the shader compares against the normalized R8 texel.
+    pub iso_value: f32,
+    /// Shell half-width in the same normalized units as `iso_value`.
+    pub iso_width: f32,
+    /// Stable sub-voxel ray offset. It reduces banding without temporal shimmer.
+    pub jitter_strength: f32,
+    /// Segment-preintegrated transfer flag, encoded 0/1 for the float uniform
+    /// block. The shader, not this struct, applies contract 7 (preintegration
+    /// is force-disabled for the velocity two-box path).
+    pub preintegration: f32,
+    /// Horizontal crop box in normalized volume coordinates.
+    pub crop_x_min: f32,
+    pub crop_x_max: f32,
+    pub crop_y_min: f32,
+    pub crop_y_max: f32,
+    /// Orthogonal slice positions in normalized volume coordinates.
+    pub slice_x: f32,
+    pub slice_y: f32,
+    pub slice_z: f32,
+    /// 0 = fixed reference sampling inside occupied bricks; 1 = full adaptive.
+    /// The 0 end is the A/B reference path required by contract 8.
+    pub adaptive_strength: f32,
     pub pending: Arc<Mutex<PendingUploads>>,
 }
 
@@ -1345,10 +2100,10 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen: &egui_wgpu::ScreenDescriptor,
-        _encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let Some(resources) = resources.get::<Vol3dResources>() else {
+        let Some(resources) = resources.get_mut::<Vol3dResources>() else {
             return Vec::new();
         };
         let uniforms: [f32; UNIFORM_FLOATS] = [
@@ -1380,6 +2135,26 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
             self.velocity_mode,
             self.ref_gate,
             self.couplet_emphasis,
+            self.lighting.rim_strength,
+            if self.lighting.enabled { 1.0 } else { 0.0 },
+            LIGHTING_ENCODE_MAX,
+            0.0,
+            self.render_mode.shader_value(),
+            self.support_mode.shader_value(),
+            self.support_floor,
+            self.support_fade,
+            self.iso_value,
+            self.iso_width,
+            self.jitter_strength,
+            self.preintegration,
+            self.crop_x_min,
+            self.crop_x_max,
+            self.crop_y_min,
+            self.crop_y_max,
+            self.slice_x,
+            self.slice_y,
+            self.slice_z,
+            self.adaptive_strength,
         ];
         let mut bytes = [0u8; UNIFORM_FLOATS * std::mem::size_of::<f32>()];
         for (index, value) in uniforms.iter().enumerate() {
@@ -1387,8 +2162,68 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
         }
         queue.write_buffer(&resources.uniforms, 0, &bytes);
 
+        let mut uploaded_volume = false;
         if let Ok(mut pending) = self.pending.lock() {
             if let Some(volume) = pending.volume.take() {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &resources.support_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &volume.support_data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(volume.n as u32),
+                        rows_per_image: Some(volume.n as u32),
+                    },
+                    wgpu::Extent3d {
+                        width: volume.n as u32,
+                        height: volume.n as u32,
+                        depth_or_array_layers: volume.nz as u32,
+                    },
+                );
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &resources.hierarchy_fine_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &volume.hierarchy_fine,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some((advanced::FINE_X * 4) as u32),
+                        rows_per_image: Some(advanced::FINE_Y as u32),
+                    },
+                    wgpu::Extent3d {
+                        width: advanced::FINE_X as u32,
+                        height: advanced::FINE_Y as u32,
+                        depth_or_array_layers: advanced::FINE_Z as u32,
+                    },
+                );
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &resources.hierarchy_coarse_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &volume.hierarchy_coarse,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some((advanced::COARSE_X * 4) as u32),
+                        rows_per_image: Some(advanced::COARSE_Y as u32),
+                    },
+                    wgpu::Extent3d {
+                        width: advanced::COARSE_X as u32,
+                        height: advanced::COARSE_Y as u32,
+                        depth_or_array_layers: advanced::COARSE_Z as u32,
+                    },
+                );
+
+                uploaded_volume = true;
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &resources.volume_tex,
@@ -1452,6 +2287,12 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
                 }
             }
             if let Some(lut) = pending.lut.take() {
+                if let Ok(mut cached) = resources.lut_cpu.lock() {
+                    *cached = lut.clone();
+                }
+                if let Ok(mut signature) = resources.preintegration_signature.lock() {
+                    *signature = u64::MAX;
+                }
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &resources.lut_tex,
@@ -1471,6 +2312,145 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
                         depth_or_array_layers: 1,
                     },
                 );
+            }
+        }
+
+        let cached_lut = resources
+            .lut_cpu
+            .lock()
+            .map(|lut| lut.clone())
+            .unwrap_or_else(|_| vec![0; 256 * 4]);
+        let signature = advanced::preintegration_signature(
+            &cached_lut,
+            self.threshold01,
+            self.threshold_high01,
+            self.threshold_mode.shader_value(),
+            self.opacity,
+        );
+        // Exact CPU mirror of the shader's `use_preintegration` gate: the table
+        // is sampled only by the direct-volume path, only with preintegration
+        // on, and never in velocity two-box (contract 7). Building it costs
+        // 256 x 256 x 16 substeps with a `powf` each, on the render thread, and
+        // `opacity` is part of the signature - so without this gate, dragging
+        // the opacity slider rebuilt a million-substep table every frame even
+        // in the modes that never read it. Skipping deliberately leaves the
+        // stored signature stale, which is exactly what makes the table rebuild
+        // on the first frame after the user turns preintegration back on.
+        let preintegration_table_is_read = self.preintegration > 0.5
+            && self.velocity_mode < 0.5
+            && self.render_mode.shader_value() < 1.5;
+        let rebuild_preintegration = preintegration_table_is_read
+            && resources
+                .preintegration_signature
+                .lock()
+                .map(|stored| *stored != signature)
+                .unwrap_or(true);
+        if rebuild_preintegration {
+            let table = advanced::build_preintegrated_lut(
+                &cached_lut,
+                self.threshold01,
+                self.threshold_high01,
+                self.threshold_mode.shader_value(),
+                self.opacity,
+            );
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &resources.preintegrated_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &table,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256 * 4),
+                    rows_per_image: Some(256),
+                },
+                wgpu::Extent3d {
+                    width: 256,
+                    height: 256,
+                    depth_or_array_layers: 1,
+                },
+            );
+            if let Ok(mut stored) = resources.preintegration_signature.lock() {
+                *stored = signature;
+            }
+        }
+
+        if uploaded_volume {
+            resources.volume_generation = resources.volume_generation.wrapping_add(1);
+        }
+
+        if self.lighting.enabled && self.shading > 0.001 {
+            let settings_revision = self.lighting.cache_revision(
+                self.threshold01,
+                self.threshold_high01,
+                self.threshold_mode.shader_value(),
+                self.velocity_mode,
+                self.ref_gate,
+                self.zspan,
+            );
+            let desired_revision =
+                combine_cache_revision(settings_revision, resources.volume_generation);
+            if resources.last_lighting_revision != Some(desired_revision) {
+                let light = self.lighting.light_direction();
+                let coefficients = self.lighting.log_sh_coefficients();
+                let lighting_uniforms: [f32; LIGHTING_UNIFORM_FLOATS] = [
+                    light[0],
+                    light[1],
+                    light[2],
+                    0.0,
+                    self.lighting.ambient_strength,
+                    self.lighting.key_strength,
+                    self.lighting.shadow_strength,
+                    self.lighting.shadow_density,
+                    self.threshold01,
+                    self.threshold_high01,
+                    self.threshold_mode.shader_value(),
+                    self.ref_gate,
+                    self.zspan,
+                    self.lighting.shadow_steps.clamp(1, MAX_SHADOW_STEPS) as f32,
+                    self.velocity_mode,
+                    LIGHTING_ENCODE_MAX,
+                    coefficients[0],
+                    coefficients[1],
+                    coefficients[2],
+                    coefficients[3],
+                    coefficients[4],
+                    coefficients[5],
+                    coefficients[6],
+                    coefficients[7],
+                    coefficients[8],
+                    coefficients[9],
+                    coefficients[10],
+                    coefficients[11],
+                    coefficients[12],
+                    coefficients[13],
+                    coefficients[14],
+                    coefficients[15],
+                ];
+                let mut lighting_bytes =
+                    [0u8; LIGHTING_UNIFORM_FLOATS * std::mem::size_of::<f32>()];
+                for (index, value) in lighting_uniforms.iter().enumerate() {
+                    lighting_bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                queue.write_buffer(&resources.light_uniforms, 0, &lighting_bytes);
+
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("vol3d-light-volume"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_pipeline(&resources.light_pipeline);
+                    compute_pass.set_bind_group(0, &resources.light_bind_group, &[]);
+                    compute_pass.dispatch_workgroups(
+                        LIGHT_VOLUME_N.div_ceil(LIGHT_WORKGROUP_SIZE),
+                        LIGHT_VOLUME_N.div_ceil(LIGHT_WORKGROUP_SIZE),
+                        LIGHT_VOLUME_NZ.div_ceil(LIGHT_WORKGROUP_SIZE),
+                    );
+                }
+                resources.last_lighting_revision = Some(desired_revision);
             }
         }
         Vec::new()
@@ -1494,6 +2474,30 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `empty_box` hand-writes the zeros the general normalize + hierarchy path
+    /// produces for an all-no-data volume, because it runs on the UI thread on
+    /// every repaint while a live volume is still building. Pin the two against
+    /// each other so the shortcut cannot silently drift from the real path.
+    #[test]
+    fn empty_box_matches_general_path() {
+        let voxels = BOX_N * BOX_N * BOX_NZ;
+        let no_data = vec![f32::NAN; voxels];
+        let reference = normalize_box_with_range(&no_data, BOX_N, BOX_NZ, 0.0, 1.0);
+        let fast = empty_box();
+        assert_eq!(fast.n, reference.n);
+        assert_eq!(fast.nz, reference.nz);
+        assert_eq!(fast.data, reference.data);
+        assert_eq!(fast.support_data, reference.support_data);
+        assert_eq!(fast.hierarchy_fine, reference.hierarchy_fine);
+        assert_eq!(fast.hierarchy_coarse, reference.hierarchy_coarse);
+        assert_eq!(fast.floor_data, reference.floor_data);
+        assert!(fast.color_data.is_none() && reference.color_data.is_none());
+        assert!(
+            (fast.acceleration_empty_fraction - reference.acceleration_empty_fraction).abs()
+                < 1.0e-6
+        );
+    }
 
     #[test]
     fn cpu_projection_is_aspect_stable() {
@@ -1620,17 +2624,19 @@ mod tests {
     }
 
     #[test]
-    fn shader_wgsl_parses_and_validates() {
-        // The build nodes are headless: wgpu never builds the pipeline, so the
-        // raymarch WGSL would otherwise only be checked in the owner's RC.
-        let module = naga::front::wgsl::parse_str(SHADER)
-            .unwrap_or_else(|e| panic!("vol3d WGSL failed to parse: {e:?}"));
-        let mut validator = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        );
-        validator
-            .validate(&module)
-            .unwrap_or_else(|e| panic!("vol3d WGSL failed to validate: {e:?}"));
+    fn shaders_parse_and_validate() {
+        // The build nodes are headless: wgpu never builds these pipelines, so
+        // Naga validates both embedded shaders without requiring an adapter.
+        for (label, source) in [("raymarch", SHADER), ("light-volume", LIGHT_VOLUME_SHADER)] {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|error| panic!("vol3d {label} WGSL failed to parse: {error:?}"));
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            );
+            validator
+                .validate(&module)
+                .unwrap_or_else(|error| panic!("vol3d {label} WGSL failed to validate: {error:?}"));
+        }
     }
 }

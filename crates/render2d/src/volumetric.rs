@@ -340,6 +340,53 @@ fn interp_profile_xs(prof: &[ProfileSample], z: f64, s: f64, policy: InterpPolic
     Some(last.v)
 }
 
+/// Interpolate the value and return a display-support score. This is not a
+/// formal uncertainty estimate and is never exposed as an official radar QC
+/// field. It records how directly the Cartesian voxel is constrained by the
+/// observed beam stack: near-beam samples score highest, broad vertical
+/// interpolation scores lower, and top/bottom extrapolation scores lowest.
+fn interp_profile_xs_with_support(
+    prof: &[ProfileSample],
+    z: f64,
+    s: f64,
+    policy: InterpPolicy,
+) -> Option<(f32, u8)> {
+    let value = interp_profile_xs(prof, z, s, policy)?;
+    let first = *prof.first()?;
+    let last = prof[prof.len() - 1];
+    let score = if z <= first.h {
+        let extend = (first.r_m * HALF_BW_RAD).max(300.0);
+        let distance = (first.h - z).max(0.0);
+        0.18 + 0.56 * (1.0 - distance / extend.max(1.0)).clamp(0.0, 1.0)
+    } else if z >= last.h {
+        let extend = (last.r_m * HALF_BW_RAD).max(1.0);
+        let distance = (z - last.h).max(0.0);
+        0.12 + 0.48 * (1.0 - distance / extend).clamp(0.0, 1.0)
+    } else {
+        let mut score = 0.45;
+        let (_, theta_i) = invert_beam(s, z);
+        for pair in prof.windows(2) {
+            let lo = pair[0];
+            let hi = pair[1];
+            if z < lo.h || z > hi.h {
+                continue;
+            }
+            let nearest_dz = (z - lo.h).abs().min((hi.h - z).abs());
+            let beam_radius = (0.5 * (lo.r_m + hi.r_m) * HALF_BW_RAD).max(150.0);
+            let directness = (-0.5 * (nearest_dz / beam_radius).powi(2)).exp();
+            let angular_gap = (hi.theta_deg - lo.theta_deg).abs();
+            let gap_score = 1.0 / (1.0 + (angular_gap / 1.5).powi(2));
+            let span = (hi.theta_deg - lo.theta_deg).abs().max(1.0e-6);
+            let weight = ((theta_i - lo.theta_deg) / span).clamp(0.0, 1.0);
+            let endpoint = 1.0 - 2.0 * weight.min(1.0 - weight);
+            score = 0.30 + 0.38 * directness + 0.20 * gap_score + 0.12 * endpoint;
+            break;
+        }
+        score
+    };
+    Some((value, (score.clamp(0.0, 1.0) * 255.0).round() as u8))
+}
+
 const MISSING_GATE: u32 = u32::MAX;
 
 /// Lookup tables shared by the full-volume products.
@@ -923,11 +970,23 @@ pub fn reflectivity_cross_section_with_smoothing(
     )
 }
 
+/// A Cartesian volume plus a BowEcho display-support field. `support` is
+/// row-major [z][y][x], 0 for no data and 1..255 for increasingly direct beam
+/// constraint. It is intentionally named support rather than confidence: it
+/// does not include calibration error, attenuation, blockage, biological
+/// contamination, dealias confidence, or network quality.
+#[derive(Clone, Debug)]
+pub struct VolumeBoxResample {
+    pub values: Vec<f32>,
+    pub support: Vec<u8>,
+}
+
 /// Cartesian box resample of the reflectivity volume for 3D direct
 /// volume rendering: `n` cells per horizontal side over `±half_km` about
 /// (center_east_km, center_north_km), `nz` levels 0..top_m. Returns
 /// row-major \[z]\[y]\[x] values (NaN = no data), same MRMS-style
-/// per-column reconstruction as the cross-sections.
+/// per-column reconstruction as the cross-sections. Compatibility wrapper
+/// retaining the historical values-only API.
 pub fn volume_box_resample(
     volume: &RadarVolume,
     center_east_km: f32,
@@ -950,7 +1009,7 @@ pub fn volume_box_resample(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // box geometry is explicit by design
+#[allow(clippy::too_many_arguments)]
 pub fn volume_box_resample_moment(
     volume: &RadarVolume,
     moment: &MomentType,
@@ -962,6 +1021,32 @@ pub fn volume_box_resample_moment(
     nz: usize,
     top_m: f32,
 ) -> Option<Vec<f32>> {
+    volume_box_resample_moment_with_support(
+        volume,
+        moment,
+        policy,
+        center_east_km,
+        center_north_km,
+        half_km,
+        n,
+        nz,
+        top_m,
+    )
+    .map(|resample| resample.values)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn volume_box_resample_moment_with_support(
+    volume: &RadarVolume,
+    moment: &MomentType,
+    policy: InterpPolicy,
+    center_east_km: f32,
+    center_north_km: f32,
+    half_km: f32,
+    n: usize,
+    nz: usize,
+    top_m: f32,
+) -> Option<VolumeBoxResample> {
     if n < 8 || nz < 4 || half_km <= 1.0 {
         return None;
     }
@@ -969,11 +1054,11 @@ pub fn volume_box_resample_moment(
     if cols.is_empty() {
         return None;
     }
-    let mut out = vec![f32::NAN; n * n * nz];
-    let slabs: Vec<Vec<f32>> = (0..n)
+    let slabs: Vec<(Vec<f32>, Vec<u8>)> = (0..n)
         .into_par_iter()
         .map(|yi| {
-            let mut slab = vec![f32::NAN; n * nz];
+            let mut values = vec![f32::NAN; n * nz];
+            let mut support = vec![0u8; n * nz];
             let north = center_north_km - half_km + 2.0 * half_km * yi as f32 / (n - 1) as f32;
             for xi in 0..n {
                 let east = center_east_km - half_km + 2.0 * half_km * xi as f32 / (n - 1) as f32;
@@ -985,22 +1070,30 @@ pub fn volume_box_resample_moment(
                 }
                 for zi in 0..nz {
                     let z = f64::from(top_m) * zi as f64 / (nz - 1) as f64;
-                    if let Some(v) = interp_profile_xs(&prof, z, s, policy) {
-                        slab[zi * n + xi] = v;
+                    if let Some((value, score)) =
+                        interp_profile_xs_with_support(&prof, z, s, policy)
+                    {
+                        values[zi * n + xi] = value;
+                        support[zi * n + xi] = score.max(1);
                     }
                 }
             }
-            slab
+            (values, support)
         })
         .collect();
-    for (yi, slab) in slabs.iter().enumerate() {
+    let mut values = vec![f32::NAN; n * n * nz];
+    let mut support = vec![0u8; n * n * nz];
+    for (yi, (slab_values, slab_support)) in slabs.iter().enumerate() {
         for zi in 0..nz {
             for xi in 0..n {
-                out[zi * n * n + yi * n + xi] = slab[zi * n + xi];
+                let dst = zi * n * n + yi * n + xi;
+                let src = zi * n + xi;
+                values[dst] = slab_values[src];
+                support[dst] = slab_support[src];
             }
         }
     }
-    Some(out)
+    Some(VolumeBoxResample { values, support })
 }
 
 /// Generic single-moment cross-section (CC, ZDR, …): same MRMS-style

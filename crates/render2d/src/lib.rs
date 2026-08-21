@@ -66,12 +66,13 @@ use thiserror::Error;
 pub use tracking::{StormTrack, StormTracker, TIME_GATE_S};
 pub use volumetric::{
     CrossSection, CrossSectionSmoothing, ECHO_TOP_THRESHOLD_DBZ, HailGrids, InterpPolicy,
-    MeshCalibration, VolumeDealiasCache, composite_reflectivity_grid, echo_top_grid, hail_grids,
-    mehs_grid, moment_cross_section, moment_cross_section_with_smoothing, poh_grid,
-    reflectivity_cross_section, reflectivity_cross_section_with_smoothing, velocity_cross_section,
+    MeshCalibration, VolumeBoxResample, VolumeDealiasCache, composite_reflectivity_grid,
+    echo_top_grid, hail_grids, mehs_grid, moment_cross_section,
+    moment_cross_section_with_smoothing, poh_grid, reflectivity_cross_section,
+    reflectivity_cross_section_with_smoothing, velocity_cross_section,
     velocity_cross_section_cached, velocity_cross_section_cached_with_smoothing,
     velocity_cross_section_from_dealiased_with_smoothing, vil_density_grid, vil_grid,
-    volume_box_resample, volume_box_resample_moment,
+    volume_box_resample, volume_box_resample_moment, volume_box_resample_moment_with_support,
 };
 pub use vwp::{
     VwpCandidateDiagnostics, VwpConfig, VwpError, VwpLevel, VwpLevelOutcome, VwpProfile,
