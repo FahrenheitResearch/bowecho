@@ -327,6 +327,8 @@ jobs:
           else
             version="$(awk -F '"' '/^version =/ { print $2; exit }' Cargo.toml)"
           fi
+          IFS=$'\t' read -r short_version bundle_version full_version \
+            < <(python3 tools/macos_plist_versions.py "$version")
           cat > "$app/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -338,6 +340,8 @@ jobs:
             <string>BowEcho</string>
             <key>CFBundleExecutable</key>
             <string>bowecho</string>
+            <key>CFBundleGetInfoString</key>
+            <string>BowEcho ${full_version}</string>
             <key>CFBundleIdentifier</key>
             <string>research.fahrenheit.bowecho</string>
             <key>CFBundleInfoDictionaryVersion</key>
@@ -347,9 +351,11 @@ jobs:
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
-            <string>${version}</string>
+            <string>${short_version}</string>
             <key>CFBundleVersion</key>
-            <string>${version}</string>
+            <string>${bundle_version}</string>
+            <key>BowEchoFullVersion</key>
+            <string>${full_version}</string>
             <key>LSMinimumSystemVersion</key>
             <string>12.0</string>
             <key>NSHighResolutionCapable</key>

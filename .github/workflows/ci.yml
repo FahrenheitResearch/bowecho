@@ -46,6 +46,9 @@ jobs:
         shell: bash
         run: bash tools/release_tag_prerelease_test.sh
 
+      - name: macOS plist version tests
+        run: python3 tools/macos_plist_versions_test.py
+
       - name: Test
         run: cargo test --workspace --all-targets
 

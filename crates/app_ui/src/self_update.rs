@@ -23,6 +23,10 @@ use ui_core::worker_slot::{SlotMessage, StreamState};
 use crate::{SECURITY_SIGNATURE_STATUS_TEXT, SECURITY_UNSIGNED_BUILD_TEXT};
 use crate::{ViewerApp, brand};
 
+#[path = "release_version.rs"]
+mod release_version;
+use release_version::newer_release_tag;
+
 /// Fetch the latest configured GitHub release tag and return it iff it is
 /// newer than the running build. Invalid/non-GitHub repository URLs disable
 /// the check before this helper is called; network/parse errors stay silent.
@@ -31,14 +35,6 @@ fn fetch_newer_release_tag(api_url: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(&body).ok()?;
     let tag = value.get("tag_name")?.as_str()?;
     newer_release_tag(tag, env!("CARGO_PKG_VERSION"))
-}
-
-/// Some(trimmed tag) iff the release tag is strictly newer than the
-/// current version; None on equal, older, or unparseable input.
-fn newer_release_tag(tag_name: &str, current_version: &str) -> Option<String> {
-    let remote = parse_semver_triple(tag_name)?;
-    let current = parse_semver_triple(current_version)?;
-    (remote > current).then(|| tag_name.trim().to_owned())
 }
 
 pub(crate) fn security_update_status_label(
@@ -52,32 +48,6 @@ pub(crate) fn security_update_status_label(
     } else {
         "No newer release detected this launch".to_owned()
     }
-}
-
-/// Parse "v1.2.3" / "1.2.3" into (major, minor, patch). Tolerates the
-/// release-tag leading 'v'/'V', missing components ("v0.9" → (0, 9, 0)),
-/// and a pre-release/build suffix ("v0.9.0-rc1" parses as (0, 9, 0) —
-/// numeric triple only, good enough for "is there a newer release").
-/// Anything non-numeric is None: the update check then stays silent.
-fn parse_semver_triple(version: &str) -> Option<(u64, u64, u64)> {
-    let trimmed = version.trim().trim_start_matches(['v', 'V']);
-    let core = trimmed.split(['-', '+']).next()?;
-    if core.is_empty() {
-        return None;
-    }
-    let mut parts = core.split('.');
-    let mut triple = [0_u64; 3];
-    for slot in &mut triple {
-        match parts.next() {
-            Some(part) => *slot = part.parse().ok()?,
-            None => break,
-        }
-    }
-    if parts.next().is_some() {
-        // Four or more dotted components — not a semver triple.
-        return None;
-    }
-    Some((triple[0], triple[1], triple[2]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,37 +1534,6 @@ impl ViewerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_semver_triple_handles_release_tags() {
-        assert_eq!(parse_semver_triple("v0.8.2"), Some((0, 8, 2)));
-        assert_eq!(parse_semver_triple("V1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_semver_triple("0.8.2"), Some((0, 8, 2)));
-        assert_eq!(parse_semver_triple(" v0.9 "), Some((0, 9, 0)));
-        assert_eq!(parse_semver_triple("v2"), Some((2, 0, 0)));
-        assert_eq!(parse_semver_triple("v0.9.0-rc1"), Some((0, 9, 0)));
-        assert_eq!(parse_semver_triple("v0.9.0+build5"), Some((0, 9, 0)));
-        assert_eq!(parse_semver_triple(""), None);
-        assert_eq!(parse_semver_triple("v"), None);
-        assert_eq!(parse_semver_triple("latest"), None);
-        assert_eq!(parse_semver_triple("v0.8.2.1"), None);
-        assert_eq!(parse_semver_triple("v0..2"), None);
-    }
-
-    #[test]
-    fn newer_release_tag_compares_numerically() {
-        let some = |tag: &str| Some(tag.to_owned());
-        assert_eq!(newer_release_tag("v0.9.0", "0.8.2"), some("v0.9.0"));
-        // Numeric compare, not lexicographic: "10" > "2".
-        assert_eq!(newer_release_tag("v0.8.10", "0.8.2"), some("v0.8.10"));
-        assert_eq!(newer_release_tag("v1.0.0", "0.9.9"), some("v1.0.0"));
-        // Same version, older remote, prerelease of the current version,
-        // and junk tags all stay silent.
-        assert_eq!(newer_release_tag("v0.8.2", "0.8.2"), None);
-        assert_eq!(newer_release_tag("v0.8.1", "0.8.2"), None);
-        assert_eq!(newer_release_tag("v0.8.2-rc1", "0.8.2"), None);
-        assert_eq!(newer_release_tag("latest", "0.8.2"), None);
-    }
 
     #[test]
     fn self_update_asset_requires_a_baked_platform_variant() {

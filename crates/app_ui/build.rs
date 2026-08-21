@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod build_metadata;
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key)
         .ok()
@@ -103,6 +105,20 @@ fn main() {
         );
 
         let mut resource = winresource::WindowsResource::new();
+        // `WindowsResource::new` keeps Cargo's full SemVer string in the
+        // FileVersion/ProductVersion string table but intentionally ignores
+        // the prerelease component in the numeric version. Mark that numeric
+        // identity honestly so Windows can distinguish an RC from a final.
+        let package_version = env_or("CARGO_PKG_VERSION", "0.0.0");
+        let package_prerelease = env_or("CARGO_PKG_VERSION_PRE", "");
+        resource.set("FileVersion", &package_version);
+        resource.set("ProductVersion", &package_version);
+        if build_metadata::cargo_version_is_prerelease(&package_prerelease) {
+            resource.set_version_info(
+                winresource::VersionInfo::FILEFLAGS,
+                winresource::VersionInfo::VS_FF_PRERELEASE,
+            );
+        }
         if icon.exists() {
             resource.set_icon(&icon.to_string_lossy());
         }

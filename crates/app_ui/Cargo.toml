@@ -30,6 +30,7 @@ simradar_cuda = { path = "../simradar_cuda" }
 styles = { path = "../styles" }
 ui_core = { path = "../ui_core" }
 weather-contours.workspace = true
+semver = "1"
 serde.workspace = true
 serde_json.workspace = true
 shapefile = "0.7"

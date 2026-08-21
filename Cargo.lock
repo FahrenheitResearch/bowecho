@@ -323,6 +323,7 @@ dependencies = [
  "rw-sat 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=cf0ca3693650153ff0f79a0e60c3ec2da7d0af01)",
  "rw-store 0.1.0 (git+https://github.com/FahrenheitResearch/rusty-weather?rev=cf0ca3693650153ff0f79a0e60c3ec2da7d0af01)",
  "rw-ui",
+ "semver",
  "serde",
  "serde_json",
  "settings",
