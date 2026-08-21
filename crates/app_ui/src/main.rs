@@ -3856,7 +3856,8 @@ struct ViewerApp {
     /// GR2-style two-click Vrot tool: armed -> click max inbound, then max
     /// outbound; the card shows Vrot, couplet diameter, and beam height.
     vrot_tool_armed: bool,
-    vrot_points: Vec<(f32, f32, f32, f32)>, // (lon, lat, value_mps, height_m)
+    vrot_points: Vec<VrotToolPoint>,
+    vrot_provenance: Option<VrotProvenance>,
     cross_section_a_lonlat: Option<(f32, f32)>,
     cross_section_b_lonlat: Option<(f32, f32)>,
     cross_section_texture: Option<egui::TextureHandle>,
@@ -8799,6 +8800,9 @@ struct CursorReadout {
     value: f32,
     base_value: Option<f32>,
     vrot: Option<VrotProbe>,
+    /// Exact source that produced velocity/Vrot values. `None` for fields
+    /// that cannot feed the manual Vrot tool.
+    vrot_provenance: Option<VrotProvenance>,
     raw: Option<u16>,
     row: usize,
     gate: usize,
@@ -8815,13 +8819,14 @@ struct CursorReadout {
     realtime_last_chunk_type: Option<RealtimeChunkType>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct VrotProbe {
     delta_v_mps: f32,
     vrot_mps: f32,
     separation_km: f32,
     inbound: VrotGate,
     outbound: VrotGate,
+    provenance: VrotProvenance,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -8830,6 +8835,173 @@ struct VrotGate {
     gate: usize,
     value_mps: f32,
     azimuth_deg: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VrotToolPoint {
+    lon: f32,
+    lat: f32,
+    value_mps: f32,
+    height_m: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VrotVelocityMode {
+    storm_relative: bool,
+    requested_dealiased: bool,
+    effective_dealiased: bool,
+    dealias_engine: Option<DealiasEngine>,
+    storm_motion_direction_millideg: Option<i32>,
+    storm_motion_speed_millimps: Option<i32>,
+}
+
+impl VrotVelocityMode {
+    fn for_product(
+        product: &DisplayProduct,
+        effective_dealiased: bool,
+        dealias_engine: DealiasEngine,
+        storm_motion: StormMotion,
+    ) -> Self {
+        let requested_dealiased = product.uses_dealiased_velocity();
+        Self {
+            storm_relative: product.is_storm_relative_velocity(),
+            requested_dealiased,
+            effective_dealiased: requested_dealiased && effective_dealiased,
+            dealias_engine: (requested_dealiased && effective_dealiased).then_some(dealias_engine),
+            storm_motion_direction_millideg: product
+                .is_storm_relative_velocity()
+                .then(|| (storm_motion.direction_deg.rem_euclid(360.0) * 1_000.0).round() as i32),
+            storm_motion_speed_millimps: product
+                .is_storm_relative_velocity()
+                .then(|| (storm_motion.speed_mps * 1_000.0).round() as i32),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match (
+            self.storm_relative,
+            self.requested_dealiased,
+            self.effective_dealiased,
+        ) {
+            (false, false, _) => "raw velocity",
+            (true, false, _) => "storm-relative raw",
+            (false, true, true) => "dealiased velocity",
+            (true, true, true) => "storm-relative dealiased",
+            (false, true, false) => "raw fallback (dealias unavailable)",
+            (true, true, false) => "storm-relative raw fallback",
+        }
+    }
+
+    fn storm_motion_label(self) -> Option<String> {
+        Some(format!(
+            "motion {:.1}\u{b0}/{:.1} m/s",
+            self.storm_motion_direction_millideg? as f32 / 1_000.0,
+            self.storm_motion_speed_millimps? as f32 / 1_000.0,
+        ))
+    }
+}
+
+/// Identity of the exact displayed velocity field behind a Vrot result.
+/// `frame` is the stable history identity; `volume_revision` additionally
+/// distinguishes live partial replacements that legitimately share it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VrotProvenance {
+    frame: FrameIdentity,
+    volume_revision: usize,
+    product: DisplayProduct,
+    cut: usize,
+    elevation_millideg: i32,
+    velocity_mode: VrotVelocityMode,
+}
+
+impl VrotProvenance {
+    fn new(
+        volume: &Arc<RadarVolume>,
+        product: &DisplayProduct,
+        cut: usize,
+        elevation_deg: f32,
+        velocity_mode: VrotVelocityMode,
+    ) -> Self {
+        Self {
+            frame: frame_identity_for_volume(volume),
+            volume_revision: Arc::as_ptr(volume) as usize,
+            product: product.clone(),
+            cut,
+            elevation_millideg: (elevation_deg * 1_000.0).round() as i32,
+            velocity_mode,
+        }
+    }
+
+    fn source_label(&self) -> String {
+        let mut label = format!(
+            "{} {} {} cut {} ({:.1}\u{b0}) \u{b7} {}",
+            self.frame.site_id,
+            self.frame.scan_time_utc.format("%H:%M:%SZ"),
+            self.product.label(),
+            self.cut,
+            self.elevation_millideg as f32 / 1_000.0,
+            self.velocity_mode.label(),
+        );
+        if let Some(motion) = self.velocity_mode.storm_motion_label() {
+            label.push_str(" \u{b7} ");
+            label.push_str(&motion);
+        }
+        label
+    }
+
+    fn matches_display(
+        &self,
+        volume: &Arc<RadarVolume>,
+        product: &DisplayProduct,
+        cut: usize,
+    ) -> bool {
+        let Some(elevation) = volume.cuts.get(cut).map(|cut| cut.elevation_deg) else {
+            return false;
+        };
+        self.frame == frame_identity_for_volume(volume)
+            && self.volume_revision == Arc::as_ptr(volume) as usize
+            && &self.product == product
+            && self.cut == cut
+            && self.elevation_millideg == (elevation * 1_000.0).round() as i32
+    }
+
+    fn change_reason(&self, current: &Self) -> &'static str {
+        if self.frame.site_id != current.frame.site_id {
+            "radar site changed"
+        } else if self.frame.scan_time_utc != current.frame.scan_time_utc
+            || self.volume_revision != current.volume_revision
+        {
+            "displayed frame changed"
+        } else if self.product != current.product || self.velocity_mode != current.velocity_mode {
+            "velocity product/source changed"
+        } else if self.cut != current.cut || self.elevation_millideg != current.elevation_millideg {
+            "tilt changed"
+        } else {
+            "source changed"
+        }
+    }
+}
+
+fn reconcile_vrot_measurement_source(
+    points: &mut Vec<VrotToolPoint>,
+    stored: &mut Option<VrotProvenance>,
+    current: Option<&VrotProvenance>,
+) -> Option<&'static str> {
+    if points.is_empty() {
+        *stored = None;
+        return None;
+    }
+    if stored.as_ref() == current {
+        return None;
+    }
+    let reason = match (stored.as_ref(), current) {
+        (Some(previous), Some(current)) => previous.change_reason(current),
+        (_, None) => "velocity source is unavailable",
+        (None, Some(_)) => "measurement provenance was missing",
+    };
+    points.clear();
+    *stored = None;
+    Some(reason)
 }
 
 struct DerivedReadoutCache {
@@ -9366,7 +9538,8 @@ struct WorkflowSnapshot {
     show_storm_tracks: bool,
     show_inspector_card: bool,
     vrot_tool_armed: bool,
-    vrot_points: Vec<(f32, f32, f32, f32)>,
+    vrot_points: Vec<VrotToolPoint>,
+    vrot_provenance: Option<VrotProvenance>,
     cross_section_armed: bool,
     cross_section_view_open: bool,
     cross_section_a_lonlat: Option<(f32, f32)>,
@@ -10170,6 +10343,7 @@ impl ViewerApp {
             archive_list_receiver: None,
             vrot_tool_armed: false,
             vrot_points: Vec::new(),
+            vrot_provenance: None,
             cross_section_a_lonlat: None,
             cross_section_b_lonlat: None,
             cross_section_texture: None,
@@ -21731,6 +21905,7 @@ impl eframe::App for ViewerApp {
         self.maybe_advance_extra_pane_history_loops(&ctx);
         self.maybe_apply_continuous_camera_follow(&ctx);
         self.sanitize_selection();
+        self.reconcile_vrot_source();
         self.poll_rotation_markers(&ctx);
         self.poll_tor_tracks(&ctx);
         self.poll_storm_tracks(&ctx);
@@ -22690,7 +22865,7 @@ impl ViewerApp {
                 self.set_storm_tracks_visible(true);
                 self.show_inspector_card = true;
                 self.vrot_tool_armed = false;
-                self.vrot_points.clear();
+                self.clear_vrot_measurement();
                 self.primary.live.enabled = true;
             }
             WorkflowPreset::VelocityRotation => {
@@ -22704,7 +22879,7 @@ impl ViewerApp {
                 self.set_storm_tracks_visible(true);
                 self.show_inspector_card = true;
                 self.vrot_tool_armed = true;
-                self.vrot_points.clear();
+                self.clear_vrot_measurement();
             }
             WorkflowPreset::ModelWrf => {
                 // Model + WRF desk: two-pane model plot with the skew-T docked
@@ -22726,7 +22901,7 @@ impl ViewerApp {
                 self.glm_enabled = true;
                 self.show_inspector_card = true;
                 self.vrot_tool_armed = true;
-                self.vrot_points.clear();
+                self.clear_vrot_measurement();
             }
             WorkflowPreset::SatelliteTropical => {
                 // Satellite + tropical: satellite window with the map overlay
@@ -22808,6 +22983,7 @@ impl ViewerApp {
             show_inspector_card: self.show_inspector_card,
             vrot_tool_armed: self.vrot_tool_armed,
             vrot_points: self.vrot_points.clone(),
+            vrot_provenance: self.vrot_provenance.clone(),
             cross_section_armed: self.cross_section_armed,
             cross_section_view_open: self.cross_section_view_open,
             cross_section_a_lonlat: self.cross_section_a_lonlat,
@@ -22892,6 +23068,7 @@ impl ViewerApp {
         self.show_inspector_card = snapshot.show_inspector_card;
         self.vrot_tool_armed = snapshot.vrot_tool_armed;
         self.vrot_points = snapshot.vrot_points;
+        self.vrot_provenance = snapshot.vrot_provenance;
         self.cross_section_armed = snapshot.cross_section_armed;
         self.cross_section_view_open = snapshot.cross_section_view_open;
         self.cross_section_a_lonlat = snapshot.cross_section_a_lonlat;
@@ -28544,12 +28721,15 @@ impl ViewerApp {
                     "GR2-style rotational velocity: arm, then click the max INBOUND gate and the max OUTBOUND gate of a couplet (velocity product). The card shows Vrot = (|Vin|+|Vout|)/2, couplet diameter, and beam height. Right-click clears.",
                 );
             if was_vrot != self.vrot_tool_armed {
-                self.vrot_points.clear();
+                self.clear_vrot_measurement();
             }
             if !self.vrot_points.is_empty() && fixed_action_button(ui, "Clear", 50.0).clicked() {
-                self.vrot_points.clear();
+                self.clear_vrot_measurement();
             }
         });
+        if let Some(provenance) = &self.vrot_provenance {
+            ui.weak(provenance.source_label());
+        }
         ui.horizontal(|ui| {
             let mut cross_section_armed = self.cross_section_armed;
             let arm_response = ui
@@ -31595,6 +31775,10 @@ impl ViewerApp {
     }
 
     fn map_canvas(&mut self, ui: &mut egui::Ui) {
+        // Sidebar/product input may change after the top-of-frame lifecycle
+        // pass. Reconcile again immediately before map paint so a stale Vrot
+        // result cannot survive for even one rendered frame.
+        self.reconcile_vrot_source();
         let available = ui.available_size();
         // In grid mode the per-cell ui.interact widgets are the ONLY
         // interactive surface — the outer allocation must not sense clicks or
@@ -32352,7 +32536,13 @@ impl ViewerApp {
         self.draw_glm(painter, rect);
         self.draw_surface_obs(painter, rect);
         self.draw_surface_obs_clock(painter, rect);
-        self.draw_vrot_tool(painter, rect);
+        self.draw_vrot_tool(
+            painter,
+            rect,
+            self.volume.as_ref(),
+            &self.selected_product,
+            self.selected_cut,
+        );
         self.draw_placefiles(painter, rect);
         self.draw_map_annotations(painter, rect);
         self.basemap_ms = Some(underlay_ms + overlay_start.elapsed().as_secs_f32() * 1000.0);
@@ -32591,7 +32781,7 @@ impl ViewerApp {
                 self.add_vrot_tool_point(rect, pointer, &product, cut);
             }
             if response.secondary_clicked() {
-                self.vrot_points.clear();
+                self.clear_vrot_measurement();
                 self.status = "Vrot points cleared".to_owned();
             }
         } else if response.clicked()
@@ -33082,7 +33272,7 @@ impl ViewerApp {
                     self.add_vrot_tool_point(cell, pointer, &product, cut);
                 }
                 if pane_was_active && response.secondary_clicked() {
-                    self.vrot_points.clear();
+                    self.clear_vrot_measurement();
                     self.status = "Vrot points cleared".to_owned();
                 }
             }
@@ -33093,9 +33283,19 @@ impl ViewerApp {
             }
         }
 
+        // A click can focus a different grid pane during the interaction
+        // pass above. Clear a measurement owned by the prior pane before the
+        // paint pass, rather than allowing it to linger until next repaint.
+        self.reconcile_vrot_source();
+
         // Paint pass: post-interaction transform; site markers recomputed
         // here so they land at the final positions too.
         for (cell_index, cell) in cells.iter().copied().enumerate() {
+            let pane_volume = if cell_index == 0 {
+                self.volume.clone()
+            } else {
+                self.extra_pane_display_volume(cell_index - 1)
+            };
             let pane_context = (cell_index > 0)
                 .then(|| self.begin_extra_pane_context(cell_index - 1))
                 .flatten();
@@ -33206,7 +33406,13 @@ impl ViewerApp {
             self.draw_vol3d_map_box_drag(&cell_painter, cell);
             self.draw_plot_domain_map_box(&cell_painter, cell, cell_index == 0);
             self.draw_center_crosshair(&cell_painter, cell);
-            self.draw_vrot_tool(&cell_painter, cell);
+            self.draw_vrot_tool(
+                &cell_painter,
+                cell,
+                pane_volume.as_ref(),
+                &pane_product,
+                pane_cut,
+            );
             self.pane_info_bar(ui, &cell_painter, cell, cell_index, &pane_product, pane_cut);
             self.draw_raw_velocity_tag_for_product(&cell_painter, cell, &pane_product, 34.0);
             // The inspector card follows the hovered pane (its readout now
@@ -45720,6 +45926,7 @@ fn velocity_vrot_probe(
     center_gate: usize,
     product: &DisplayProduct,
     storm_motion: StormMotion,
+    provenance: VrotProvenance,
 ) -> Option<VrotProbe> {
     if !product.is_signed_radial_velocity() {
         return None;
@@ -45768,6 +45975,7 @@ fn velocity_vrot_probe(
         separation_km,
         inbound: inbound.vrot_gate(),
         outbound: outbound.vrot_gate(),
+        provenance,
     })
 }
 
@@ -47481,16 +47689,17 @@ fn vrot_display_scale_unit(display_unit: (&str, f32), unit_system: units::Units)
 }
 
 fn format_vrot_card_line(
-    probe: VrotProbe,
+    probe: &VrotProbe,
     display_unit: (&'static str, f32),
     unit_system: units::Units,
 ) -> String {
     let (velocity_unit, velocity_scale) = vrot_display_scale_unit(display_unit, unit_system);
     format!(
-        "Vrot {:.1} {velocity_unit} - dV {:.1} {velocity_unit} - sep {:.2} km",
+        "Vrot {:.1} {velocity_unit} - dV {:.1} {velocity_unit} - sep {:.2} km - {}",
         probe.vrot_mps / velocity_scale,
         probe.delta_v_mps / velocity_scale,
-        probe.separation_km
+        probe.separation_km,
+        probe.provenance.source_label(),
     )
 }
 
@@ -53483,6 +53692,28 @@ mod tests {
         assert!(misses[0].contains("Gone Table"));
     }
 
+    fn test_vrot_provenance() -> VrotProvenance {
+        VrotProvenance {
+            frame: FrameIdentity {
+                site_id: "KTLX".to_owned(),
+                scan_time_utc: Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap(),
+            },
+            volume_revision: 17,
+            product: DisplayProduct::Moment(MomentType::Velocity),
+            cut: 1,
+            elevation_millideg: 500,
+            velocity_mode: VrotVelocityMode::for_product(
+                &DisplayProduct::Moment(MomentType::Velocity),
+                false,
+                DealiasEngine::Region,
+                StormMotion {
+                    direction_deg: 0.0,
+                    speed_mps: 0.0,
+                },
+            ),
+        }
+    }
+
     #[test]
     fn vrot_probe_uses_source_velocity_gates() {
         let gate_range = radar_core::GateRange {
@@ -53517,6 +53748,7 @@ mod tests {
                 direction_deg: 0.0,
                 speed_mps: 0.0,
             },
+            test_vrot_provenance(),
         )
         .expect("vrot probe");
 
@@ -53548,6 +53780,169 @@ mod tests {
         assert!(!manual_vrot_product_supported(&DisplayProduct::Derived(
             DerivedProduct::CompositeReflectivity
         )));
+    }
+
+    fn test_vrot_point() -> VrotToolPoint {
+        VrotToolPoint {
+            lon: -97.0,
+            lat: 35.0,
+            value_mps: -20.0,
+            height_m: 1_000.0,
+        }
+    }
+
+    #[test]
+    fn manual_vrot_measurement_invalidates_for_every_value_source_change() {
+        let base = test_vrot_provenance();
+        let mut cases = Vec::new();
+
+        let mut site = base.clone();
+        site.frame.site_id = "KINX".to_owned();
+        cases.push(("site", site, "radar site changed"));
+
+        let mut frame = base.clone();
+        frame.frame.scan_time_utc += chrono::Duration::minutes(5);
+        cases.push(("frame", frame, "displayed frame changed"));
+
+        let mut revision = base.clone();
+        revision.volume_revision += 1;
+        cases.push(("live volume revision", revision, "displayed frame changed"));
+
+        let mut product = base.clone();
+        product.product = DisplayProduct::StormRelativeVelocity;
+        product.velocity_mode = VrotVelocityMode::for_product(
+            &product.product,
+            false,
+            DealiasEngine::Region,
+            StormMotion {
+                direction_deg: 240.0,
+                speed_mps: 12.0,
+            },
+        );
+        cases.push(("product", product, "velocity product/source changed"));
+
+        let mut cut = base.clone();
+        cut.cut += 1;
+        cut.elevation_millideg = 1_500;
+        cases.push(("cut/tilt", cut, "tilt changed"));
+
+        for (label, current, expected_reason) in cases {
+            let mut points = vec![test_vrot_point()];
+            let mut stored = Some(base.clone());
+            assert_eq!(
+                reconcile_vrot_measurement_source(&mut points, &mut stored, Some(&current)),
+                Some(expected_reason),
+                "{label}"
+            );
+            assert!(points.is_empty(), "{label} retained a stale point");
+            assert!(stored.is_none(), "{label} retained stale provenance");
+        }
+    }
+
+    #[test]
+    fn manual_vrot_measurement_invalidates_for_dealias_or_storm_motion_change() {
+        let mut dealiased = test_vrot_provenance();
+        dealiased.product = DisplayProduct::DealiasedVelocity;
+        dealiased.velocity_mode = VrotVelocityMode::for_product(
+            &dealiased.product,
+            true,
+            DealiasEngine::Region,
+            StormMotion {
+                direction_deg: 0.0,
+                speed_mps: 0.0,
+            },
+        );
+        let mut raw_fallback = dealiased.clone();
+        raw_fallback.velocity_mode = VrotVelocityMode::for_product(
+            &raw_fallback.product,
+            false,
+            DealiasEngine::Region,
+            StormMotion {
+                direction_deg: 0.0,
+                speed_mps: 0.0,
+            },
+        );
+
+        let mut points = vec![test_vrot_point()];
+        let mut stored = Some(dealiased);
+        assert_eq!(
+            reconcile_vrot_measurement_source(&mut points, &mut stored, Some(&raw_fallback)),
+            Some("velocity product/source changed")
+        );
+        assert!(points.is_empty());
+
+        let mut srv = test_vrot_provenance();
+        srv.product = DisplayProduct::StormRelativeVelocity;
+        srv.velocity_mode = VrotVelocityMode::for_product(
+            &srv.product,
+            false,
+            DealiasEngine::Region,
+            StormMotion {
+                direction_deg: 240.0,
+                speed_mps: 12.0,
+            },
+        );
+        let mut new_motion = srv.clone();
+        new_motion.velocity_mode = VrotVelocityMode::for_product(
+            &new_motion.product,
+            false,
+            DealiasEngine::Region,
+            StormMotion {
+                direction_deg: 255.0,
+                speed_mps: 16.0,
+            },
+        );
+        let mut points = vec![test_vrot_point()];
+        let mut stored = Some(srv);
+        assert_eq!(
+            reconcile_vrot_measurement_source(&mut points, &mut stored, Some(&new_motion)),
+            Some("velocity product/source changed")
+        );
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn manual_vrot_measurement_preserves_only_its_originating_pane_volume() {
+        let time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let origin = Arc::new(test_volume_with_site_time("KTLX", time));
+        let other_pane_same_frame = Arc::new(test_volume_with_site_time("KTLX", time));
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        let provenance = VrotProvenance::new(
+            &origin,
+            &product,
+            0,
+            origin.cuts[0].elevation_deg,
+            VrotVelocityMode::for_product(
+                &product,
+                false,
+                DealiasEngine::Region,
+                StormMotion {
+                    direction_deg: 0.0,
+                    speed_mps: 0.0,
+                },
+            ),
+        );
+
+        assert!(provenance.matches_display(&origin, &product, 0));
+        assert!(provenance.matches_display(&Arc::clone(&origin), &product, 0));
+        assert!(
+            !provenance.matches_display(&other_pane_same_frame, &product, 0),
+            "a different pane volume with the same site/time must not inherit the overlay"
+        );
+        assert!(!provenance.matches_display(&origin, &DisplayProduct::DealiasedVelocity, 0));
+    }
+
+    #[test]
+    fn manual_vrot_measurement_keeps_matching_source() {
+        let current = test_vrot_provenance();
+        let mut points = vec![test_vrot_point()];
+        let mut stored = Some(current.clone());
+        assert_eq!(
+            reconcile_vrot_measurement_source(&mut points, &mut stored, Some(&current)),
+            None
+        );
+        assert_eq!(points, vec![test_vrot_point()]);
+        assert_eq!(stored, Some(current));
     }
 
     #[test]
@@ -53920,6 +54315,7 @@ mod tests {
             value: 22.5,
             base_value: None,
             vrot: None,
+            vrot_provenance: None,
             raw: Some(86),
             row: 42,
             gate: 123,
@@ -53981,6 +54377,7 @@ mod tests {
 
     #[test]
     fn cursor_readout_format_reports_vrot_gate_endpoints() {
+        let provenance = test_vrot_provenance();
         let readout = CursorReadout {
             site_id: "KTLX".to_owned(),
             volume_time_utc: Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap(),
@@ -54004,7 +54401,9 @@ mod tests {
                     value_mps: 24.0,
                     azimuth_deg: 212.0,
                 },
+                provenance: provenance.clone(),
             }),
+            vrot_provenance: Some(provenance),
             raw: Some(86),
             row: 5,
             gate: 101,
@@ -54071,19 +54470,20 @@ mod tests {
                 value_mps: 24.0,
                 azimuth_deg: 212.0,
             },
+            provenance: test_vrot_provenance(),
         };
 
         assert_eq!(
             format_vrot_card_line(
-                probe,
+                &probe,
                 ("mph", color_tables::unit_scale_to_internal("mph")),
                 units::Units::Imperial
             ),
-            "Vrot 47.0 mph - dV 94.0 mph - sep 1.25 km"
+            "Vrot 47.0 mph - dV 94.0 mph - sep 1.25 km - KTLX 01:30:00Z VEL cut 1 (0.5\u{b0}) \u{b7} raw velocity"
         );
         assert_eq!(
-            format_vrot_card_line(probe, ("m/s", 1.0), units::Units::Metric),
-            "Vrot 21.0 m/s - dV 42.0 m/s - sep 1.25 km"
+            format_vrot_card_line(&probe, ("m/s", 1.0), units::Units::Metric),
+            "Vrot 21.0 m/s - dV 42.0 m/s - sep 1.25 km - KTLX 01:30:00Z VEL cut 1 (0.5\u{b0}) \u{b7} raw velocity"
         );
     }
 
@@ -74437,6 +74837,7 @@ mod tests {
             archive_list_receiver: None,
             vrot_tool_armed: false,
             vrot_points: Vec::new(),
+            vrot_provenance: None,
             cross_section_a_lonlat: None,
             cross_section_b_lonlat: None,
             cross_section_texture: None,

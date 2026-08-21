@@ -204,17 +204,36 @@ impl ViewerApp {
     /// GR2-style Vrot measurement overlay: two clicked gates (max inbound +
     /// max outbound), connecting line, and a card with
     /// Vrot = (|Vin| + |Vout|) / 2, couplet diameter, and beam height.
-    pub(crate) fn draw_vrot_tool(&self, painter: &egui::Painter, rect: egui::Rect) {
+    pub(crate) fn draw_vrot_tool(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        volume: Option<&Arc<RadarVolume>>,
+        product: &DisplayProduct,
+        cut: usize,
+    ) {
         if self.vrot_points.is_empty() {
+            return;
+        }
+        let Some(provenance) = self.vrot_provenance.as_ref() else {
+            return;
+        };
+        let Some(volume) = volume else {
+            return;
+        };
+        if !provenance.matches_display(volume, product, cut) {
+            // A grid pane with a different product/tilt/source must never
+            // inherit another pane's measurement, even for the one frame
+            // before the centralized lifecycle reconciler runs.
             return;
         }
         let positions: Vec<egui::Pos2> = self
             .vrot_points
             .iter()
-            .map(|&(lon, lat, ..)| self.lon_lat_to_screen(rect, lon, lat))
+            .map(|point| self.lon_lat_to_screen(rect, point.lon, point.lat))
             .collect();
         for (index, position) in positions.iter().enumerate() {
-            let value = self.vrot_points[index].2;
+            let value = self.vrot_points[index].value_mps;
             let color = if value < 0.0 {
                 egui::Color32::from_rgb(80, 220, 120)
             } else {
@@ -232,8 +251,10 @@ impl ViewerApp {
                 [positions[0], positions[1]],
                 egui::Stroke::new(1.6_f32, egui::Color32::from_rgb(245, 230, 120)),
             );
-            let (lon_a, lat_a, v_a, h_a) = self.vrot_points[0];
-            let (lon_b, lat_b, v_b, h_b) = self.vrot_points[1];
+            let a = self.vrot_points[0];
+            let b = self.vrot_points[1];
+            let (lon_a, lat_a, v_a, h_a) = (a.lon, a.lat, a.value_mps, a.height_m);
+            let (lon_b, lat_b, v_b, h_b) = (b.lon, b.lat, b.value_mps, b.height_m);
             let vrot_mps = (v_a.abs() + v_b.abs()) / 2.0;
             let (velocity_unit, velocity_scale) = self.vrot_display_unit();
             let diameter_km = haversine_km(lat_a, lon_a, lat_b, lon_b);
@@ -244,10 +265,11 @@ impl ViewerApp {
                 (positions[0].y + positions[1].y) / 2.0,
             );
             let label = format!(
-                "Vrot {:.0} kt · dia {:.1} nm · {:.1} kft",
+                "Vrot {:.0} kt · dia {:.1} nm · {:.1} kft\n{}",
                 vrot_mps / velocity_scale,
                 diameter_nm,
-                height_kft
+                height_kft,
+                provenance.source_label(),
             );
             let label = label.replace(" kt", &format!(" {velocity_unit}"));
             draw_heavy_halo_text(
@@ -264,7 +286,7 @@ impl ViewerApp {
                 painter,
                 positions[0] + egui::vec2(8.0, -8.0),
                 egui::Align2::LEFT_BOTTOM,
-                "click max outbound",
+                &format!("click max outbound\n{}", provenance.source_label()),
                 egui::FontId::proportional(11.0),
                 egui::Color32::from_rgb(245, 230, 120),
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
@@ -989,7 +1011,7 @@ impl ViewerApp {
                 lines.push(provenance.truth_label());
             }
         }
-        if let Some(probe) = readout.as_ref().and_then(|readout| readout.vrot) {
+        if let Some(probe) = readout.as_ref().and_then(|readout| readout.vrot.as_ref()) {
             lines.push(format_vrot_card_line(
                 probe,
                 self.vrot_display_unit(),
@@ -2212,6 +2234,7 @@ impl ViewerApp {
             value,
             base_value: None,
             vrot: None,
+            vrot_provenance: None,
             raw: None,
             row,
             gate,
@@ -2281,6 +2304,74 @@ impl ViewerApp {
         self.cursor_readout_for(rect, position, &product, cut)
     }
 
+    pub(crate) fn clear_vrot_measurement(&mut self) {
+        self.vrot_points.clear();
+        self.vrot_provenance = None;
+    }
+
+    fn vrot_provenance_for_volume(
+        &mut self,
+        volume: Arc<RadarVolume>,
+        product: &DisplayProduct,
+        cut: usize,
+    ) -> Option<VrotProvenance> {
+        if !manual_vrot_product_supported(product) {
+            return None;
+        }
+        let elevation_deg = volume.cuts.get(cut)?.elevation_deg;
+        // Manual clicks use `cursor_readout_for`, which samples the raw or
+        // dealiased MomentGrid directly. Display smoothing is raster-only and
+        // therefore is deliberately not part of this value provenance.
+        let effective_dealiased = if product.uses_dealiased_velocity() {
+            self.dealiased_velocity_readout_grid(&volume, cut).is_some()
+        } else {
+            false
+        };
+        Some(VrotProvenance::new(
+            &volume,
+            product,
+            cut,
+            elevation_deg,
+            VrotVelocityMode::for_product(
+                product,
+                effective_dealiased,
+                self.dealias_engine,
+                self.current_storm_motion(),
+            ),
+        ))
+    }
+
+    fn active_vrot_provenance(&mut self) -> Option<VrotProvenance> {
+        let pane_index = if self.grid_layout == PanelLayout::One {
+            0
+        } else {
+            self.active_pane
+                .min(self.grid_layout.panel_count().saturating_sub(1))
+        };
+        let (product, cut) = self.pane_product_cut(pane_index)?;
+        let volume = if pane_index == 0 {
+            self.volume.clone()
+        } else {
+            self.extra_pane_display_volume(pane_index - 1)
+        }?;
+        self.vrot_provenance_for_volume(volume, &product, cut)
+    }
+
+    pub(crate) fn reconcile_vrot_source(&mut self) {
+        if self.vrot_points.is_empty() {
+            self.vrot_provenance = None;
+            return;
+        }
+        let current = self.active_vrot_provenance();
+        if let Some(reason) = reconcile_vrot_measurement_source(
+            &mut self.vrot_points,
+            &mut self.vrot_provenance,
+            current.as_ref(),
+        ) {
+            self.status = format!("Vrot measurement cleared: {reason}");
+        }
+    }
+
     pub(crate) fn add_vrot_tool_point(
         &mut self,
         rect: egui::Rect,
@@ -2300,18 +2391,35 @@ impl ViewerApp {
             self.status = "No velocity gate under Vrot click".to_owned();
             return;
         }
+        let Some(provenance) = readout.vrot_provenance.clone() else {
+            self.status = "Vrot source provenance unavailable".to_owned();
+            return;
+        };
         let (lon, lat) = self.screen_to_lon_lat(rect, position);
-        if self.vrot_points.len() >= 2 {
-            self.vrot_points.clear();
+        let source_changed =
+            !self.vrot_points.is_empty() && self.vrot_provenance.as_ref() != Some(&provenance);
+        if source_changed {
+            self.clear_vrot_measurement();
         }
-        self.vrot_points
-            .push((lon, lat, readout.value, readout.height_above_radar_m));
+        if self.vrot_points.len() >= 2 {
+            self.clear_vrot_measurement();
+        }
+        self.vrot_provenance = Some(provenance);
+        self.vrot_points.push(VrotToolPoint {
+            lon,
+            lat,
+            value_mps: readout.value,
+            height_m: readout.height_above_radar_m,
+        });
         self.status = match self.vrot_points.as_slice() {
+            [_] if source_changed => {
+                "Vrot source changed; point 1 reset — click the opposite velocity max".to_owned()
+            }
             [_] => "Vrot point 1 set; click the opposite velocity max".to_owned(),
             [a, b] => {
                 let (velocity_unit, velocity_scale) = self.vrot_display_unit();
-                let vrot = ((a.2.abs() + b.2.abs()) / 2.0) / velocity_scale;
-                if a.2.signum() == b.2.signum() {
+                let vrot = ((a.value_mps.abs() + b.value_mps.abs()) / 2.0) / velocity_scale;
+                if a.value_mps.signum() == b.value_mps.signum() {
                     format!(
                         "Vrot {:.0} {velocity_unit}; points have the same sign",
                         vrot
@@ -2352,6 +2460,7 @@ impl ViewerApp {
             .uses_dealiased_velocity()
             .then(|| self.dealiased_velocity_readout_grid(&volume, selected_cut))
             .flatten();
+        let effective_dealiased = dealiased_grid.is_some();
         let grid = dealiased_grid.as_deref().unwrap_or(source_grid);
         let (radar_lat, radar_lon) = self.loaded_volume_location()?;
         // Probe the gate ACTUALLY RENDERED under the cursor: invert the
@@ -2392,7 +2501,31 @@ impl ViewerApp {
             base_value
         };
         let storm_motion = self.current_storm_motion();
-        let vrot = velocity_vrot_probe(cut, grid, row, gate, &selected_product, storm_motion);
+        let vrot_provenance = manual_vrot_product_supported(&selected_product).then(|| {
+            VrotProvenance::new(
+                &volume,
+                &selected_product,
+                selected_cut,
+                cut.elevation_deg,
+                VrotVelocityMode::for_product(
+                    &selected_product,
+                    effective_dealiased,
+                    self.dealias_engine,
+                    storm_motion,
+                ),
+            )
+        });
+        let vrot = vrot_provenance.clone().and_then(|provenance| {
+            velocity_vrot_probe(
+                cut,
+                grid,
+                row,
+                gate,
+                &selected_product,
+                storm_motion,
+                provenance,
+            )
+        });
         let load_timing = self.load_timing;
         // Beam-center height from the gate's true slant range (4/3-Earth model;
         // Doviak & Zrnić 1993, eq. 2.28b), not the screen-derived ground range.
@@ -2410,6 +2543,7 @@ impl ViewerApp {
                 .is_storm_relative_velocity()
                 .then_some(base_value),
             vrot,
+            vrot_provenance,
             raw,
             row,
             gate,
@@ -2950,6 +3084,7 @@ pub(crate) fn format_cursor_readout(
         .unwrap_or_default();
     let vrot = readout
         .vrot
+        .as_ref()
         .map(|probe| {
             let (velocity_unit, velocity_scale) =
                 vrot_display_scale_unit(display_unit, unit_system);
