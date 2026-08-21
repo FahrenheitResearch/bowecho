@@ -42,6 +42,10 @@ jobs:
         shell: bash
         run: bash tools/check_release_binary_size_test.sh
 
+      - name: Release tag prerelease classification tests
+        shell: bash
+        run: bash tools/release_tag_prerelease_test.sh
+
       - name: Test
         run: cargo test --workspace --all-targets
 

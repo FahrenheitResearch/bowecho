@@ -29,23 +29,137 @@ this functionality:
 - **License:** BSD-3-Clause (retaining the upstream SHARPpy notices)
 - **Copyright:** © SHARPpy Reimagined maintainers (FahrenheitResearch)
 - **Source:** <https://github.com/FahrenheitResearch/SHARPpy-Reimagined-vRust>
+- **BowEcho crate:** `sharppyrs` 0.1.0
+- **Pinned crate source:** <https://github.com/FahrenheitResearch/sharppyrs>
+- **Pinned revision:** `b97d29c937d4f4146796249c9663e924d98ed34a`
 
 The `sharppyrs` crate that draws BowEcho's sounding window is a Rust/egui
 port of SHARPpy-Reimagined's modified SPC widget (layout, zoomed hodograph,
 0–500 m trace band, locator inset, index board).
 
+The complete `sharppyrs` BSD-3-Clause notice follows so binary packages do
+not depend on a source checkout or network link for the required terms:
+
+BSD 3-Clause License
+
+SHARPpy Reimagined additions and modifications:
+Copyright (c) 2026, SHARPpy Reimagined maintainers. All rights reserved.
+
+Upstream SHARPpy notices retained verbatim:
+Copyright (c) 2011, Patrick T. Marsh & John Hart. All rights reserved.
+Copyright (c) 2012, MetPy Developers. All rights reserved.
+Copyright (c) 2020, Kelton Halbert, Greg Blumberg & Tim Supinie. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the MetPy Developers nor the names of any contributors
+   may be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+This project is an independent fork and is not endorsed by the upstream SHARPpy
+or MetPy contributors.
+
+Bundled Rusty Weather executables are distributed under their accompanying
+license notice in sharpmod/resources/bin/RUSTY-WEATHER-LICENSE.txt.
+
 ## sharprs / rusty-weather
 
 - **License:** BSD-3-Clause / MIT
 - **Copyright:** © FahrenheitResearch
+- **BowEcho crate:** `sharprs` 0.1.0 (vendored)
 - **Sources:** <https://github.com/FahrenheitResearch/sharprs>,
   <https://github.com/FahrenheitResearch/rusty-weather>
+- **Imported from rusty-weather revision:**
+  `cf0ca3693650153ff0f79a0e60c3ec2da7d0af01`
 
 `sharprs` is the pure-Rust SHARPpy calculation engine behind the sounding
 analysis (parcels, effective inflow, composite indices); the rusty-weather
 crates (`rw-ui`, `rustwx-*`) provide the model-data dock, classic sounding
 panel, and satellite/model stack. See each repository for its authoritative
 license text.
+
+The complete license notice from BowEcho's vendored `sharprs` crate follows so
+the exact release bundles satisfy its MIT and retained SHARPpy BSD-3-Clause
+binary-redistribution terms:
+
+MIT License
+
+Copyright (c) 2025 FahrenheitResearch
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+SHARPpy BSD-3-Clause Notice
+
+This crate ports and derives portions of SHARPpy. Those portions remain
+subject to the following notice and conditions:
+
+Copyright (c) 2011, Patrick T. Marsh & John Hart. All rights reserved.
+
+Copyright (c) 2012, MetPy Developers. All rights reserved.
+
+Copyright (c) 2020, Kelton Halbert, Greg Blumberg & Tim Supinie. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the MetPy Developers nor the names of any contributors
+   may be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## OpenJPEG / openjp2 Rust port
 

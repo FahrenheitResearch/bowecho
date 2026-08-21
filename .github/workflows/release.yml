@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    outputs:
+      prerelease: ${{ steps.release_kind.outputs.prerelease }}
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -42,18 +44,38 @@ jobs:
             exit 1
           fi
 
+      - name: Classify release tag
+        id: release_kind
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cargo validated the exact workspace version above. Preserve its
+          # SemVer prerelease meaning all the way through draft creation,
+          # reruns that edit an existing release, and final publication.
+          prerelease="$(bash tools/release_tag_prerelease.sh "${GITHUB_REF_NAME}")"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_IS_PRERELEASE: ${{ steps.release_kind.outputs.prerelease }}
         run: |
+          set -euo pipefail
           notes_file="docs/releases/${GITHUB_REF_NAME}.md"
           if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             echo "Release ${GITHUB_REF_NAME} already exists."
-            if [ -f "$notes_file" ]; then
-              gh release edit "${GITHUB_REF_NAME}" \
-                --repo "${GITHUB_REPOSITORY}" \
-                --notes-file "$notes_file"
+            release_args=(
+              "${GITHUB_REF_NAME}"
+              --repo "${GITHUB_REPOSITORY}"
+              --prerelease="${RELEASE_IS_PRERELEASE}"
+            )
+            if [[ "${RELEASE_IS_PRERELEASE}" == "true" ]]; then
+              release_args+=(--latest=false)
             fi
+            if [ -f "$notes_file" ]; then
+              release_args+=(--notes-file "$notes_file")
+            fi
+            gh release edit "${release_args[@]}"
           else
             release_args=(
               "${GITHUB_REF_NAME}"
@@ -61,6 +83,9 @@ jobs:
               --title "BowEcho ${GITHUB_REF_NAME}"
               --draft
             )
+            if [[ "${RELEASE_IS_PRERELEASE}" == "true" ]]; then
+              release_args+=(--prerelease --latest=false)
+            fi
             if [ -f "$notes_file" ]; then
               release_args+=(--notes-file "$notes_file")
             else
@@ -626,8 +651,10 @@ jobs:
         run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
 
   publish-release:
-    needs: upload-release-assets
-    if: startsWith(github.ref, 'refs/tags/') && needs.upload-release-assets.result == 'success'
+    needs:
+      - create-release
+      - upload-release-assets
+    if: startsWith(github.ref, 'refs/tags/') && needs.create-release.result == 'success' && needs.upload-release-assets.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -635,4 +662,18 @@ jobs:
       - name: Publish release after all assets upload
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${GITHUB_REF_NAME}" --draft=false --repo "${GITHUB_REPOSITORY}"
+          RELEASE_IS_PRERELEASE: ${{ needs.create-release.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_args=(
+            "${GITHUB_REF_NAME}"
+            --draft=false
+            --repo "${GITHUB_REPOSITORY}"
+            --prerelease="${RELEASE_IS_PRERELEASE}"
+          )
+          if [[ "${RELEASE_IS_PRERELEASE}" == "true" ]]; then
+            # A prerelease must never displace the latest stable release.
+            release_args+=(--latest=false)
+          fi
+          gh release edit "${release_args[@]}"
