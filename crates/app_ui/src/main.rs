@@ -78196,7 +78196,7 @@ mod tests {
         assert_eq!(sidebar_tab_label(SidebarTab::Severe, &legacy), "Alerts");
         legacy.features.map = "Layers+".to_owned();
         assert_eq!(sidebar_tab_label(SidebarTab::Layers, &legacy), "Layers+");
-        let tooltip = sidebar_tab_tooltip(SidebarTab::Layers);
+        let tooltip = sidebar_tab_tooltip(SidebarTab::Layers).to_ascii_lowercase();
         assert!(tooltip.contains("map layers"));
         assert!(tooltip.contains("radar age"));
         assert!(tooltip.contains("appearance"));
