@@ -291,8 +291,13 @@ fn azimuth_delta_deg(a: f32, b: f32) -> f32 {
 }
 
 fn max_range_m(grid: &MomentGrid) -> f32 {
-    grid.gate_range.first_gate_m as f32
-        + grid.gate_range.gate_spacing_m as f32 * grid.gate_range.gate_count as f32
+    let spacing_m = f64::from(grid.gate_range.gate_spacing_m);
+    if grid.gate_range.gate_count == 0 || spacing_m <= 0.0 {
+        return 0.0;
+    }
+    (f64::from(grid.gate_range.first_gate_m)
+        + spacing_m * (grid.gate_range.gate_count as f64 - 0.5))
+        .max(0.0) as f32
 }
 
 #[cfg(test)]
@@ -354,6 +359,85 @@ mod tests {
 
     fn dbz_raw(dbz: f32) -> u8 {
         (dbz * 2.0 + 66.0).round() as u8
+    }
+
+    fn set_gate_range(volume: &mut RadarVolume, gate_range: GateRange) {
+        let cut = &mut volume.cuts[0];
+        for radial in &mut cut.radials {
+            radial.gate_range = gate_range.clone();
+        }
+        cut.moments
+            .get_mut(&MomentType::Reflectivity)
+            .expect("reflectivity grid")
+            .gate_range = gate_range;
+    }
+
+    #[test]
+    fn swath_range_uses_outer_edge_of_center_based_gates() {
+        let mut volume = volume_with(MomentType::Reflectivity, 4, 950, 100, |_r, _g| 0);
+        set_gate_range(
+            &mut volume,
+            GateRange {
+                first_gate_m: 62,
+                gate_spacing_m: 125,
+                gate_count: 950,
+            },
+        );
+        let grid = volume.cuts[0]
+            .moments
+            .get_mut(&MomentType::Reflectivity)
+            .expect("reflectivity grid");
+
+        assert_eq!(max_range_m(grid), 118_749.5);
+        grid.gate_range.gate_count = 0;
+        assert_eq!(max_range_m(grid), 0.0);
+        grid.gate_range.gate_count = 950;
+        grid.gate_range.gate_spacing_m = 0;
+        assert_eq!(max_range_m(grid), 0.0);
+        grid.gate_range.gate_spacing_m = -125;
+        assert_eq!(max_range_m(grid), 0.0);
+    }
+
+    #[test]
+    fn reference_geometry_tiebreak_uses_outer_gate_edge() {
+        let mut larger_spacing =
+            volume_with(MomentType::Reflectivity, 4, 4, 100, |_r, _g| dbz_raw(30.0));
+        set_gate_range(
+            &mut larger_spacing,
+            GateRange {
+                first_gate_m: 0,
+                gate_spacing_m: 300,
+                gate_count: 4,
+            },
+        );
+        let mut farther_edge =
+            volume_with(MomentType::Reflectivity, 4, 4, 200, |_r, _g| dbz_raw(40.0));
+        set_gate_range(
+            &mut farther_edge,
+            GateRange {
+                first_gate_m: 190,
+                gate_spacing_m: 250,
+                gate_count: 4,
+            },
+        );
+
+        // The old first + spacing * count formula preferred the 300 m grid
+        // (1200 m versus 1190 m). Comparing the real outer edges instead
+        // prefers the nonzero-first grid (1065 m versus 1050 m).
+        let swath = max_value_swath(
+            &[&farther_edge, &larger_spacing],
+            MomentType::Reflectivity,
+            SwathAggregation::Max,
+        )
+        .expect("swath");
+        assert_eq!(
+            swath.cuts[0].moments[&MomentType::Reflectivity].gate_range,
+            GateRange {
+                first_gate_m: 190,
+                gate_spacing_m: 250,
+                gate_count: 4,
+            }
+        );
     }
 
     #[test]

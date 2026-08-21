@@ -3664,8 +3664,13 @@ fn median_small_f32(values: &mut [f32], count: usize) -> f32 {
 }
 
 fn max_range_m(grid: &MomentGrid) -> f32 {
-    grid.gate_range.first_gate_m as f32
-        + grid.gate_range.gate_spacing_m as f32 * grid.gate_range.gate_count as f32
+    let spacing_m = f64::from(grid.gate_range.gate_spacing_m);
+    if grid.gate_range.gate_count == 0 || spacing_m <= 0.0 {
+        return 0.0;
+    }
+    (f64::from(grid.gate_range.first_gate_m)
+        + spacing_m * (grid.gate_range.gate_count as f64 - 0.5))
+        .max(0.0) as f32
 }
 
 fn azimuth_from_xy(dx: f32, dy: f32) -> f32 {
@@ -4102,6 +4107,36 @@ mod tests {
         assert_eq!(azimuth_from_xy(1.0, 0.0).round(), 90.0);
         assert_eq!(azimuth_from_xy(0.0, -1.0).round(), 180.0);
         assert_eq!(azimuth_from_xy(-1.0, 0.0).round(), 270.0);
+    }
+
+    #[test]
+    fn viewport_range_uses_outer_edge_of_center_based_gates() {
+        let mut grid = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            GateRange {
+                first_gate_m: 62,
+                gate_spacing_m: 125,
+                gate_count: 950,
+            },
+            1.0,
+            0.0,
+            None,
+            None,
+        );
+
+        // Gate zero is centred at 62 m, so the far edge is half a gate past
+        // gate 949: 62 + 125 * 949.5 = 118749.5 m.
+        assert_eq!(max_range_m(&grid), 118_749.5);
+        let geometry = viewport_geometry(&grid, sample_viewport_options());
+        assert!((geometry.max_range_km_sq.sqrt() - 118.7495).abs() < 0.000_01);
+
+        grid.gate_range.gate_count = 0;
+        assert_eq!(max_range_m(&grid), 0.0);
+        grid.gate_range.gate_count = 950;
+        grid.gate_range.gate_spacing_m = 0;
+        assert_eq!(max_range_m(&grid), 0.0);
+        grid.gate_range.gate_spacing_m = -125;
+        assert_eq!(max_range_m(&grid), 0.0);
     }
 
     #[test]
