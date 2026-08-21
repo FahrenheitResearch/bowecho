@@ -33,8 +33,8 @@ pub use advanced::{SupportMode, Vol3dRenderMode};
 
 pub const BOX_N: usize = 192;
 pub const BOX_NZ: usize = 48;
-/// A sharper floor than the volume lattice, while retaining a 512-byte row
-/// pitch that is friendly to texture uploads.
+/// A sharper floor than the volume lattice. RG value/mask texels retain a
+/// 1024-byte row pitch that is friendly to texture uploads.
 pub const FLOOR_N: usize = 512;
 pub const BOX_HALF_KM: f32 = 60.0;
 pub const BOX_TOP_M: f32 = 18_000.0;
@@ -268,8 +268,9 @@ pub struct VolumeBox {
     /// Conservative macro hierarchy aggregated from fine bricks.
     pub hierarchy_coarse: Vec<u8>,
     pub acceleration_empty_fraction: f32,
-    /// Raw normalized dBZ for the low-level floor. Rows run south-to-north,
-    /// exactly like the y dimension of `volume_box_resample`.
+    /// Packed RG texels for the low-level floor: normalized value followed by
+    /// an observed-data mask. Rows run south-to-north, exactly like the y
+    /// dimension of `volume_box_resample`.
     pub floor_data: Option<Vec<u8>>,
     pub floor_elevation_deg: Option<f32>,
 }
@@ -680,7 +681,11 @@ pub fn normalize_box_with_support(
         acceleration_empty_fraction: acceleration.empty_fine_fraction,
         // Upload an empty floor with every new volume so a failed low-tilt
         // raster can never leave the prior scan painted underneath.
-        floor_data: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N)]),
+        // RG texels: normalized value plus an explicit observed-data mask.
+        // Keeping validity separate is essential for Below/Outside threshold
+        // modes because a missing gate and a valid value at the palette
+        // minimum both normalize to zero.
+        floor_data: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N).saturating_mul(2)]),
         floor_elevation_deg: None,
     }
 }
@@ -708,7 +713,7 @@ pub fn empty_box() -> VolumeBox {
         acceleration_empty_fraction: 1.0,
         // Upload an empty floor with every new volume so a failed low-tilt
         // raster can never leave the prior scan painted underneath.
-        floor_data: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N)]),
+        floor_data: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N).saturating_mul(2)]),
         floor_elevation_deg: None,
     }
 }
@@ -856,13 +861,17 @@ pub fn lowest_moment_floor(
     let gate_count = grid.gate_range.gate_count;
     let span_km = half_km * 2.0;
     let denominator = (FLOOR_N - 1).max(1) as f32;
-    let mut data = vec![0u8; FLOOR_N * FLOOR_N];
-    data.par_chunks_mut(FLOOR_N)
+    // Pack each floor texel as RG: normalized value, then an explicit
+    // validity mask. A value-only texture cannot distinguish no-data from a
+    // legitimate value at `value_min`; that ambiguity painted every missing
+    // pixel in Below/Outside threshold modes.
+    let mut data = vec![0u8; FLOOR_N * FLOOR_N * 2];
+    data.par_chunks_mut(FLOOR_N * 2)
         .enumerate()
         .for_each(|(row_index, output_row)| {
             // row 0 = south, matching the volume texture's +Y convention.
             let north_km = center_north_km - half_km + span_km * row_index as f32 / denominator;
-            for (column_index, output) in output_row.iter_mut().enumerate() {
+            for (column_index, output) in output_row.chunks_exact_mut(2).enumerate() {
                 let east_km =
                     center_east_km - half_km + span_km * column_index as f32 / denominator;
                 let range_m = east_km.hypot(north_km) * 1000.0;
@@ -884,7 +893,8 @@ pub fn lowest_moment_floor(
                 else {
                     continue;
                 };
-                *output = normalize_value(value, value_min, value_max);
+                output[0] = normalize_value(value, value_min, value_max);
+                output[1] = 255;
             }
         });
     Some((data, elevation_deg))
@@ -1026,19 +1036,22 @@ fn shaded_rgb(uvw: vec3<f32>, ray_dir: vec3<f32>, base: vec3<f32>) -> vec3<f32> 
     return base * mix(1.0, lighting, clamp(u.shading, 0.0, 1.0));
 }
 
-fn column_max(uv: vec2<f32>) -> f32 {
+fn column_max(uv: vec2<f32>) -> vec2<f32> {
     var maximum = 0.0;
+    var observed = 0.0;
     let low = clamp(u.clip_low, 0.0, 0.99);
     let high = clamp(u.clip_high, low + 0.01, 1.0);
     for (var i = 0; i < FLOOR_COLUMN_STEPS; i = i + 1) {
         let fraction = (f32(i) + 0.5) / f32(FLOOR_COLUMN_STEPS);
         let z = mix(low, high, fraction);
-        maximum = max(
-            maximum,
-            textureSampleLevel(t_volume, s_volume, vec3<f32>(uv, z), 0.0).r
-        );
+        let point = vec3<f32>(uv, z);
+        let support = textureSampleLevel(t_support, s_volume, point, 0.0).r;
+        if (support > 0.0001) {
+            maximum = max(maximum, textureSampleLevel(t_volume, s_volume, point, 0.0).r);
+            observed = 1.0;
+        }
     }
-    return maximum;
+    return vec2<f32>(maximum, observed);
 }
 
 fn threshold_strength(value: f32, low: f32, high: f32, mode: f32, width: f32) -> f32 {
@@ -1466,23 +1479,32 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             let point = eye + rd * floor_t;
             if (abs(point.x) <= 1.0 && abs(point.y) <= 1.0) {
                 let floor_uv = vec2<f32>((point.x + 1.0) * 0.5, (point.y + 1.0) * 0.5);
-                var value = textureSampleLevel(t_floor, s_floor, floor_uv, 0.0).r;
+                let floor_sample = textureSampleLevel(t_floor, s_floor, floor_uv, 0.0).rg;
+                var value = floor_sample.r;
+                // Requiring a fully valid filtered footprint keeps the edge
+                // of the observed PPI honest instead of blending no-data zero
+                // into the last valid gate.
+                var floor_observed = floor_sample.g > 0.999;
                 // Column-max projects the reflectivity structure column onto the
                 // floor; in velocity mode that column lives in t_volume and
                 // would be miscolored by the velocity LUT, so fall back to the
                 // lowest-tilt velocity PPI there.
                 if (u.floor_mode > 1.5 && u.velocity_mode < 0.5) {
-                    value = column_max(floor_uv);
+                    let projected = column_max(floor_uv);
+                    value = projected.r;
+                    floor_observed = projected.g > 0.5;
                 }
-                let floor_transfer = threshold_strength(
-                    value, u.floor_threshold, u.floor_threshold_high,
-                    u.floor_threshold_mode, 0.04
-                );
-                if (floor_transfer > 0.0) {
-                    let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(value, 0.5), 0.0);
-                    let alpha = palette.a * u.floor_opacity * floor_transfer;
-                    color = color + (1.0 - accumulated) * alpha * palette.rgb;
-                    accumulated = accumulated + (1.0 - accumulated) * alpha;
+                if (floor_observed) {
+                    let floor_transfer = threshold_strength(
+                        value, u.floor_threshold, u.floor_threshold_high,
+                        u.floor_threshold_mode, 0.04
+                    );
+                    if (floor_transfer > 0.0) {
+                        let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(value, 0.5), 0.0);
+                        let alpha = palette.a * u.floor_opacity * floor_transfer;
+                        color = color + (1.0 - accumulated) * alpha * palette.rgb;
+                        accumulated = accumulated + (1.0 - accumulated) * alpha;
+                    }
                 }
             }
         }
@@ -1584,7 +1606,7 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R8Unorm,
+        format: wgpu::TextureFormat::Rg8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -2275,7 +2297,7 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
                         &floor_data,
                         wgpu::TexelCopyBufferLayout {
                             offset: 0,
-                            bytes_per_row: Some(FLOOR_N as u32),
+                            bytes_per_row: Some((FLOOR_N * 2) as u32),
                             rows_per_image: Some(FLOOR_N as u32),
                         },
                         wgpu::Extent3d {
@@ -2496,6 +2518,18 @@ mod tests {
         assert!(
             (fast.acceleration_empty_fraction - reference.acceleration_empty_fraction).abs()
                 < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn empty_floor_is_explicitly_masked_instead_of_looking_like_a_low_value() {
+        let floor = empty_box().floor_data.expect("empty floor upload");
+        assert_eq!(floor.len(), FLOOR_N * FLOOR_N * 2);
+        assert!(
+            floor
+                .chunks_exact(2)
+                .all(|texel| texel == [0, 0]),
+            "no-data floor texels must carry a zero validity channel"
         );
     }
 
