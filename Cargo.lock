@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "app_ui"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "async-trait",
  "bowecho_cli",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "bowecho-bench"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "chrono",
  "color_tables",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "bowecho_cli"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "chrono",
  "glob",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 
 [[package]]
 name = "cairo-sys-rs"
@@ -1065,7 +1065,7 @@ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
 name = "color_tables"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 
 [[package]]
 name = "colorchoice"
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "data_source"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "chrono",
  "nexrad_io",
@@ -3224,7 +3224,7 @@ dependencies = [
 
 [[package]]
 name = "mini_ui"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "cache",
  "chrono",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "nexrad_io"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "byteorder",
  "bzip2 0.6.1",
@@ -4370,7 +4370,7 @@ dependencies = [
 
 [[package]]
 name = "product_engine"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "radar_core",
 ]
@@ -4554,7 +4554,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radar_core"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "chrono",
  "serde",
@@ -4562,7 +4562,7 @@ dependencies = [
 
 [[package]]
 name = "radar_scattering"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4748,7 +4748,7 @@ source = "git+https://github.com/FahrenheitResearch/region-global-dealias?rev=a7
 
 [[package]]
 name = "render2d"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "chrono",
  "color_tables",
@@ -5658,7 +5658,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5767,7 +5767,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simradar_cuda"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "cudarc",
  "radar_scattering",
@@ -5778,7 +5778,7 @@ dependencies = [
 
 [[package]]
 name = "simradar_validation"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "chrono",
  "nexrad_io",
@@ -6008,7 +6008,7 @@ dependencies = [
 
 [[package]]
 name = "styles"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -6519,7 +6519,7 @@ dependencies = [
 
 [[package]]
 name = "ui_core"
-version = "0.34.13"
+version = "0.34.14-rc.1"
 dependencies = [
  "chrono",
  "data_source",
