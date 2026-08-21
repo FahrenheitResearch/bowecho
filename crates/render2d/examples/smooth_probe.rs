@@ -19,7 +19,7 @@ fn save(
         .render_moment_rgba_into(volume, options, &mut px)
         .expect("render");
     let mut img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(w, h, Rgba([15, 17, 20, 255]));
-    for (i, p) in px.chunks_exact(4).enumerate() {
+    for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
         let a = p[3] as u32;
         if a == 0 {
             continue;

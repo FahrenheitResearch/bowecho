@@ -345,7 +345,7 @@ fn perimeter_bin_mask(
             }
         }
         crossings.sort_by(f64::total_cmp);
-        for pair in crossings.chunks_exact(2) {
+        for pair in crossings.as_chunks::<2>().0 {
             let lo = ((pair[0] - lon0) / bin - 0.5).ceil().max(0.0) as usize;
             let hi = ((pair[1] - lon0) / bin - 0.5).floor();
             if hi < 0.0 || lo >= width {

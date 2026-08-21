@@ -1986,7 +1986,7 @@ mod tests {
                 .render_moment_rgba_into(&v, opts, &mut pixels)
                 .expect("render");
             assert!(
-                pixels.chunks_exact(4).any(|p| p[3] > 0),
+                pixels.as_chunks::<4>().0.iter().any(|p| p[3] > 0),
                 "{family:?} derived product rendered no opaque pixels"
             );
         }

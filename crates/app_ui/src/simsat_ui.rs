@@ -584,7 +584,9 @@ impl PlotPayload {
                     ));
                 }
                 let pixels = rgba
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|px| rustwx_render::Color::rgba(px[0], px[1], px[2], px[3]))
                     .collect();
                 SatellitePlotSource::rgba_from_mesh(
@@ -3193,7 +3195,7 @@ fn write_result_to_store(
         let mut rgb_r = vec![f32::NAN; n];
         let mut rgb_g = vec![f32::NAN; n];
         let mut rgb_b = vec![f32::NAN; n];
-        for (index, pixel) in rgba.chunks_exact(4).enumerate() {
+        for (index, pixel) in rgba.as_chunks::<4>().0.iter().enumerate() {
             if pixel[3] >= 128 {
                 rgb_r[index] = pixel[0] as f32;
                 rgb_g[index] = pixel[1] as f32;

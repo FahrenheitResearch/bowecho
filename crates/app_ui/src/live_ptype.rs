@@ -243,7 +243,12 @@ impl LivePtypeRadarOccurrence {
         if rgba.len() != cells.checked_mul(4)? {
             return None;
         }
-        let alpha = rgba.chunks_exact(4).map(|pixel| pixel[3]).collect();
+        let alpha = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| pixel[3])
+            .collect();
         Some(Self {
             size,
             alpha,

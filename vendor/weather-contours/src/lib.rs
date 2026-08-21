@@ -159,8 +159,10 @@ impl PackedContours {
                 ));
             }
             if vertices
-                .chunks_exact(2)
-                .zip(vertices[2..].chunks_exact(2))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(vertices[2..].as_chunks::<2>().0.iter())
                 .any(|(a, b)| same_stored_point((a[0], a[1]), (b[0], b[1])))
             {
                 return Err(ContourError::Invariant(
@@ -1210,7 +1212,12 @@ fn has_minimum_distinct_points(vertices: &[f32], minimum: usize) -> bool {
     debug_assert!(minimum <= 3);
     let mut distinct = [(0.0_f32, 0.0_f32); 3];
     let mut count = 0;
-    for point in vertices.chunks_exact(2).map(|point| (point[0], point[1])) {
+    for point in vertices
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|point| (point[0], point[1]))
+    {
         if distinct[..count]
             .iter()
             .all(|&existing| !same_stored_point(existing, point))
@@ -1259,7 +1266,9 @@ fn emit_path(
         visited[index] = true;
         let point = (node_x[index], node_y[index]);
         let previous_point = output.vertices[first_point * 2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .next_back()
             .map(|stored| (stored[0], stored[1]));
         if previous_point.is_none_or(|previous| !same_stored_point(previous, point)) {
@@ -1654,7 +1663,12 @@ mod tests {
             .vertices
             .iter()
             .all(|coordinate| coordinate.is_finite()));
-        assert!(output.vertices.chunks_exact(2).all(|point| point[0] == 0.0));
+        assert!(output
+            .vertices
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|point| point[0] == 0.0));
     }
 
     #[test]

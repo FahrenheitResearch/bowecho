@@ -138,8 +138,10 @@ fn decode_rotation_track_cache(bytes: &[u8]) -> Option<RotationTrackCache> {
         return None;
     }
     let grid = raw_grid
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
     Some(RotationTrackCache {
         site_id,

@@ -1088,7 +1088,7 @@ pub fn lowest_moment_floor(
         .for_each(|(row_index, output_row)| {
             // row 0 = south, matching the volume texture's +Y convention.
             let north_km = center_north_km - half_km + span_km * row_index as f32 / denominator;
-            for (column_index, output) in output_row.chunks_exact_mut(2).enumerate() {
+            for (column_index, output) in output_row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 let east_km =
                     center_east_km - half_km + span_km * column_index as f32 / denominator;
                 let range_m = east_km.hypot(north_km) * 1000.0;
@@ -2785,7 +2785,11 @@ mod tests {
         let floor = empty_box().floor_data.expect("empty floor upload");
         assert_eq!(floor.len(), FLOOR_N * FLOOR_N * 2);
         assert!(
-            floor.chunks_exact(2).all(|texel| texel == [0, 0]),
+            floor
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|texel| *texel == [0, 0]),
             "no-data floor texels must carry a zero validity channel"
         );
     }

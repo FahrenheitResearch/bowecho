@@ -363,7 +363,7 @@ fn split_rgb_planes(
     let mut r = Vec::with_capacity(pixel_count);
     let mut g = Vec::with_capacity(pixel_count);
     let mut b = Vec::with_capacity(pixel_count);
-    for (index, pixel) in rgb.chunks_exact(3).enumerate() {
+    for (index, pixel) in rgb.as_chunks::<3>().0.iter().enumerate() {
         if alpha.is_some_and(|alpha| alpha[index] == 0) {
             r.push(f32::NAN);
             g.push(f32::NAN);

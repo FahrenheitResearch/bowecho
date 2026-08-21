@@ -676,10 +676,12 @@ impl SweepParse {
             }
             2 => {
                 let words: Vec<i16> = payload
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| match endian {
-                        Endian::Little => i16::from_le_bytes([pair[0], pair[1]]),
-                        Endian::Big => i16::from_be_bytes([pair[0], pair[1]]),
+                        Endian::Little => i16::from_le_bytes(*pair),
+                        Endian::Big => i16::from_be_bytes(*pair),
                     })
                     .collect();
                 let words = if compressed {
@@ -703,7 +705,9 @@ impl SweepParse {
             }
             3 => MomentRow::F32(
                 payload
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|quad| {
                         let raw = endian.i32(quad, 0);
                         if raw == param.bad_data {
@@ -716,7 +720,9 @@ impl SweepParse {
             ),
             4 => MomentRow::F32(
                 payload
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|quad| {
                         let raw = endian.f32(quad, 0);
                         if raw == param.bad_data as f32 || raw <= DORADE_BAD_F32 {

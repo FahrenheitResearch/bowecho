@@ -252,7 +252,12 @@ impl RhiPanel {
 
         let table = color_tables.for_family(family);
         let mut rgba = vec![0u8; section.width * section.height * 4];
-        for (cell, value) in rgba.chunks_exact_mut(4).zip(section.values.iter()) {
+        for (cell, value) in rgba
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(section.values.iter())
+        {
             if value.is_finite() {
                 cell.copy_from_slice(&table.color_for_value(*value));
             }

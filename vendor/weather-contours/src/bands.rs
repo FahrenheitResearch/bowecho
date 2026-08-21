@@ -672,7 +672,9 @@ mod tests {
     fn mesh_area(output: &PackedBands) -> f64 {
         output
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|indices| {
                 let point = |index: u32| {
                     let index = index as usize;
@@ -692,7 +694,9 @@ mod tests {
     fn mesh_area_for_band(output: &PackedBands, band: u32) -> f64 {
         output
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .zip(output.triangle_band_indices.iter().copied())
             .filter(|(_, candidate)| *candidate == band)
             .map(|(indices, _)| {
@@ -757,7 +761,9 @@ mod tests {
         assert!((mesh_area(&output) - 2.0).abs() < 1.0e-6);
         let shared = output
             .vertices
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter(|point| (point[0] - 1.0).abs() < 1.0e-6)
             .count();
         assert!(shared < output.stats.output_triangles * 2);

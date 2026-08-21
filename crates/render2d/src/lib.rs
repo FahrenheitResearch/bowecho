@@ -5413,11 +5413,11 @@ mod tests {
     }
 
     fn has_visible_pixel(pixels: &[u8]) -> bool {
-        pixels.chunks_exact(4).any(|pixel| pixel[3] != 0)
+        pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0)
     }
 
     fn has_transparent_pixel(pixels: &[u8]) -> bool {
-        pixels.chunks_exact(4).any(|pixel| pixel[3] == 0)
+        pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0)
     }
 
     fn viewport_lookup_reference(

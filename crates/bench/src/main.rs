@@ -348,13 +348,13 @@ const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// remainder): identical buffers hash identically, and word folding is
 /// ~8x cheaper than byte-wise FNV on the ~27 MB hashed per iteration.
 fn fnv1a64_words(mut hash: u64, bytes: &[u8]) -> u64 {
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        let word = u64::from_le_bytes(chunk.try_into().expect("chunks_exact yields 8-byte chunks"));
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        let word = u64::from_le_bytes(*chunk);
         hash ^= word;
         hash = hash.wrapping_mul(FNV64_PRIME);
     }
-    for &byte in chunks.remainder() {
+    for &byte in remainder {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(FNV64_PRIME);
     }

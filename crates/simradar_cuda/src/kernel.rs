@@ -362,12 +362,12 @@ impl CudaLutExecutor {
             )
             .map_err(|error| driver_error("download CUDA segment output", error))?;
         output
-            .chunks_exact(CUDA_LUT_COMPONENT_COUNT)
+            .as_chunks::<CUDA_LUT_COMPONENT_COUNT>()
+            .0
+            .iter()
             .enumerate()
             .map(|(segment, values)| {
-                let components: [f64; CUDA_LUT_COMPONENT_COUNT] = values
-                    .try_into()
-                    .expect("CUDA output chunks have the declared component count");
+                let components = *values;
                 AdditiveScattering::from_components(components)
                     .map_err(|source| CudaSegmentExecutionError::InvalidOutput { segment, source })
             })

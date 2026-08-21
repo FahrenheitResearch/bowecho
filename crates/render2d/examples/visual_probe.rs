@@ -130,7 +130,7 @@ impl PixelStats {
             purple_like: 0,
             rf_purple_like: 0,
         };
-        for pixel in pixels.chunks_exact(4) {
+        for pixel in pixels.as_chunks::<4>().0 {
             let [red, green, blue, alpha] = [pixel[0], pixel[1], pixel[2], pixel[3]];
             if alpha == 0 {
                 continue;

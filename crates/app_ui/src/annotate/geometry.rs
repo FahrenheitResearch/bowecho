@@ -252,7 +252,7 @@ pub(crate) fn clip_line_to_polygon(a: Pos2, b: Pos2, poly: &[Pos2]) -> Vec<(Pos2
     }
     ts.sort_by(f32::total_cmp);
     let mut out = Vec::new();
-    for pair in ts.chunks_exact(2) {
+    for pair in ts.as_chunks::<2>().0 {
         if pair[1] - pair[0] > 1e-6 {
             out.push((a + d * pair[0], a + d * pair[1]));
         }

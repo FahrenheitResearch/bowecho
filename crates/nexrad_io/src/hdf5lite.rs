@@ -1258,12 +1258,14 @@ impl Datatype {
         match self.class {
             DtClass::Int { signed: false } if self.size == 1 => Ok(H5Data::U8(raw.to_vec())),
             DtClass::Int { signed: false } if self.size == 2 => Ok(H5Data::U16(
-                raw.chunks_exact(2)
+                raw.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| {
                         if self.big_endian {
-                            u16::from_be_bytes([pair[0], pair[1]])
+                            u16::from_be_bytes(*pair)
                         } else {
-                            u16::from_le_bytes([pair[0], pair[1]])
+                            u16::from_le_bytes(*pair)
                         }
                     })
                     .collect(),
@@ -1274,24 +1276,28 @@ impl Datatype {
                     .collect(),
             )),
             DtClass::Float if self.size == 4 => Ok(H5Data::F32(
-                raw.chunks_exact(4)
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|quad| {
                         let bits = if self.big_endian {
-                            u32::from_be_bytes(quad.try_into().expect("4 bytes"))
+                            u32::from_be_bytes(*quad)
                         } else {
-                            u32::from_le_bytes(quad.try_into().expect("4 bytes"))
+                            u32::from_le_bytes(*quad)
                         };
                         f32::from_bits(bits)
                     })
                     .collect(),
             )),
             DtClass::Float if self.size == 8 => Ok(H5Data::F64(
-                raw.chunks_exact(8)
+                raw.as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|oct| {
                         let bits = if self.big_endian {
-                            u64::from_be_bytes(oct.try_into().expect("8 bytes"))
+                            u64::from_be_bytes(*oct)
                         } else {
-                            u64::from_le_bytes(oct.try_into().expect("8 bytes"))
+                            u64::from_le_bytes(*oct)
                         };
                         f64::from_bits(bits)
                     })

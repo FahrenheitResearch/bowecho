@@ -2321,7 +2321,9 @@ fn parse_lat_lon_points(lines: &[&str]) -> Vec<HazardPoint> {
             .collect()
     } else {
         tokens
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter_map(|pair| {
                 let lat = parse_coordinate_hundredths(pair[0], false)?;
                 let lon = parse_coordinate_hundredths(pair[1], true)?;
@@ -3370,7 +3372,7 @@ pub(crate) fn filled_polygon_with_holes_mesh(
     for point in &points {
         mesh.colored_vertex(*point, fill);
     }
-    for triangle in triangles.chunks_exact(3) {
+    for triangle in triangles.as_chunks::<3>().0 {
         mesh.add_triangle(triangle[0] as u32, triangle[1] as u32, triangle[2] as u32);
     }
     Some(mesh)
@@ -3776,7 +3778,9 @@ fn triangulate_screen_polygon(points: &[egui::Pos2]) -> Option<Vec<[usize; 3]>> 
     }
     Some(
         triangles
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|triangle| [triangle[0], triangle[1], triangle[2]])
             .collect(),
     )
@@ -3993,7 +3997,7 @@ fn scanline_fill_meshes_with_limit(
         intervals.clear();
         for crossings in &mut crossings_by_ring {
             crossings.sort_by(|left, right| left.0.total_cmp(&right.0));
-            for pair in crossings.chunks_exact(2) {
+            for pair in crossings.as_chunks::<2>().0 {
                 intervals.push((pair[0].1, pair[1].1));
             }
         }
@@ -5228,7 +5232,9 @@ mod tests {
                 .iter()
                 .map(|mesh| {
                     mesh.indices
-                        .chunks_exact(3)
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
                         .filter(|triangle| {
                             let a = mesh.vertices[triangle[0] as usize].pos;
                             let b = mesh.vertices[triangle[1] as usize].pos;
@@ -5393,7 +5399,7 @@ mod tests {
             filled_polygon_with_holes_mesh(&outer, &holes, egui::Color32::from_rgb(255, 255, 0))
                 .expect("donut triangulates");
         let contains = |point: egui::Pos2| {
-            mesh.indices.chunks_exact(3).any(|triangle| {
+            mesh.indices.as_chunks::<3>().0.iter().any(|triangle| {
                 let a = mesh.vertices[triangle[0] as usize].pos;
                 let b = mesh.vertices[triangle[1] as usize].pos;
                 let c = mesh.vertices[triangle[2] as usize].pos;

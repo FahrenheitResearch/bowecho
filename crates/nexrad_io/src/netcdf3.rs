@@ -241,30 +241,40 @@ impl<'a> Cursor<'a> {
                 3 => {
                     let mut values = reserve_vec(nelems, "netCDF short attribute")?;
                     values.extend(
-                        raw.chunks_exact(2)
-                            .map(|pair| i64::from(i16::from_be_bytes([pair[0], pair[1]]))),
+                        raw.as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|pair| i64::from(i16::from_be_bytes(*pair))),
                     );
                     NcValue::Ints(values)
                 }
                 4 => {
                     let mut values = reserve_vec(nelems, "netCDF int attribute")?;
-                    values.extend(raw.chunks_exact(4).map(|quad| {
-                        i64::from(i32::from_be_bytes(quad.try_into().expect("4 bytes")))
-                    }));
+                    values.extend(
+                        raw.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|quad| i64::from(i32::from_be_bytes(*quad))),
+                    );
                     NcValue::Ints(values)
                 }
                 5 => {
                     let mut values = reserve_vec(nelems, "netCDF float attribute")?;
-                    values.extend(raw.chunks_exact(4).map(|quad| {
-                        f64::from(f32::from_be_bytes(quad.try_into().expect("4 bytes")))
-                    }));
+                    values.extend(
+                        raw.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|quad| f64::from(f32::from_be_bytes(*quad))),
+                    );
                     NcValue::Doubles(values)
                 }
                 6 => {
                     let mut values = reserve_vec(nelems, "netCDF double attribute")?;
                     values.extend(
-                        raw.chunks_exact(8)
-                            .map(|oct| f64::from_be_bytes(oct.try_into().expect("8 bytes"))),
+                        raw.as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|oct| f64::from_be_bytes(*oct)),
                     );
                     NcValue::Doubles(values)
                 }
@@ -555,32 +565,40 @@ fn decode_array(raw: &[u8], nc_type: u32) -> Result<NcArray> {
         3 => {
             let mut values = reserve_vec(raw.len() / 2, "netCDF i16 array")?;
             values.extend(
-                raw.chunks_exact(2)
-                    .map(|pair| i16::from_be_bytes([pair[0], pair[1]])),
+                raw.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| i16::from_be_bytes(*pair)),
             );
             NcArray::I16(values)
         }
         4 => {
             let mut values = reserve_vec(raw.len() / 4, "netCDF i32 array")?;
             values.extend(
-                raw.chunks_exact(4)
-                    .map(|quad| i32::from_be_bytes(quad.try_into().expect("4 bytes"))),
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|quad| i32::from_be_bytes(*quad)),
             );
             NcArray::I32(values)
         }
         5 => {
             let mut values = reserve_vec(raw.len() / 4, "netCDF f32 array")?;
             values.extend(
-                raw.chunks_exact(4)
-                    .map(|quad| f32::from_be_bytes(quad.try_into().expect("4 bytes"))),
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|quad| f32::from_be_bytes(*quad)),
             );
             NcArray::F32(values)
         }
         6 => {
             let mut values = reserve_vec(raw.len() / 8, "netCDF f64 array")?;
             values.extend(
-                raw.chunks_exact(8)
-                    .map(|oct| f64::from_be_bytes(oct.try_into().expect("8 bytes"))),
+                raw.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|oct| f64::from_be_bytes(*oct)),
             );
             NcArray::F64(values)
         }

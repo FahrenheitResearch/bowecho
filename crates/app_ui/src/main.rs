@@ -41051,7 +41051,7 @@ impl ViewerApp {
         // display-threshold clamp: the 3D transfer function is independent.
         let table = self.vol3d_color_table_for_product(product);
         let mut lut = vec![0u8; 256 * 4];
-        for (index, pixel) in lut.chunks_exact_mut(4).enumerate() {
+        for (index, pixel) in lut.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let fraction = index as f32 / 255.0;
             let value = value_min + (value_max - value_min) * fraction;
             pixel.copy_from_slice(&table.color_for_value(value));
@@ -43856,7 +43856,12 @@ impl ViewerApp {
 
         let table = self.color_tables.for_family(family);
         let mut rgba = vec![0u8; section.width * section.height * 4];
-        for (cell, value) in rgba.chunks_exact_mut(4).zip(section.values.iter()) {
+        for (cell, value) in rgba
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(section.values.iter())
+        {
             if value.is_finite() {
                 cell.copy_from_slice(&table.color_for_value(*value));
             }
@@ -51770,7 +51775,7 @@ struct SatMapSampleCtx<'a> {
 }
 
 fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
-    rgba.chunks_exact(4).all(|pixel| match pixel[3] {
+    rgba.as_chunks::<4>().0.iter().all(|pixel| match pixel[3] {
         0 => pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0,
         255 => true,
         _ => false,
@@ -73337,7 +73342,9 @@ mod tests {
         match shape {
             egui::Shape::Mesh(mesh) => mesh
                 .indices
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|triangle| {
                     [
                         mesh.vertices[triangle[0] as usize].pos,
@@ -73930,7 +73937,7 @@ mod tests {
     fn probe_draw_shape(image: &mut image::RgbaImage, shape: &egui::Shape) {
         match shape {
             egui::Shape::Mesh(mesh) => {
-                for triangle in mesh.indices.chunks_exact(3) {
+                for triangle in mesh.indices.as_chunks::<3>().0 {
                     let a = mesh.vertices[triangle[0] as usize];
                     let b = mesh.vertices[triangle[1] as usize];
                     let c = mesh.vertices[triangle[2] as usize];

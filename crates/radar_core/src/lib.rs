@@ -670,8 +670,10 @@ impl MomentGrid {
         };
 
         values.extend(
-            row.chunks_exact(2)
-                .map(|gate| u16::from_be_bytes([gate[0], gate[1]])),
+            row.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|gate| u16::from_be_bytes(*gate)),
         );
         if row_gate_count < self.gate_range.gate_count {
             values.resize(

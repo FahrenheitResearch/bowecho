@@ -572,7 +572,7 @@ pub(crate) fn load_repository_legacy_property_luts() -> Result<LegacyPropertyTMa
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Write as _};
+    use std::io::Cursor;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
