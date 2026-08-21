@@ -121,6 +121,7 @@ mod self_update;
 mod settings_persistence;
 mod settings_ui;
 mod sharppy_sounding;
+mod sidebar_layout;
 mod simradar_gate_inspector;
 mod simradar_truth_lab;
 mod simsat_hrrr;
@@ -661,7 +662,7 @@ const LOOP_SPEED_PERCENT_OPTIONS: &[u16] =
 const BACKGROUND_ACTIVITY_REPAINT_MS: u64 = 250;
 const SATELLITE_MAP_LAYER_HOVER: &str =
     "Render the current frame as a layer under the radar (opacity in Map)";
-const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Custom > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar (US or international, whichever is closer). When a loop is loaded, WSR-88D overlays auto-sync to that loop; international overlays refresh live on their provider cadence.";
+const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Map > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar (US or international, whichever is closer). When a loop is loaded, WSR-88D overlays auto-sync to that loop; international overlays refresh live on their provider cadence.";
 #[cfg(any(windows, test))]
 const SECURITY_UNSIGNED_BUILD_TEXT: &str = "Official Windows release binaries are Authenticode-signed (Azure Trusted Signing). Windows Defender or SmartScreen may still warn on unsigned local builds or renamed copies. Use official GitHub release assets when possible; do not whitelist random copies.";
 #[cfg(any(windows, test))]
@@ -3905,6 +3906,18 @@ struct ViewerApp {
     live_hazard_auto_refresh: bool,
     show_performance_stats: bool,
     sidebar_tab: SidebarTab,
+    /// Versioned section ordering/custom-tab document loaded from the opaque
+    /// settings value. Unknown future schemas are retained read-only.
+    sidebar_layout: sidebar_layout::LayoutDocument,
+    sidebar_layout_newer_schema: bool,
+    sidebar_layout_editor_target: sidebar_layout::EditorTarget,
+    /// Set only while a customized/custom tab renders one registered section.
+    /// Existing panel bodies consult it through `remembered_section` so they
+    /// can be reused without duplicating control behavior.
+    sidebar_section_render: Option<sidebar_layout::RenderContext>,
+    /// One-shot reveal for a workflow target hidden by a built-in override.
+    /// It never rewrites the user's visibility choices.
+    forced_sidebar_section: Option<sidebar_layout::SectionId>,
     /// Live-warning request cadence/attempt clock.
     last_live_hazard_refresh: Option<Instant>,
     /// Last fully successful live-warning final install. Archive/local loads
@@ -8842,18 +8855,30 @@ enum SidebarTab {
     Severe,
     Data,
     Settings,
+    Custom(u32),
 }
 
 impl SidebarTab {
+    fn from_builtin(tab: sidebar_layout::BuiltinTab) -> Self {
+        match tab {
+            sidebar_layout::BuiltinTab::Radar => Self::Radar,
+            sidebar_layout::BuiltinTab::Map => Self::Layers,
+            sidebar_layout::BuiltinTab::Alerts => Self::Severe,
+            sidebar_layout::BuiltinTab::Data => Self::Data,
+            sidebar_layout::BuiltinTab::Settings => Self::Settings,
+        }
+    }
+
     /// Stable settings slug for this tab — what `app_settings.sidebar_tab`
     /// stores so the active tab survives restarts (like `sidebar_width_pt`).
-    fn slug(self) -> &'static str {
+    fn slug(self) -> String {
         match self {
-            Self::Radar => "radar",
-            Self::Layers => "layers",
-            Self::Severe => "severe",
-            Self::Data => "data",
-            Self::Settings => "settings",
+            Self::Radar => "radar".to_owned(),
+            Self::Layers => "layers".to_owned(),
+            Self::Severe => "severe".to_owned(),
+            Self::Data => "data".to_owned(),
+            Self::Settings => "settings".to_owned(),
+            Self::Custom(id) => format!("custom:{id}"),
         }
     }
 
@@ -8866,7 +8891,11 @@ impl SidebarTab {
             "severe" => Some(Self::Severe),
             "data" => Some(Self::Data),
             "settings" => Some(Self::Settings),
-            _ => None,
+            custom => custom
+                .strip_prefix("custom:")
+                .and_then(|id| id.parse::<u32>().ok())
+                .filter(|id| *id != 0)
+                .map(Self::Custom),
         }
     }
 }
@@ -9382,6 +9411,7 @@ fn sidebar_tab_label(tab: SidebarTab, brand: &settings::BrandConfig) -> &str {
         SidebarTab::Severe => feature_label(&brand.features.warnings, "Severe", "Alerts"),
         SidebarTab::Data => "Data",
         SidebarTab::Settings => "⚙",
+        SidebarTab::Custom(_) => "Custom",
     }
 }
 
@@ -9389,7 +9419,7 @@ fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
     match tab {
         SidebarTab::Radar => "Site, products, tilt, loop, algorithms — live operations",
         SidebarTab::Layers => {
-            "Customization: map layers, added overlays, analysis overlays, radar age, and appearance/color tables"
+            "Map layers, added overlays, analysis overlays, radar age, and appearance/color tables"
         }
         SidebarTab::Severe => "Warnings, watches, MDs, SPC outlooks + reports, alert filters",
         SidebarTab::Data => {
@@ -9398,6 +9428,7 @@ fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
         SidebarTab::Settings => {
             "Settings: display, basemap, alerts, hotkeys, performance, diagnostics"
         }
+        SidebarTab::Custom(_) => "A user-created sidebar assembled from registered sections",
     }
 }
 
@@ -9744,6 +9775,8 @@ impl ViewerApp {
             loaded_styles.status.clone(),
             Instant::now(),
         );
+        let loaded_sidebar_layout =
+            sidebar_layout::LoadedLayout::load(app_settings.sidebar_layout_state.as_ref());
 
         let restored_model_keep_runs = app_settings.model_keep_runs;
         let restored_model_slug = app_settings.model_slug.clone();
@@ -10165,6 +10198,11 @@ impl ViewerApp {
             live_hazard_auto_refresh: restored_live_hazard_auto_refresh,
             show_performance_stats: false,
             sidebar_tab: SidebarTab::Radar,
+            sidebar_layout: loaded_sidebar_layout.document,
+            sidebar_layout_newer_schema: loaded_sidebar_layout.newer_schema,
+            sidebar_layout_editor_target: sidebar_layout::EditorTarget::default(),
+            sidebar_section_render: None,
+            forced_sidebar_section: None,
             last_live_hazard_refresh: None,
             last_successful_live_hazard_refresh: None,
             hazard_request_tracks_live_success: false,
@@ -10197,6 +10235,11 @@ impl ViewerApp {
         // empty/unknown slugs (older configs) keep the Radar default.
         app.sidebar_tab =
             SidebarTab::from_slug(&app.app_settings.sidebar_tab).unwrap_or(SidebarTab::Radar);
+        if let SidebarTab::Custom(id) = app.sidebar_tab
+            && app.sidebar_layout.custom_tab(id).is_none()
+        {
+            app.sidebar_tab = SidebarTab::Radar;
+        }
         app.bold_labels = restored_bold_labels;
         app.gate_filter_dbz = restored_gate_filter_dbz;
         app.swath.reflectivity.enabled = app.app_settings.overlay_max_ref_swath;
@@ -22017,7 +22060,7 @@ impl eframe::App for ViewerApp {
         // made while the chrome is hidden are not lost.
         let tab_slug = self.sidebar_tab.slug();
         if self.app_settings.sidebar_tab != tab_slug {
-            self.app_settings.sidebar_tab = tab_slug.to_owned();
+            self.app_settings.sidebar_tab = tab_slug;
             self.mark_app_settings_dirty();
         }
 
@@ -22384,7 +22427,7 @@ impl ViewerApp {
                     ui.menu_button(egui::RichText::new(label).strong().color(color), |ui| {
                         ui.set_min_width(330.0);
                         if fixed_action_button(ui, "Next", 58.0).clicked() {
-                            self.sidebar_tab = SidebarTab::Severe;
+                            self.reveal_sidebar_section(sidebar_layout::SectionId::AlertsCurrent);
                             if let Some(index) = self.first_unacknowledged_hazard_index() {
                                 self.focus_unacknowledged_hazard_record(index, ui.ctx());
                             }
@@ -22419,7 +22462,9 @@ impl ViewerApp {
                                             )
                                             .on_hover_text(&row.hover);
                                         if response.clicked() {
-                                            self.sidebar_tab = SidebarTab::Severe;
+                                            self.reveal_sidebar_section(
+                                                sidebar_layout::SectionId::AlertsCurrent,
+                                            );
                                             self.focus_unacknowledged_hazard_record(
                                                 row.index,
                                                 ui.ctx(),
@@ -22628,7 +22673,7 @@ impl ViewerApp {
                     DisplayProduct::Moment(MomentType::CorrelationCoefficient),
                     DisplayProduct::Moment(MomentType::DifferentialReflectivity),
                 ]);
-                self.sidebar_tab = SidebarTab::Severe;
+                self.reveal_sidebar_section(sidebar_layout::SectionId::AlertsCurrent);
                 self.hazards_visible = true;
                 self.hazards_active_only = true;
                 self.live_hazard_auto_refresh = true;
@@ -22668,7 +22713,7 @@ impl ViewerApp {
                 // armed for the sim-supercell couplets. Folds together the old
                 // Model context, Simulated radar, and Upper air presets.
                 self.set_workflow_layout(PanelLayout::TwoVertical);
-                self.sidebar_tab = SidebarTab::Data;
+                self.reveal_sidebar_section(sidebar_layout::SectionId::DataModelStore);
                 self.model_enabled = true;
                 self.open_viewer(dock::WorkspacePane::Model);
                 self.open_viewer(dock::WorkspacePane::Wrf);
@@ -22688,7 +22733,7 @@ impl ViewerApp {
                 // following the player, plus the tropical master and storm-cards
                 // panel. Folds together the old Satellite and Tropical presets.
                 self.set_workflow_layout(PanelLayout::One);
-                self.sidebar_tab = SidebarTab::Layers;
+                self.reveal_sidebar_section(sidebar_layout::SectionId::MapLayers);
                 self.open_viewer(dock::WorkspacePane::Satellite);
                 // Once a run loads, the map overlay tracks the player frame.
                 self.sat_map_follow = true;
@@ -22698,7 +22743,7 @@ impl ViewerApp {
             }
             WorkflowPreset::ArchiveReview => {
                 self.set_workflow_layout(PanelLayout::One);
-                self.sidebar_tab = SidebarTab::Data;
+                self.reveal_sidebar_section(sidebar_layout::SectionId::DataRadarArchive);
                 self.archive_load_loop = true;
                 self.archive_frame_count =
                     self.archive_frame_count.max(DEFAULT_ARCHIVE_FRAME_COUNT);
@@ -23034,7 +23079,7 @@ impl ViewerApp {
                 .clicked()
             {
                 self.app_settings.show_hurricane_hunters = true;
-                self.sidebar_tab = SidebarTab::Layers;
+                self.reveal_sidebar_section(sidebar_layout::SectionId::MapLayers);
                 self.mark_app_settings_dirty();
                 if let Some((latitude, longitude)) = self
                     .tropical
@@ -24738,52 +24783,146 @@ impl ViewerApp {
         ui.add_space(2.0);
         self.sidebar_tab_bar(ui);
         ui.separator();
+        let active = self.sidebar_tab;
+        let scroll_id = match active {
+            SidebarTab::Radar => "sidebar_radar_tab".to_owned(),
+            SidebarTab::Layers => "sidebar_custom_tab".to_owned(),
+            SidebarTab::Severe => "sidebar_hazards_tab".to_owned(),
+            SidebarTab::Data => "sidebar_archive_tab".to_owned(),
+            SidebarTab::Settings => "sidebar_settings_tab".to_owned(),
+            SidebarTab::Custom(id) => format!("sidebar_user_tab_{id}"),
+        };
+        egui::ScrollArea::vertical()
+            .id_salt(scroll_id)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.render_sidebar_tab_body(ui, ctx, active);
+            });
+    }
 
-        match self.sidebar_tab {
+    fn render_sidebar_tab_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tab: SidebarTab) {
+        match tab {
             SidebarTab::Radar => {
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_radar_tab")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.radar_controls_panel(ui, ctx);
-                    });
+                if self
+                    .sidebar_layout
+                    .builtin_is_customized(sidebar_layout::BuiltinTab::Radar)
+                {
+                    self.render_builtin_section_layout(ui, ctx, sidebar_layout::BuiltinTab::Radar);
+                } else if self.sidebar_layout.radar_preset() == sidebar_layout::RadarPreset::Compact
+                {
+                    self.radar_controls_panel_compact(ui, ctx);
+                } else {
+                    // Fresh and pre-layout settings intentionally return to
+                    // the v0.34.11 analyst surface. The body is current code,
+                    // so v0.34.13 scrubber/archive fixes remain present.
+                    self.radar_controls_panel_classic(ui, ctx);
+                }
             }
-            SidebarTab::Layers => {
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_custom_tab")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.customization_panel(ui, ctx);
-                    });
+            SidebarTab::Layers => self.render_builtin_or_default(
+                ui,
+                ctx,
+                sidebar_layout::BuiltinTab::Map,
+                |app, ui| app.customization_panel(ui, ctx),
+            ),
+            SidebarTab::Severe => self.render_builtin_or_default(
+                ui,
+                ctx,
+                sidebar_layout::BuiltinTab::Alerts,
+                |app, ui| app.hazard_panel(ui),
+            ),
+            SidebarTab::Data => self.render_builtin_or_default(
+                ui,
+                ctx,
+                sidebar_layout::BuiltinTab::Data,
+                |app, ui| app.data_panel(ui, ctx),
+            ),
+            SidebarTab::Settings => self.render_builtin_or_default(
+                ui,
+                ctx,
+                sidebar_layout::BuiltinTab::Settings,
+                |app, ui| app.settings_panel(ui, ctx),
+            ),
+            SidebarTab::Custom(id) => self.render_custom_sidebar_tab(ui, ctx, id),
+        }
+    }
+
+    fn render_builtin_or_default(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        tab: sidebar_layout::BuiltinTab,
+        default_body: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
+        if self.sidebar_layout.builtin_is_customized(tab) {
+            self.render_builtin_section_layout(ui, ctx, tab);
+        } else {
+            default_body(self, ui);
+        }
+    }
+
+    fn render_builtin_section_layout(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        tab: sidebar_layout::BuiltinTab,
+    ) {
+        let mut sections = self.sidebar_layout.resolved_builtin(tab);
+        let forced = self
+            .forced_sidebar_section
+            .filter(|section| section.spec().tab == tab);
+        if let Some(section) = forced
+            && !sections.contains(&section)
+        {
+            sections.push(section);
+        }
+        for section in sections {
+            self.render_registered_sidebar_section(
+                ui,
+                ctx,
+                section,
+                sidebar_layout::RenderScope::Builtin,
+            );
+        }
+        if forced.is_some() {
+            self.forced_sidebar_section = None;
+        }
+    }
+
+    fn render_custom_sidebar_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, id: u32) {
+        let Some(tab) = self.sidebar_layout.custom_tab(id).cloned() else {
+            ui.colored_label(
+                egui::Color32::from_rgb(244, 194, 92),
+                "This custom tab no longer exists.",
+            );
+            if ui.button("Return to Radar").clicked() {
+                self.sidebar_tab = SidebarTab::Radar;
             }
-            SidebarTab::Severe => {
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_hazards_tab")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.hazard_panel(ui);
-                    });
+            return;
+        };
+        if tab.sections.is_empty() {
+            ui.weak("This tab is empty. Add the sections you use most.");
+            if ui.button("Add sections...").clicked() {
+                self.sidebar_layout_editor_target = sidebar_layout::EditorTarget::Custom(id);
+                self.reveal_sidebar_section(sidebar_layout::SectionId::SettingsSidebarLayout);
             }
-            SidebarTab::Data => {
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_archive_tab")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.data_panel(ui, ctx);
-                    });
-            }
-            SidebarTab::Settings => {
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_settings_tab")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.settings_panel(ui, ctx);
-                    });
+            return;
+        }
+        for slug in tab.sections {
+            if let Some(section) = sidebar_layout::SectionId::from_slug(&slug) {
+                self.render_registered_sidebar_section(
+                    ui,
+                    ctx,
+                    section,
+                    sidebar_layout::RenderScope::Custom(id),
+                );
+            } else {
+                let key = format!("custom:{id}:unknown:{slug}");
+                let _ = panel_kit::section(ui, &key, "Unavailable section", true, |ui| {
+                    ui.weak(format!(
+                        "{slug} is not available in this BowEcho build. It remains saved for forward compatibility."
+                    ));
+                });
             }
         }
     }
@@ -24815,17 +24954,211 @@ impl ViewerApp {
     fn remembered_section<R>(
         &mut self,
         ui: &mut egui::Ui,
-        key: &'static str,
+        key: &str,
         label: &str,
         default_open: bool,
         body: impl FnOnce(&mut Self, &mut egui::Ui) -> R,
     ) -> Option<R> {
-        let open = self.section_open(key, default_open);
-        let response = panel_kit::section(ui, key, label, open, |ui| body(self, ui));
+        let rendered_key = if let Some(render) = self.sidebar_section_render {
+            if sidebar_layout::SectionId::from_legacy_key(key) != Some(render.section) {
+                return None;
+            }
+            match render.scope {
+                sidebar_layout::RenderScope::Builtin => key.to_owned(),
+                sidebar_layout::RenderScope::Custom(tab_id) => {
+                    sidebar_layout::custom_section_key(tab_id, render.section)
+                }
+            }
+        } else {
+            key.to_owned()
+        };
+        let open = self.section_open(&rendered_key, default_open);
+        let response = panel_kit::section(ui, &rendered_key, label, open, |ui| body(self, ui));
         if response.toggled {
-            self.set_section_open(key, !open);
+            self.set_section_open(&rendered_key, !open);
         }
         response.body
+    }
+
+    fn save_sidebar_layout(&mut self) {
+        if self.sidebar_layout_newer_schema {
+            return;
+        }
+        self.sidebar_layout.normalize();
+        self.app_settings.sidebar_layout_state = Some(self.sidebar_layout.to_value());
+        self.mark_app_settings_dirty();
+    }
+
+    fn reveal_sidebar_section(&mut self, section: sidebar_layout::SectionId) {
+        let spec = section.spec();
+        match self.sidebar_layout.destination_for(section) {
+            sidebar_layout::SectionDestination::Builtin => {
+                self.sidebar_tab = SidebarTab::from_builtin(spec.tab);
+                self.set_section_open(spec.legacy_key, true);
+            }
+            sidebar_layout::SectionDestination::Custom(id) => {
+                self.sidebar_tab = SidebarTab::Custom(id);
+                self.set_section_open(&sidebar_layout::custom_section_key(id, section), true);
+            }
+            sidebar_layout::SectionDestination::ForcedBuiltin => {
+                // The canonical placement is hidden and no custom placement
+                // exists. Reveal once without mutating the hidden list.
+                self.forced_sidebar_section = Some(section);
+                self.sidebar_tab = SidebarTab::from_builtin(spec.tab);
+                self.set_section_open(spec.legacy_key, true);
+            }
+        }
+    }
+
+    fn render_registered_sidebar_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        section: sidebar_layout::SectionId,
+        scope: sidebar_layout::RenderScope,
+    ) {
+        let previous = self
+            .sidebar_section_render
+            .replace(sidebar_layout::RenderContext { section, scope });
+        match section.spec().tab {
+            sidebar_layout::BuiltinTab::Radar => {
+                self.render_registered_radar_section(ui, ctx, section)
+            }
+            sidebar_layout::BuiltinTab::Map => self.customization_panel(ui, ctx),
+            sidebar_layout::BuiltinTab::Alerts => {
+                if section == sidebar_layout::SectionId::AlertsControls {
+                    let spec = section.spec();
+                    self.remembered_section(
+                        ui,
+                        spec.legacy_key,
+                        spec.title,
+                        spec.default_open,
+                        |app, ui| app.hazard_panel(ui),
+                    );
+                } else {
+                    self.hazard_panel(ui);
+                }
+            }
+            sidebar_layout::BuiltinTab::Data => self.data_panel(ui, ctx),
+            sidebar_layout::BuiltinTab::Settings => self.settings_panel(ui, ctx),
+        }
+        self.sidebar_section_render = previous;
+    }
+
+    fn render_registered_radar_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        section: sidebar_layout::SectionId,
+    ) {
+        use sidebar_layout::SectionId;
+
+        let editing_pane: Option<usize> = (self.grid_layout != PanelLayout::One
+            && self.active_pane >= 1
+            && self.active_pane - 1 < self.extra_panes.len())
+        .then(|| self.active_pane - 1);
+        let independent_pane = self.independent_editing_pane();
+        let spec = section.spec();
+        self.remembered_section(
+            ui,
+            spec.legacy_key,
+            spec.title,
+            spec.default_open,
+            |app, ui| match section {
+                SectionId::RadarWorkspace => {
+                    app.radar_pane_layout_controls(ui, ctx, editing_pane, independent_pane);
+                }
+                SectionId::RadarPlayback => app.frame_history_panel(ui, ctx),
+                SectionId::RadarSite => app.radar_site_section_body(ui, independent_pane),
+                SectionId::RadarAlgorithms => app.radar_algorithms_section_body(ui, ctx),
+                SectionId::RadarTools => app.radar_tools_section_body(ui, ctx),
+                SectionId::RadarProducts | SectionId::RadarTilts => {
+                    let editing_product = editing_pane
+                        .map(|slot| app.extra_panes[slot].product.clone())
+                        .unwrap_or_else(|| app.selected_product.clone());
+                    let editing_cut = editing_pane
+                        .and_then(|slot| app.extra_panes[slot].cut)
+                        .unwrap_or(app.selected_cut);
+                    let active_volume = editing_pane
+                        .and_then(|slot| {
+                            app.extra_panes
+                                .get(slot)
+                                .and_then(|pane| pane.volume.clone())
+                        })
+                        .or_else(|| app.volume.clone());
+                    let Some(volume) = active_volume else {
+                        ui.weak("Load a radar volume to use this section.");
+                        return;
+                    };
+                    let effective_cut =
+                        best_cut_for_product(&volume, editing_cut, &editing_product)
+                            .unwrap_or(editing_cut);
+                    let product_buttons = app
+                        .displayable_products_for_picker(&volume)
+                        .into_iter()
+                        .filter(|product| {
+                            product_visible_in_picker(product, app.unfold_velocity_display)
+                        })
+                        .map(|product| {
+                            let target_cut = if editing_pane.is_none() {
+                                app.preferred_primary_cut_for_product_switch(&volume, &product)
+                            } else {
+                                advanced_product_source_cut(&volume, effective_cut, &product)
+                                    .or_else(|| {
+                                        cut_for_user_product_switch(
+                                            &volume,
+                                            effective_cut,
+                                            &product,
+                                        )
+                                    })
+                            };
+                            (product, target_cut)
+                        })
+                        .collect::<Vec<_>>();
+                    if section == SectionId::RadarProducts {
+                        app.radar_products_section_body(
+                            ui,
+                            ctx,
+                            editing_pane,
+                            &editing_product,
+                            &volume,
+                            &product_buttons,
+                        );
+                    } else {
+                        let selected_frame_status = editing_pane
+                            .map_or(app.displayed_primary_frame_status, |slot| {
+                                app.extra_panes[slot].displayed_frame_status
+                            });
+                        let total = volume.cuts.len();
+                        let cut_rows = volume
+                            .cuts
+                            .iter()
+                            .enumerate()
+                            .map(|(index, cut)| TiltCutRow {
+                                index,
+                                total,
+                                elevation_deg: cut.elevation_deg,
+                                radial_count: cut.radials.len(),
+                                start_time_utc: cut_start_time_utc(&volume, index),
+                                selected: index == effective_cut,
+                                product_compatible: is_displayable_on_cut(
+                                    &volume,
+                                    index,
+                                    &editing_product,
+                                ),
+                                state: tilt_completion_state_for_displayed_frame(
+                                    selected_frame_status,
+                                    cut,
+                                    &volume.site.id,
+                                ),
+                            })
+                            .collect::<Vec<_>>();
+                        app.radar_tilt_section_body(ui, ctx, editing_pane, &cut_rows);
+                    }
+                }
+                _ => unreachable!("non-Radar section routed to Radar renderer"),
+            },
+        );
     }
 
     fn active_appearance_profile(&self) -> AppearanceProfile {
@@ -25038,6 +25371,51 @@ impl ViewerApp {
                 let response = response.on_hover_text(sidebar_tab_tooltip(*tab));
                 if response.clicked() {
                     self.sidebar_tab = *tab;
+                }
+            }
+        });
+        let custom_tabs = self
+            .sidebar_layout
+            .custom_tabs
+            .iter()
+            .map(|tab| (tab.id, tab.title.clone()))
+            .collect::<Vec<_>>();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
+            for (id, title) in custom_tabs {
+                let selected = self.sidebar_tab == SidebarTab::Custom(id);
+                let response = ui
+                    .add_sized(
+                        egui::vec2(
+                            (title.chars().count() as f32 * 7.0 + 20.0).clamp(72.0, 136.0),
+                            PANEL_BUTTON_HEIGHT,
+                        ),
+                        egui::Button::selectable(selected, &title),
+                    )
+                    .on_hover_text(format!("Open custom tab: {title}"));
+                if response.clicked() {
+                    self.sidebar_tab = SidebarTab::Custom(id);
+                }
+            }
+            let create = ui
+                .add_sized(
+                    egui::vec2(54.0, PANEL_BUTTON_HEIGHT),
+                    egui::Button::new("+ Tab"),
+                )
+                .on_hover_text("Create a custom tab from any sidebar sections");
+            if create.clicked() {
+                if self.sidebar_layout_newer_schema {
+                    self.reveal_sidebar_section(sidebar_layout::SectionId::SettingsSidebarLayout);
+                } else if let Some(id) = self.sidebar_layout.create_custom_tab() {
+                    self.sidebar_layout_editor_target = sidebar_layout::EditorTarget::Custom(id);
+                    self.save_sidebar_layout();
+                    self.sidebar_tab = SidebarTab::Custom(id);
+                } else {
+                    self.status = format!(
+                        "Custom tab limit reached ({})",
+                        sidebar_layout::MAX_CUSTOM_TABS
+                    );
+                    self.reveal_sidebar_section(sidebar_layout::SectionId::SettingsSidebarLayout);
                 }
             }
         });
@@ -26771,7 +27149,7 @@ impl ViewerApp {
         }
     }
 
-    fn radar_controls_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn radar_controls_panel_compact(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // The sidebar edits the focused pane. Keep the basic workflow stable
         // and short; the full analyst surface remains in Advanced below.
         let editing_pane: Option<usize> = (self.grid_layout != PanelLayout::One
@@ -26879,11 +27257,11 @@ impl ViewerApp {
         if ui
             .link(format!("Map & appearance: {layer_count} layers >"))
             .on_hover_text(
-                "Open the Custom tab for map layers, overlays, and the full color-table manager",
+                "Open the Map tab for map layers, overlays, and the full color-table manager",
             )
             .clicked()
         {
-            self.sidebar_tab = SidebarTab::Layers;
+            self.reveal_sidebar_section(sidebar_layout::SectionId::MapAppearance);
         }
 
         panel_kit::ruled_subgroup(ui, "Advanced", |_| {});
@@ -26947,8 +27325,7 @@ impl ViewerApp {
         );
     }
 
-    #[allow(dead_code)]
-    fn radar_controls_panel_legacy(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn radar_controls_panel_classic(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // The sidebar edits the FOCUSED pane: the main pane (or 1x1) edits the
         // shared state everyone follows; a focused extra pane edits itself.
         // (Volume-free — hoisted above the volume gate.)
@@ -27045,17 +27422,17 @@ impl ViewerApp {
             app.frame_history_panel(ui, ctx);
         });
 
-        // Layer/customization state lives in the Custom tab now; RADAR
+        // Layer/customization state lives in the Map tab now; RADAR
         // keeps a one-line link-row so the count stays visible from ops.
         let layer_count = self.rail_layer_count();
         if ui
-            .link(format!("Custom: {layer_count} layers >"))
+            .link(format!("Map: {layer_count} layers >"))
             .on_hover_text(
-                "Open the Custom tab: map layers, added overlays, analysis overlays, and appearance/color tables",
+                "Open the Map tab: map layers, added overlays, analysis overlays, and appearance/color tables",
             )
             .clicked()
         {
-            self.sidebar_tab = SidebarTab::Layers;
+            self.reveal_sidebar_section(sidebar_layout::SectionId::MapLayers);
         }
 
         // Everything below genuinely needs a loaded volume (the status line
@@ -28725,9 +29102,9 @@ impl ViewerApp {
     }
 
     fn request_color_table_manager(&mut self, family: ColorTableFamily) {
-        self.sidebar_tab = SidebarTab::Layers;
         self.color_table_target = family;
         self.open_color_tables_request = true;
+        self.reveal_sidebar_section(sidebar_layout::SectionId::MapAppearance);
     }
 
     /// The top bar's "vX.Y.Z available" chip lands here: jump to the ⚙
@@ -28735,8 +29112,8 @@ impl ViewerApp {
     /// next render — that is where the in-app updater (Install update /
     /// Open releases / Check now) lives.
     fn request_update_settings(&mut self) {
-        self.sidebar_tab = SidebarTab::Settings;
         self.open_update_section_request = true;
+        self.reveal_sidebar_section(sidebar_layout::SectionId::SettingsSecurityUpdates);
     }
 
     fn active_product_color_picker(
@@ -42502,8 +42879,7 @@ impl ViewerApp {
             lead: self.storm_follow_lead,
         };
         self.storm_track_follow = Some(follow);
-        self.sidebar_tab = SidebarTab::Radar;
-        self.set_section_open("radar_algorithms", true);
+        self.reveal_sidebar_section(sidebar_layout::SectionId::RadarAlgorithms);
         let follow_label = self
             .apply_storm_track_camera_follow_for_current_frame(ctx)
             .unwrap_or_else(|| format!("following storm #{}", hit.track_id));
@@ -50995,8 +51371,13 @@ mod tests {
     #[test]
     fn sidebar_tab_slugs_round_trip_and_unknown_falls_back_to_none() {
         for tab in SIDEBAR_TABS {
-            assert_eq!(SidebarTab::from_slug(tab.slug()), Some(*tab));
+            assert_eq!(SidebarTab::from_slug(&tab.slug()), Some(*tab));
         }
+        assert_eq!(
+            SidebarTab::from_slug("custom:42"),
+            Some(SidebarTab::Custom(42))
+        );
+        assert_eq!(SidebarTab::Custom(42).slug(), "custom:42");
         // Empty (older configs) and unknown/wrong-case slugs restore Radar
         // via the `.unwrap_or(SidebarTab::Radar)` at the construction seam.
         assert_eq!(SidebarTab::from_slug(""), None);
@@ -74084,6 +74465,11 @@ mod tests {
             live_hazard_auto_refresh: false,
             show_performance_stats: false,
             sidebar_tab: SidebarTab::Radar,
+            sidebar_layout: sidebar_layout::LayoutDocument::default(),
+            sidebar_layout_newer_schema: false,
+            sidebar_layout_editor_target: sidebar_layout::EditorTarget::default(),
+            sidebar_section_render: None,
+            forced_sidebar_section: None,
             last_live_hazard_refresh: None,
             last_successful_live_hazard_refresh: None,
             hazard_request_tracks_live_success: false,

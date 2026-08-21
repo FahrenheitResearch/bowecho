@@ -2258,7 +2258,9 @@ impl ViewerApp {
             self.open_update_section_request = false;
             self.set_section_open("settings_security_updates", true);
         }
-        if let Some(persistence) = self.settings_persistence.status_view(Instant::now()) {
+        if self.sidebar_section_render.is_none()
+            && let Some(persistence) = self.settings_persistence.status_view(Instant::now())
+        {
             let color = match persistence.level {
                 settings_persistence::PersistenceNoticeLevel::Success => {
                     egui::Color32::from_rgb(108, 218, 142)
@@ -2276,6 +2278,13 @@ impl ViewerApp {
         self.remembered_section(ui, "settings_display", "Display", true, |app, ui| {
             app.display_settings_section(ui, ctx);
         });
+        self.remembered_section(
+            ui,
+            "settings_sidebar_layout",
+            "Sidebar & custom tabs",
+            false,
+            |app, ui| app.sidebar_layout_settings_section(ui),
+        );
         self.remembered_section(
             ui,
             "settings_radar_products",
@@ -2367,6 +2376,330 @@ impl ViewerApp {
         self.remembered_section(ui, "settings_model", "Model", false, |app, ui| {
             app.model_settings_section(ui, ctx);
         });
+    }
+
+    fn sidebar_layout_settings_section(&mut self, ui: &mut egui::Ui) {
+        use sidebar_layout::{BuiltinTab, EditorTarget, RadarPreset, SECTION_SPECS};
+
+        if self.sidebar_layout_newer_schema {
+            panel_kit::status_block(
+                ui,
+                "Sidebar layout was written by a newer BowEcho",
+                Some(
+                    "It is preserved read-only. Built-in tabs use the safe Classic defaults until this build is upgraded or you explicitly reset the layout.",
+                ),
+            );
+            if ui
+                .button("Reset newer layout")
+                .on_hover_text(
+                    "Replace the preserved newer layout with this build's Classic defaults",
+                )
+                .clicked()
+            {
+                self.sidebar_layout = sidebar_layout::LayoutDocument::default();
+                self.sidebar_layout_newer_schema = false;
+                self.app_settings.sidebar_layout_state = Some(self.sidebar_layout.to_value());
+                self.sidebar_tab = SidebarTab::Radar;
+                self.sidebar_layout_editor_target = EditorTarget::default();
+                self.mark_app_settings_dirty();
+            }
+            return;
+        }
+
+        let mut edited = self.sidebar_layout.clone();
+        let mut target = self.sidebar_layout_editor_target;
+
+        panel_kit::row(ui, "Radar default", |ui| {
+            let mut preset = edited.radar_preset();
+            egui::ComboBox::from_id_salt("radar_sidebar_preset")
+                .selected_text(match preset {
+                    RadarPreset::Classic => "Classic analyst",
+                    RadarPreset::Compact => "Compact",
+                })
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut preset, RadarPreset::Classic, "Classic analyst")
+                        .on_hover_text(
+                            "The pre-v0.34.12 layout: full Playback, Products, Tilt, Site, Algorithms, and Tools sections",
+                        );
+                    ui.selectable_value(&mut preset, RadarPreset::Compact, "Compact")
+                        .on_hover_text(
+                            "The optional minimal quick-control experiment with advanced controls folded below",
+                        );
+                });
+            edited.set_radar_preset(preset);
+        });
+        ui.weak("Classic is the default for fresh and upgraded installs. A customized Radar order overrides the preset until restored.");
+
+        panel_kit::row(ui, "Edit", |ui| {
+            let selected_text = match target {
+                EditorTarget::Builtin(tab) => tab.label().to_owned(),
+                EditorTarget::Custom(id) => edited
+                    .custom_tab(id)
+                    .map(|tab| tab.title.clone())
+                    .unwrap_or_else(|| "Missing custom tab".to_owned()),
+            };
+            egui::ComboBox::from_id_salt("sidebar_layout_editor_target")
+                .selected_text(selected_text)
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    ui.strong("Built-in tabs");
+                    for tab in BuiltinTab::ALL {
+                        ui.selectable_value(&mut target, EditorTarget::Builtin(tab), tab.label());
+                    }
+                    if !edited.custom_tabs.is_empty() {
+                        ui.separator();
+                        ui.strong("Custom tabs");
+                    }
+                    for custom in &edited.custom_tabs {
+                        ui.selectable_value(
+                            &mut target,
+                            EditorTarget::Custom(custom.id),
+                            &custom.title,
+                        );
+                    }
+                });
+        });
+
+        match target {
+            EditorTarget::Builtin(tab) => {
+                let default_order = SECTION_SPECS
+                    .iter()
+                    .filter(|spec| spec.tab == tab)
+                    .map(|spec| spec.slug.to_owned())
+                    .collect::<Vec<_>>();
+                let mut layout = edited.builtins.get(tab.slug()).cloned().unwrap_or_else(|| {
+                    sidebar_layout::BuiltinLayout {
+                        order: default_order.clone(),
+                        hidden: Vec::new(),
+                    }
+                });
+                for slug in &default_order {
+                    if !layout.order.contains(slug) {
+                        layout.order.push(slug.clone());
+                    }
+                }
+                let mut move_action = None;
+                let mut visibility_changed = false;
+                for (index, slug) in layout.order.clone().iter().enumerate() {
+                    let Some(section) = sidebar_layout::SectionId::from_slug(slug) else {
+                        continue;
+                    };
+                    let spec = section.spec();
+                    if spec.tab != tab {
+                        continue;
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let mut shown = !layout.hidden.iter().any(|hidden| hidden == slug);
+                        if ui.checkbox(&mut shown, spec.title).changed() {
+                            layout.hidden.retain(|hidden| hidden != slug);
+                            if !shown {
+                                layout.hidden.push(slug.clone());
+                            }
+                            visibility_changed = true;
+                        }
+                        if ui
+                            .add_enabled(index > 0, egui::Button::new("↑"))
+                            .on_hover_text("Move section up")
+                            .clicked()
+                        {
+                            move_action = Some((index, index - 1));
+                        }
+                        if ui
+                            .add_enabled(index + 1 < layout.order.len(), egui::Button::new("↓"))
+                            .on_hover_text("Move section down")
+                            .clicked()
+                        {
+                            move_action = Some((index, index + 1));
+                        }
+                    });
+                }
+                if let Some((from, to)) = move_action {
+                    layout.order.swap(from, to);
+                }
+                if move_action.is_some() || visibility_changed {
+                    edited.builtins.insert(tab.slug().to_owned(), layout);
+                }
+                if ui
+                    .button("Restore this tab's default")
+                    .on_hover_text("Restore shipped order and visibility; future new sections remain automatic")
+                    .clicked()
+                {
+                    edited.builtins.remove(tab.slug());
+                }
+            }
+            EditorTarget::Custom(id) => {
+                let Some(index) = edited.custom_tabs.iter().position(|tab| tab.id == id) else {
+                    target = EditorTarget::Builtin(BuiltinTab::Radar);
+                    self.sidebar_layout_editor_target = target;
+                    return;
+                };
+                let mut custom = edited.custom_tabs[index].clone();
+                panel_kit::row(ui, "Tab name", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut custom.title)
+                            .desired_width(160.0)
+                            .char_limit(32),
+                    );
+                });
+
+                let mut tab_action = None;
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(index > 0, egui::Button::new("Move tab left"))
+                        .clicked()
+                    {
+                        tab_action = Some("left");
+                    }
+                    if ui
+                        .add_enabled(
+                            index + 1 < edited.custom_tabs.len(),
+                            egui::Button::new("Move tab right"),
+                        )
+                        .clicked()
+                    {
+                        tab_action = Some("right");
+                    }
+                    if ui
+                        .add_enabled(
+                            edited.custom_tabs.len() < sidebar_layout::MAX_CUSTOM_TABS,
+                            egui::Button::new("Duplicate"),
+                        )
+                        .clicked()
+                    {
+                        tab_action = Some("duplicate");
+                    }
+                    if ui.button("Delete tab").clicked() {
+                        tab_action = Some("delete");
+                    }
+                });
+
+                ui.separator();
+                ui.strong("Chosen sections");
+                if custom.sections.is_empty() {
+                    ui.weak("No sections yet. Choose them below.");
+                }
+                let mut section_action = None;
+                for (section_index, slug) in custom.sections.iter().enumerate() {
+                    let title = sidebar_layout::SectionId::from_slug(slug)
+                        .map(|section| section.spec().title)
+                        .unwrap_or("Unavailable section");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(egui::Label::new(title).truncate())
+                            .on_hover_text(slug);
+                        if ui
+                            .add_enabled(section_index > 0, egui::Button::new("↑"))
+                            .on_hover_text("Move section up")
+                            .clicked()
+                        {
+                            section_action = Some((section_index, -1_i8));
+                        }
+                        if ui
+                            .add_enabled(
+                                section_index + 1 < custom.sections.len(),
+                                egui::Button::new("↓"),
+                            )
+                            .on_hover_text("Move section down")
+                            .clicked()
+                        {
+                            section_action = Some((section_index, 1_i8));
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            section_action = Some((section_index, 0_i8));
+                        }
+                    });
+                }
+                if let Some((section_index, direction)) = section_action {
+                    if direction == 0 {
+                        custom.sections.remove(section_index);
+                    } else {
+                        let other = if direction < 0 {
+                            section_index - 1
+                        } else {
+                            section_index + 1
+                        };
+                        custom.sections.swap(section_index, other);
+                    }
+                }
+
+                ui.separator();
+                ui.strong("Add sections");
+                for category in BuiltinTab::ALL {
+                    ui.collapsing(category.label(), |ui| {
+                        for spec in SECTION_SPECS.iter().filter(|spec| spec.tab == category) {
+                            // The editor section itself remains reachable from
+                            // the fixed +Tab affordance; allowing it in a custom
+                            // tab is useful and does not recursively render.
+                            let mut chosen = custom.sections.iter().any(|slug| slug == spec.slug);
+                            let enabled = chosen
+                                || custom.sections.len() < sidebar_layout::MAX_CUSTOM_SECTIONS;
+                            if ui
+                                .add_enabled(enabled, egui::Checkbox::new(&mut chosen, spec.title))
+                                .changed()
+                            {
+                                if chosen {
+                                    custom.sections.push(spec.slug.to_owned());
+                                } else {
+                                    custom.sections.retain(|slug| slug != spec.slug);
+                                }
+                            }
+                        }
+                    });
+                }
+
+                edited.custom_tabs[index] = custom;
+                match tab_action {
+                    Some("left") => edited.custom_tabs.swap(index, index - 1),
+                    Some("right") => edited.custom_tabs.swap(index, index + 1),
+                    Some("duplicate") => {
+                        let mut duplicate = edited.custom_tabs[index].clone();
+                        duplicate.id = edited.next_custom_id();
+                        duplicate.title = format!("{} copy", duplicate.title);
+                        let new_id = duplicate.id;
+                        edited.custom_tabs.insert(index + 1, duplicate);
+                        target = EditorTarget::Custom(new_id);
+                    }
+                    Some("delete") => {
+                        edited.custom_tabs.remove(index);
+                        if self.sidebar_tab == SidebarTab::Custom(id) {
+                            self.sidebar_tab = SidebarTab::Radar;
+                        }
+                        target = EditorTarget::Builtin(BuiltinTab::Radar);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    edited.custom_tabs.len() < sidebar_layout::MAX_CUSTOM_TABS,
+                    egui::Button::new("Create custom tab"),
+                )
+                .clicked()
+                && let Some(id) = edited.create_custom_tab()
+            {
+                target = EditorTarget::Custom(id);
+            }
+            if ui
+                .button("Reset all sidebar layout")
+                .on_hover_text("Remove custom tabs and restore every built-in tab and the Classic Radar preset")
+                .clicked()
+            {
+                edited = sidebar_layout::LayoutDocument::default();
+                target = EditorTarget::Builtin(BuiltinTab::Radar);
+                self.sidebar_tab = SidebarTab::Radar;
+            }
+        });
+
+        edited.normalize();
+        self.sidebar_layout_editor_target = target;
+        if edited != self.sidebar_layout {
+            self.sidebar_layout = edited;
+            self.save_sidebar_layout();
+        }
     }
 
     /// Settings ▸ Model — the settings-class controls evicted from the

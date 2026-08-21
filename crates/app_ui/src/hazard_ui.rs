@@ -7,253 +7,269 @@ use crate::*;
 
 impl ViewerApp {
     pub(crate) fn hazard_panel(&mut self, ui: &mut egui::Ui) {
-        let mut source_changed = false;
-        panel_kit::row(ui, "Source", |ui| {
-            let mut mode =
-                meteoalarm::WarningSourceMode::from_key(&self.app_settings.warning_source);
-            egui::ComboBox::from_id_salt("live_warning_source")
-                .selected_text(mode.label())
-                .width(174.0)
-                .show_ui(ui, |ui| {
-                    for option in meteoalarm::WarningSourceMode::ALL {
-                        ui.selectable_value(&mut mode, option, option.label());
-                    }
-                });
-            if mode.key() != self.app_settings.warning_source {
-                self.app_settings.warning_source = mode.key().to_owned();
-                source_changed = true;
-            }
-        });
-
-        let mode = meteoalarm::WarningSourceMode::from_key(&self.app_settings.warning_source);
-        let radar_country = data_source::sites::resolve(&self.display_owner_site())
-            .and_then(|site| meteoalarm::country_feed_for_label(&site.country));
-        if mode == meteoalarm::WarningSourceMode::Europe {
-            panel_kit::row(ui, "Country", |ui| {
-                let selected =
-                    meteoalarm::country_feed_by_slug(self.app_settings.meteoalarm_country.trim());
-                let selected_label = selected
-                    .map(|country| country.label)
-                    .unwrap_or("Auto (radar country)");
-                egui::ComboBox::from_id_salt("meteoalarm_country")
-                    .selected_text(selected_label)
-                    .width(174.0)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(selected.is_none(), "Auto (radar country)")
-                            .clicked()
-                        {
-                            self.app_settings.meteoalarm_country = "auto".to_owned();
-                            source_changed = true;
-                        }
-                        for country in meteoalarm::COUNTRY_FEEDS {
-                            if ui
-                                .selectable_label(selected == Some(*country), country.label)
-                                .clicked()
-                            {
-                                self.app_settings.meteoalarm_country = country.slug.to_owned();
-                                source_changed = true;
-                            }
-                        }
-                    });
-            });
-        } else if mode == meteoalarm::WarningSourceMode::Auto
-            && let Some(country) = radar_country
-        {
-            ui.weak(format!("Auto source: MeteoAlarm {}", country.label));
-        }
-        if source_changed {
-            self.mark_app_settings_dirty();
-            self.reload_warning_source(ui.ctx());
-            return;
-        }
-
-        let resolved_source = self.resolved_warning_source();
-        if let meteoalarm::ResolvedWarningSource::Unavailable(reason) = &resolved_source {
-            panel_kit::status_block(
-                ui,
-                reason,
-                Some("Change Source above, or select a radar in the matching warning network."),
-            );
-            return;
-        }
-        let europe_list_only = matches!(
-            resolved_source,
+        let rendered_section = self.sidebar_section_render.map(|render| render.section);
+        let show_controls = rendered_section.is_none()
+            || rendered_section == Some(sidebar_layout::SectionId::AlertsControls);
+        let mut europe_list_only = matches!(
+            self.resolved_warning_source(),
             meteoalarm::ResolvedWarningSource::MeteoAlarm(_)
         );
-        if europe_list_only {
-            panel_kit::status_block(
-                ui,
-                "Official MeteoAlarm country warnings · list and details",
-                Some(
-                    "MeteoAlarm's anonymous Atom/CAP feed carries area names and region codes but no public polygon geometry. BowEcho does not invent placement, so these entries are intentionally not drawn on the map.",
-                ),
-            );
-            ui.weak("Data provided by EUMETNET members via MeteoAlarm · CC BY 4.0.");
-            ui.horizontal_wrapped(|ui| {
-                ui.hyperlink_to("Official MeteoAlarm feeds", "https://feeds.meteoalarm.org/");
-                ui.weak("·");
-                ui.hyperlink_to(
-                    "CC BY 4.0 license",
-                    "https://creativecommons.org/licenses/by/4.0/",
-                );
+        if show_controls {
+            let mut source_changed = false;
+            panel_kit::row(ui, "Source", |ui| {
+                let mut mode =
+                    meteoalarm::WarningSourceMode::from_key(&self.app_settings.warning_source);
+                egui::ComboBox::from_id_salt("live_warning_source")
+                    .selected_text(mode.label())
+                    .width(174.0)
+                    .show_ui(ui, |ui| {
+                        for option in meteoalarm::WarningSourceMode::ALL {
+                            ui.selectable_value(&mut mode, option, option.label());
+                        }
+                    });
+                if mode.key() != self.app_settings.warning_source {
+                    self.app_settings.warning_source = mode.key().to_owned();
+                    source_changed = true;
+                }
             });
-        }
 
-        // Wrapped rather than a kit row: these live controls must fit the
-        // narrow sidebar. Map geometry controls are NWS-only; active/refresh
-        // semantics apply to both sources.
-        let mut startup_defaults_changed = false;
-        ui.horizontal_wrapped(|ui| {
-            if !europe_list_only {
+            let mode = meteoalarm::WarningSourceMode::from_key(&self.app_settings.warning_source);
+            let radar_country = data_source::sites::resolve(&self.display_owner_site())
+                .and_then(|site| meteoalarm::country_feed_for_label(&site.country));
+            if mode == meteoalarm::WarningSourceMode::Europe {
+                panel_kit::row(ui, "Country", |ui| {
+                    let selected = meteoalarm::country_feed_by_slug(
+                        self.app_settings.meteoalarm_country.trim(),
+                    );
+                    let selected_label = selected
+                        .map(|country| country.label)
+                        .unwrap_or("Auto (radar country)");
+                    egui::ComboBox::from_id_salt("meteoalarm_country")
+                        .selected_text(selected_label)
+                        .width(174.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(selected.is_none(), "Auto (radar country)")
+                                .clicked()
+                            {
+                                self.app_settings.meteoalarm_country = "auto".to_owned();
+                                source_changed = true;
+                            }
+                            for country in meteoalarm::COUNTRY_FEEDS {
+                                if ui
+                                    .selectable_label(selected == Some(*country), country.label)
+                                    .clicked()
+                                {
+                                    self.app_settings.meteoalarm_country = country.slug.to_owned();
+                                    source_changed = true;
+                                }
+                            }
+                        });
+                });
+            } else if mode == meteoalarm::WarningSourceMode::Auto
+                && let Some(country) = radar_country
+            {
+                ui.weak(format!("Auto source: MeteoAlarm {}", country.label));
+            }
+            if source_changed {
+                self.mark_app_settings_dirty();
+                self.reload_warning_source(ui.ctx());
+                return;
+            }
+
+            let resolved_source = self.resolved_warning_source();
+            if let meteoalarm::ResolvedWarningSource::Unavailable(reason) = &resolved_source {
+                panel_kit::status_block(
+                    ui,
+                    reason,
+                    Some("Change Source above, or select a radar in the matching warning network."),
+                );
+                return;
+            }
+            europe_list_only = matches!(
+                resolved_source,
+                meteoalarm::ResolvedWarningSource::MeteoAlarm(_)
+            );
+            if europe_list_only {
+                panel_kit::status_block(
+                    ui,
+                    "Official MeteoAlarm country warnings · list and details",
+                    Some(
+                        "MeteoAlarm's anonymous Atom/CAP feed carries area names and region codes but no public polygon geometry. BowEcho does not invent placement, so these entries are intentionally not drawn on the map.",
+                    ),
+                );
+                ui.weak("Data provided by EUMETNET members via MeteoAlarm · CC BY 4.0.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to("Official MeteoAlarm feeds", "https://feeds.meteoalarm.org/");
+                    ui.weak("·");
+                    ui.hyperlink_to(
+                        "CC BY 4.0 license",
+                        "https://creativecommons.org/licenses/by/4.0/",
+                    );
+                });
+            }
+
+            // Wrapped rather than a kit row: these live controls must fit the
+            // narrow sidebar. Map geometry controls are NWS-only; active/refresh
+            // semantics apply to both sources.
+            let mut startup_defaults_changed = false;
+            ui.horizontal_wrapped(|ui| {
+                if !europe_list_only {
+                    if ui
+                        .checkbox(&mut self.hazards_visible, "Show on map")
+                        .on_hover_text("Draw NWS warning polygons on the map")
+                        .changed()
+                    {
+                        startup_defaults_changed = true;
+                    }
+                    let mut show_labels = self.app_settings.show_hazard_labels;
+                    if ui
+                        .checkbox(&mut show_labels, "Labels")
+                        .on_hover_text("Draw compact warning labels such as SVR 0653 on the map")
+                        .changed()
+                    {
+                        self.app_settings.show_hazard_labels = show_labels;
+                        self.mark_app_settings_dirty();
+                        ui.ctx().request_repaint();
+                    }
+                }
                 if ui
-                    .checkbox(&mut self.hazards_visible, "Show on map")
-                    .on_hover_text("Draw NWS warning polygons on the map")
+                    .checkbox(&mut self.hazards_active_only, "Active only")
+                    .on_hover_text("Hide expired/cancelled alerts")
                     .changed()
                 {
                     startup_defaults_changed = true;
                 }
-                let mut show_labels = self.app_settings.show_hazard_labels;
                 if ui
-                    .checkbox(&mut show_labels, "Labels")
-                    .on_hover_text("Draw compact warning labels such as SVR 0653 on the map")
+                    .checkbox(&mut self.live_hazard_auto_refresh, "Auto-refresh")
+                    .on_hover_text("Re-fetch active alerts on the live cadence")
                     .changed()
                 {
-                    self.app_settings.show_hazard_labels = show_labels;
-                    self.mark_app_settings_dirty();
+                    startup_defaults_changed = true;
+                }
+            });
+            if startup_defaults_changed {
+                self.persist_hazard_panel_settings();
+            }
+            if !europe_list_only {
+                // Family filters as a kit chip grid: selected = shown on the map
+                // and in the list; the hidden-family set is the same state the
+                // checkboxes used to edit.
+                let family_chips = HAZARD_FILTER_FAMILIES
+                    .iter()
+                    .map(|&(family, label)| panel_kit::Chip {
+                        label,
+                        hotkey: None,
+                        selected: !self.hidden_hazard_families.contains(family),
+                        enabled: true,
+                        hover: Some(format!("Show {family} alerts on the map and in the list")),
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(clicked) = panel_kit::chip_grid(ui, &family_chips) {
+                    let (family, _) = HAZARD_FILTER_FAMILIES[clicked];
+                    if !self.hidden_hazard_families.remove(family) {
+                        self.hidden_hazard_families.insert(family.to_owned());
+                    }
+                    self.persist_hazard_panel_settings();
+                    if self
+                        .selected_hazard_record()
+                        .is_some_and(|record| !self.hazard_record_visible(record))
+                    {
+                        self.selected_hazard_index = None;
+                    }
                     ui.ctx().request_repaint();
                 }
-            }
-            if ui
-                .checkbox(&mut self.hazards_active_only, "Active only")
-                .on_hover_text("Hide expired/cancelled alerts")
-                .changed()
-            {
-                startup_defaults_changed = true;
-            }
-            if ui
-                .checkbox(&mut self.live_hazard_auto_refresh, "Auto-refresh")
-                .on_hover_text("Re-fetch active alerts on the live cadence")
-                .changed()
-            {
-                startup_defaults_changed = true;
-            }
-        });
-        if startup_defaults_changed {
-            self.persist_hazard_panel_settings();
-        }
-        if !europe_list_only {
-            // Family filters as a kit chip grid: selected = shown on the map
-            // and in the list; the hidden-family set is the same state the
-            // checkboxes used to edit.
-            let family_chips = HAZARD_FILTER_FAMILIES
-                .iter()
-                .map(|&(family, label)| panel_kit::Chip {
-                    label,
-                    hotkey: None,
-                    selected: !self.hidden_hazard_families.contains(family),
-                    enabled: true,
-                    hover: Some(format!("Show {family} alerts on the map and in the list")),
-                })
-                .collect::<Vec<_>>();
-            if let Some(clicked) = panel_kit::chip_grid(ui, &family_chips) {
-                let (family, _) = HAZARD_FILTER_FAMILIES[clicked];
-                if !self.hidden_hazard_families.remove(family) {
-                    self.hidden_hazard_families.insert(family.to_owned());
-                }
-                self.persist_hazard_panel_settings();
-                if self
-                    .selected_hazard_record()
-                    .is_some_and(|record| !self.hazard_record_visible(record))
-                {
-                    self.selected_hazard_index = None;
-                }
-                ui.ctx().request_repaint();
-            }
-            ui.weak("Watch types");
-            let watch_parent_visible = !self.hidden_hazard_families.contains("watch");
-            let watch_chips = HAZARD_WATCH_FILTERS
-                .iter()
-                .map(|&(watch_type, label)| panel_kit::Chip {
-                    label,
-                    hotkey: None,
-                    selected: (watch_parent_visible || watch_type == "pds")
-                        && !self
-                            .app_settings
-                            .hidden_hazard_watch_types
-                            .iter()
-                            .any(|hidden| hidden.eq_ignore_ascii_case(watch_type)),
-                    enabled: true,
-                    hover: Some(if watch_type == "pds" {
-                        "Show PDS watches even when the general Watch family is hidden".to_owned()
-                    } else {
-                        format!("Show {label} polygons")
-                    }),
-                })
-                .collect::<Vec<_>>();
-            if let Some(clicked) = panel_kit::chip_grid(ui, &watch_chips) {
-                let watch_type = HAZARD_WATCH_FILTERS[clicked].0;
-                if !watch_parent_visible && watch_type != "pds" {
-                    self.hidden_hazard_families.remove("watch");
-                    self.app_settings
-                        .hidden_hazard_watch_types
-                        .retain(|hidden| !hidden.eq_ignore_ascii_case(watch_type));
-                    self.persist_hazard_panel_settings();
-                } else if let Some(index) = self
-                    .app_settings
-                    .hidden_hazard_watch_types
+                ui.weak("Watch types");
+                let watch_parent_visible = !self.hidden_hazard_families.contains("watch");
+                let watch_chips = HAZARD_WATCH_FILTERS
                     .iter()
-                    .position(|hidden| hidden.eq_ignore_ascii_case(watch_type))
-                {
-                    self.app_settings.hidden_hazard_watch_types.remove(index);
-                    self.mark_app_settings_dirty();
-                } else {
-                    self.app_settings
+                    .map(|&(watch_type, label)| panel_kit::Chip {
+                        label,
+                        hotkey: None,
+                        selected: (watch_parent_visible || watch_type == "pds")
+                            && !self
+                                .app_settings
+                                .hidden_hazard_watch_types
+                                .iter()
+                                .any(|hidden| hidden.eq_ignore_ascii_case(watch_type)),
+                        enabled: true,
+                        hover: Some(if watch_type == "pds" {
+                            "Show PDS watches even when the general Watch family is hidden"
+                                .to_owned()
+                        } else {
+                            format!("Show {label} polygons")
+                        }),
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(clicked) = panel_kit::chip_grid(ui, &watch_chips) {
+                    let watch_type = HAZARD_WATCH_FILTERS[clicked].0;
+                    if !watch_parent_visible && watch_type != "pds" {
+                        self.hidden_hazard_families.remove("watch");
+                        self.app_settings
+                            .hidden_hazard_watch_types
+                            .retain(|hidden| !hidden.eq_ignore_ascii_case(watch_type));
+                        self.persist_hazard_panel_settings();
+                    } else if let Some(index) = self
+                        .app_settings
                         .hidden_hazard_watch_types
-                        .push(watch_type.to_owned());
-                    self.mark_app_settings_dirty();
+                        .iter()
+                        .position(|hidden| hidden.eq_ignore_ascii_case(watch_type))
+                    {
+                        self.app_settings.hidden_hazard_watch_types.remove(index);
+                        self.mark_app_settings_dirty();
+                    } else {
+                        self.app_settings
+                            .hidden_hazard_watch_types
+                            .push(watch_type.to_owned());
+                        self.mark_app_settings_dirty();
+                    }
+                    ui.ctx().request_repaint();
                 }
-                ui.ctx().request_repaint();
-            }
-            // The ordinary fill slider is authoritative for every family;
-            // per-family alpha remains available in Appearance for advanced
-            // customization after this global control is used.
-            let mut fill_alpha = self.style_registry.hazard_global().fill_alpha as f32;
-            let fill_response =
-                panel_kit::slider_row(ui, "All fills", &mut fill_alpha, 0.0..=80.0, 0.0, |value| {
-                    format!("{value:.0}")
-                })
+                // The ordinary fill slider is authoritative for every family;
+                // per-family alpha remains available in Appearance for advanced
+                // customization after this global control is used.
+                let mut fill_alpha = self.style_registry.hazard_global().fill_alpha as f32;
+                let fill_response = panel_kit::slider_row(
+                    ui,
+                    "All fills",
+                    &mut fill_alpha,
+                    0.0..=80.0,
+                    0.0,
+                    |value| format!("{value:.0}"),
+                )
                 .on_hover_text(
                     "Set warning-polygon fill opacity for every family (0 disables fills)",
                 );
-            if fill_response.changed() {
-                self.set_all_hazard_fill_alpha(fill_alpha.round() as u8);
-                ui.ctx().request_repaint();
+                if fill_response.changed() {
+                    self.set_all_hazard_fill_alpha(fill_alpha.round() as u8);
+                    ui.ctx().request_repaint();
+                }
+                if fill_response.drag_stopped()
+                    || (fill_response.changed() && !fill_response.dragged())
+                {
+                    self.save_styles();
+                }
             }
-            if fill_response.drag_stopped() || (fill_response.changed() && !fill_response.dragged())
-            {
-                self.save_styles();
-            }
+            ui.horizontal(|ui| {
+                let loading = self.hazard_receiver.is_some();
+                if fixed_action_button(ui, "Refresh Live", 96.0).clicked() && !loading {
+                    self.refresh_live_hazards_manually(ui.ctx());
+                }
+                if fixed_action_button(ui, "Clear", 52.0).clicked() {
+                    self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
+                    self.invalidate_hazard_record_metadata_cache();
+                    self.hazard_overlay = None;
+                    self.completed_live_hazard_overlay = None;
+                    self.selected_hazard_index = None;
+                    self.unacknowledged_hazard_event_ids.clear();
+                    self.hazard_status = if europe_list_only {
+                        "No MeteoAlarm warning entries loaded".to_owned()
+                    } else {
+                        "No hazard polygons loaded".to_owned()
+                    };
+                }
+            });
         }
-        ui.horizontal(|ui| {
-            let loading = self.hazard_receiver.is_some();
-            if fixed_action_button(ui, "Refresh Live", 96.0).clicked() && !loading {
-                self.refresh_live_hazards_manually(ui.ctx());
-            }
-            if fixed_action_button(ui, "Clear", 52.0).clicked() {
-                self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
-                self.invalidate_hazard_record_metadata_cache();
-                self.hazard_overlay = None;
-                self.completed_live_hazard_overlay = None;
-                self.selected_hazard_index = None;
-                self.unacknowledged_hazard_event_ids.clear();
-                self.hazard_status = if europe_list_only {
-                    "No MeteoAlarm warning entries loaded".to_owned()
-                } else {
-                    "No hazard polygons loaded".to_owned()
-                };
-            }
-        });
 
         self.remembered_section(
             ui,
@@ -456,48 +472,51 @@ impl ViewerApp {
             },
         );
 
-        if let Some(record) = self.selected_hazard_record() {
-            ui.add_space(6.0);
-            egui::CollapsingHeader::new("Selected alert text")
-                .id_salt("hazard_selected_alert_text")
-                .default_open(true)
-                .show(ui, |ui| {
-                    let detail_lines = hazard_record_detail_lines(record);
-                    fixed_height_scroll(
-                        ui,
-                        "hazard_detail_text",
-                        HAZARD_DETAIL_SCROLL_HEIGHT,
-                        |ui| {
-                            for line in &detail_lines {
-                                wrapped_label(ui, line);
-                            }
-                        },
-                    );
-                    spc_md_image::show(
-                        ui,
-                        &record.event_family,
-                        record.source_url.as_deref(),
-                        &record.event_id,
-                    );
-                    if meteoalarm::is_meteoalarm_record(record)
-                        && let Some(source_url) = record.source_url.as_deref()
-                    {
-                        ui.hyperlink_to("Open official CAP warning", source_url);
+        if rendered_section.is_none()
+            || rendered_section == Some(sidebar_layout::SectionId::AlertsCurrent)
+        {
+            if let Some(record) = self.selected_hazard_record() {
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("Selected alert text")
+                    .id_salt("hazard_selected_alert_text")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let detail_lines = hazard_record_detail_lines(record);
+                        fixed_height_scroll(
+                            ui,
+                            "hazard_detail_text",
+                            HAZARD_DETAIL_SCROLL_HEIGHT,
+                            |ui| {
+                                for line in &detail_lines {
+                                    wrapped_label(ui, line);
+                                }
+                            },
+                        );
+                        spc_md_image::show(
+                            ui,
+                            &record.event_family,
+                            record.source_url.as_deref(),
+                            &record.event_id,
+                        );
+                        if meteoalarm::is_meteoalarm_record(record)
+                            && let Some(source_url) = record.source_url.as_deref()
+                        {
+                            ui.hyperlink_to("Open official CAP warning", source_url);
+                        }
+                    });
+            }
+            let summary_lines = self.hazard_summary_lines();
+            fixed_height_scroll(
+                ui,
+                "hazard_summary_text",
+                HAZARD_SUMMARY_SCROLL_HEIGHT,
+                |ui| {
+                    for line in &summary_lines {
+                        wrapped_label(ui, line);
                     }
-                });
+                },
+            );
         }
-
-        let summary_lines = self.hazard_summary_lines();
-        fixed_height_scroll(
-            ui,
-            "hazard_summary_text",
-            HAZARD_SUMMARY_SCROLL_HEIGHT,
-            |ui| {
-                for line in &summary_lines {
-                    wrapped_label(ui, line);
-                }
-            },
-        );
 
         // SPC OUTLOOKS — config consolidated here from the layer rail (spec
         // §1 SEVERE table); the rail's SPC rows' ⚙ jumps to this section.
@@ -1126,7 +1145,7 @@ impl ViewerApp {
             .is_some_and(|record| record.event_family == "mesoscale discussion");
         self.select_hazard_index(index);
         if opens_alert_details {
-            self.sidebar_tab = SidebarTab::Severe;
+            self.reveal_sidebar_section(sidebar_layout::SectionId::AlertsCurrent);
             self.sidebar_hidden = false;
         }
     }
@@ -1473,7 +1492,7 @@ impl ViewerApp {
         }
         if let Some(index) = details_index {
             self.select_hazard_index(index);
-            self.sidebar_tab = SidebarTab::Severe;
+            self.reveal_sidebar_section(sidebar_layout::SectionId::AlertsCurrent);
             self.sidebar_hidden = false;
         }
         ctx.request_repaint_after(Duration::from_secs(1));

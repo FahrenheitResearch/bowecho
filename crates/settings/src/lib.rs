@@ -1426,6 +1426,13 @@ pub struct AppSettings {
     /// so `AppSettings` stays UI-crate-free, like `units`/`time_zone`.
     #[serde(default)]
     pub sidebar_tab: String,
+    /// Versioned sidebar-layout document owned by `app_ui`: the Radar preset,
+    /// per-built-in ordering/visibility overrides, and bounded user-created
+    /// tabs.  Keeping it opaque here avoids coupling settings persistence to
+    /// egui or the app's section registry. `None` is the pre-customization
+    /// format and resolves to the classic pre-v0.34.12 Radar layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_layout_state: Option<serde_json::Value>,
     /// Chrome theme slug: "slate" (the default) or "graphite". Both v0.30
     /// theme candidates ship as user options (Settings > Display > Theme).
     /// Parsed via `ThemeChoice::from_slug` at use sites (app_ui/ui_theme.rs)
@@ -1914,6 +1921,7 @@ impl Default for AppSettings {
             sidebar_section_open: BTreeMap::new(),
             sidebar_width_pt: None,
             sidebar_tab: String::new(),
+            sidebar_layout_state: None,
             ui_theme: String::new(),
             floating_window_accent_rgb: None,
             sat_ir_enhancement: default_sat_ir_enhancement(),
@@ -3438,6 +3446,27 @@ mod tests {
         let back = AppSettings::from_json(&settings.to_json());
 
         assert_eq!(back.sidebar_tab, "severe");
+    }
+
+    #[test]
+    fn sidebar_layout_state_defaults_absent_and_round_trips_opaquely() {
+        assert_eq!(AppSettings::from_json("{}").sidebar_layout_state, None);
+
+        let document = serde_json::json!({
+            "version": 1,
+            "radar_preset": "classic",
+            "custom_tabs": [{
+                "id": 7,
+                "title": "Storm Desk",
+                "sections": ["radar.playback", "alerts.current"]
+            }]
+        });
+        let settings = AppSettings {
+            sidebar_layout_state: Some(document.clone()),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+        assert_eq!(back.sidebar_layout_state, Some(document));
     }
 
     #[test]
