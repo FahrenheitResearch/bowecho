@@ -646,7 +646,6 @@ impl Profile {
         if !target_pres.is_finite() || target_pres <= 0.0 {
             return f64::NAN;
         }
-        let log_target = target_pres.ln();
 
         // Find the bounding levels.  pres is descending, so walk until we
         // pass below target_pres.
@@ -657,12 +656,25 @@ impl Profile {
             if !p0.is_finite() || !p1.is_finite() {
                 continue;
             }
-            if target_pres <= p0 && target_pres >= p1 {
-                let f0 = field[i];
-                let f1 = field[i + 1];
+            let f0 = field[i];
+            let f1 = field[i + 1];
+            // Height -> pressure round trips use exp(ln(p)). At an exact
+            // native level that can land a few ulps outside the profile
+            // (for example 950 hPa becomes 950.0000000000001), which used to
+            // make an otherwise valid surface wind look out of bounds and
+            // turn exact-layer helicity into NaN. Preserve native endpoints
+            // exactly before applying the ordinary range check.
+            if (target_pres - p0).abs() < TOL {
+                return if f0.is_finite() { f0 } else { f64::NAN };
+            }
+            if (target_pres - p1).abs() < TOL {
+                return if f1.is_finite() { f1 } else { f64::NAN };
+            }
+            if target_pres < p0 && target_pres > p1 {
                 if !f0.is_finite() || !f1.is_finite() {
                     return f64::NAN;
                 }
+                let log_target = target_pres.ln();
                 let lp0 = p0.ln();
                 let lp1 = p1.ln();
                 let denom = lp0 - lp1;
@@ -725,6 +737,15 @@ impl Profile {
             }
             if (target_hght >= h0 && target_hght <= h1) || (target_hght <= h0 && target_hght >= h1)
             {
+                // Do not round-trip an exact native endpoint through
+                // exp(ln(p)): an outward one-ulp result is outside the valid
+                // pressure range and breaks downstream wind interpolation.
+                if (target_hght - h0).abs() < TOL {
+                    return p0;
+                }
+                if (target_hght - h1).abs() < TOL {
+                    return p1;
+                }
                 let dh = h1 - h0;
                 if dh.abs() < TOL {
                     return p0;
@@ -1287,6 +1308,43 @@ mod tests {
         let h = prof.interp_hght(775.0);
         let p = prof.pres_at_height(h);
         assert!((p - 775.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn native_height_pressure_wind_roundtrip_keeps_exact_endpoints() {
+        // These pressures deliberately include values for which exp(ln(p))
+        // rounds upward. Before the endpoint guard, a 950-hPa surface became
+        // 950.0000000000001 hPa and interp_wind rejected it as out of range.
+        let pres = [950.0, 850.0, 775.0, 650.0, 500.0, 300.0];
+        let hght = [650.0, 1500.0, 2300.0, 3800.0, 5700.0, 9200.0];
+        let tmpc = [24.0, 17.0, 10.0, 0.0, -18.0, -42.0];
+        let dwpc = [18.0, 12.0, 5.0, -8.0, -30.0, -50.0];
+        let u = [5.0, 10.0, 15.0, 22.0, 30.0, 38.0];
+        let v = [8.0, 12.0, 16.0, 20.0, 24.0, 28.0];
+        let prof = Profile::from_uv(
+            &pres,
+            &hght,
+            &tmpc,
+            &dwpc,
+            &u,
+            &v,
+            &[],
+            StationInfo::default(),
+        )
+        .unwrap();
+
+        for i in 0..prof.num_levels() {
+            let pressure = prof.pres_at_height(prof.hght[i]);
+            assert_eq!(pressure, prof.pres[i], "native pressure at level {i}");
+            let (roundtrip_u, roundtrip_v) = prof.interp_wind(pressure);
+            assert_eq!(roundtrip_u, prof.u[i], "u wind at level {i}");
+            assert_eq!(roundtrip_v, prof.v[i], "v wind at level {i}");
+        }
+
+        // Defense in depth: tolerate the outward one-ulp pressure directly,
+        // even when it did not come through pres_at_height.
+        let (surface_u, surface_v) = prof.interp_wind(950.0000000000001);
+        assert_eq!((surface_u, surface_v), (prof.u[0], prof.v[0]));
     }
 
     #[test]

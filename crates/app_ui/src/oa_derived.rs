@@ -302,14 +302,15 @@ const SPECS: &[CompositeSpec] = &[
         "SCP",
         "",
         "Composite Indices",
-        Some("scp_mu_0_3km_0_6km_proxy"),
+        // This is the full effective-layer SCP, not the fixed 0-3/0-6 proxy.
+        Some("scp"),
         (0.0, 20.0),
     ),
     spec(
         "STP (CIN)",
         "",
         "Composite Indices",
-        Some("stp_fixed"),
+        Some("stp_effective"),
         (0.0, 8.0),
     ),
     spec(
@@ -338,14 +339,17 @@ const SPECS: &[CompositeSpec] = &[
         "Eff SRH",
         "m²/s²",
         "Wind Shear",
-        Some("srh_0_3km"),
+        // No production palette currently carries effective-layer semantics;
+        // falling back is more honest than labeling this fixed 0-3 km SRH.
+        None,
         (0.0, 600.0),
     ),
     spec(
         "Eff bulk shear",
         "kt",
         "Wind Shear",
-        Some("bulk_shear_0_6km"),
+        // EBWD is inflow base -> half-depth to the MU EL, not fixed 0-6 km.
+        None,
         (0.0, 80.0),
     ),
     spec(
@@ -1168,6 +1172,18 @@ mod tests {
         let fields = composite_pass(&inputs, 1, &progress);
         assert_eq!(fields.len(), SPECS.len());
         assert_eq!(fields[0].name, "SCP", "legacy auto-show index 0");
+        let style_slug = |name: &str| {
+            fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing field {name}"))
+                .style_slug
+        };
+        assert_eq!(style_slug("SCP"), Some("scp"));
+        assert_eq!(style_slug("STP (CIN)"), Some("stp_effective"));
+        assert_eq!(style_slug("STP (fixed)"), Some("stp_fixed"));
+        assert_eq!(style_slug("Eff SRH"), None);
+        assert_eq!(style_slug("Eff bulk shear"), None);
         let mut names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         names.sort_unstable();
         names.dedup();
@@ -1602,6 +1618,23 @@ mod tests {
             oracle.right_esrh,
             TOL,
         );
+        check("SCP", p.scp.unwrap_or(f64::NAN), dv.right_scp, TOL);
+        check("STP (CIN)", p.stp_cin.unwrap_or(f64::NAN), dv.stp_cin, TOL);
+        // sharppyrs does not publish VTP as a DerivedParams field. Build its
+        // oracle value from the sounding window's parcel, effective SRH,
+        // EBWD, and lapse-rate outputs, then compare the OA compositor's final
+        // product rather than merely asserting that it is nonzero.
+        let oracle_vtp = sharprs::params::composites::vtp_mod(
+            oracle.mlpcl.bplus,
+            oracle.right_esrh,
+            oracle_ebwd_kt * KT_TO_MS,
+            oracle.mlpcl.lclhght,
+            oracle.mlpcl.bminus,
+            oracle.mlpcl.b3km,
+            dv.lapserate_700_500,
+        )
+        .unwrap_or(f64::NAN);
+        check("VTP", p.vtp_mod.unwrap_or(f64::NAN), oracle_vtp, TOL);
 
         assert!(
             bad.is_empty(),
@@ -1638,5 +1671,26 @@ mod tests {
                 "{name} must be positive on this supercell column, got {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn effective_composite_cutoff_edges_are_pinned() {
+        use sharprs::params::composites;
+
+        let scp_below = composites::scp(3000.0, 200.0, 10.0 - 1e-6).unwrap();
+        let scp_at = composites::scp(3000.0, 200.0, 10.0).unwrap();
+        assert_eq!(scp_below, 0.0, "SCP must be zero below 10 m/s EBWD");
+        assert!(scp_at > 0.0, "SCP turns on at 10 m/s EBWD");
+
+        let stp_below = composites::stp_cin(2000.0, 200.0, 12.5 - 1e-6, 900.0, -30.0).unwrap();
+        let stp_at = composites::stp_cin(2000.0, 200.0, 12.5, 900.0, -30.0).unwrap();
+        assert_eq!(stp_below, 0.0, "STP(CIN) must be zero below 12.5 m/s EBWD");
+        assert!(stp_at > 0.0, "STP(CIN) turns on at 12.5 m/s EBWD");
+
+        let vtp_at = composites::vtp_mod(1700.0, 250.0, 20.0, 1000.0, -50.0, 50.0, 6.5).unwrap();
+        let vtp_above =
+            composites::vtp_mod(1700.0, 250.0, 20.0 + 1e-6, 1000.0, -50.0, 50.0, 6.5).unwrap();
+        assert_eq!(vtp_at, 0.0, "VTP remains zero at 20 m/s EBWD");
+        assert!(vtp_above > 0.0, "VTP turns on above 20 m/s EBWD");
     }
 }

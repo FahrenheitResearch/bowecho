@@ -124,6 +124,8 @@ pub struct ComputedParams {
 
     // -- Effective inflow layer --
     pub eff_inflow: (f64, f64),
+    /// Cyclonic effective SRH magnitude (m2/s2): right-mover in the Northern
+    /// Hemisphere, sign-normalized left-mover in the Southern Hemisphere.
     pub effective_srh: Option<f64>,
     /// Bulk shear across the effective inflow layer itself (base -> top), m/s.
     /// SHARPpy labels this "Eff Inflow" in the shear table.
@@ -226,6 +228,43 @@ impl Default for EcapeParcelParams {
     }
 }
 
+#[inline]
+fn southern_hemisphere(profile: &Profile) -> bool {
+    profile.station.latitude.is_finite() && profile.station.latitude < 0.0
+}
+
+/// Select the cyclonic Bunkers mover for the station's hemisphere while
+/// retaining both raw right/left vectors in [`ComputedParams`] for display.
+#[inline]
+fn cyclonic_storm_motion(
+    profile: &Profile,
+    rstu: f64,
+    rstv: f64,
+    lstu: f64,
+    lstv: f64,
+) -> (f64, f64) {
+    if southern_hemisphere(profile) {
+        (lstu, lstv)
+    } else {
+        (rstu, rstv)
+    }
+}
+
+/// Express helicity in a cyclonic-positive coordinate system. A mirrored
+/// Southern Hemisphere hodograph has negative raw total/segments, so swap and
+/// negate the signed buckets as well as the total.
+#[inline]
+fn cyclonic_helicity(
+    profile: &Profile,
+    (total, positive, negative): (f64, f64, f64),
+) -> (f64, f64, f64) {
+    if southern_hemisphere(profile) {
+        (-total, -negative, -positive)
+    } else {
+        (total, positive, negative)
+    }
+}
+
 /// Compute all derived sounding parameters from a profile.
 ///
 /// This is the single entry point that calls into every analysis module.
@@ -254,12 +293,13 @@ pub fn compute_all_params(profile: &Profile) -> ComputedParams {
 
     // -- Effective inflow layer --
     let eff_inflow = cape::effective_inflow_layer(&cape_prof, 100.0, -250.0, Some(&mupcl));
+    let has_effective_inflow = eff_inflow.0.is_finite() && eff_inflow.1.is_finite();
 
     // -- Storm motion --
     // SHARPpy's ConvectiveProfile takes the parcel-based Bunkers motion
     // whenever an effective inflow layer exists, and only falls back to the
     // fixed SFC-6 km method when it does not.
-    let (rstu, rstv, lstu, lstv) = if eff_inflow.0.is_finite() && eff_inflow.1.is_finite() {
+    let (rstu, rstv, lstu, lstv) = if has_effective_inflow {
         winds::bunkers_storm_motion(profile, &mupcl, eff_inflow.0)
     } else {
         winds::non_parcel_bunkers_motion(profile).unwrap_or((
@@ -269,22 +309,29 @@ pub fn compute_all_params(profile: &Profile) -> ComputedParams {
             f64::NAN,
         ))
     };
+    let (storm_u, storm_v) = cyclonic_storm_motion(profile, rstu, rstv, lstu, lstv);
 
     // -- Corfidi vectors --
     let (corfidi_up_u, corfidi_up_v, corfidi_dn_u, corfidi_dn_v) =
         winds::corfidi_mcs_motion(profile).unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN));
 
     // -- Helicity --
-    let srh01 = winds::helicity(profile, 0.0, 1000.0, rstu, rstv, -1.0, true).unwrap_or((
-        f64::NAN,
-        f64::NAN,
-        f64::NAN,
-    ));
-    let srh03 = winds::helicity(profile, 0.0, 3000.0, rstu, rstv, -1.0, true).unwrap_or((
-        f64::NAN,
-        f64::NAN,
-        f64::NAN,
-    ));
+    let srh01 = cyclonic_helicity(
+        profile,
+        winds::helicity(profile, 0.0, 1000.0, storm_u, storm_v, -1.0, true).unwrap_or((
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        )),
+    );
+    let srh03 = cyclonic_helicity(
+        profile,
+        winds::helicity(profile, 0.0, 3000.0, storm_u, storm_v, -1.0, true).unwrap_or((
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        )),
+    );
 
     // -- Shear --
     let p_sfc = profile.sfc_pressure();
@@ -304,9 +351,9 @@ pub fn compute_all_params(profile: &Profile) -> ComputedParams {
     // zero-thickness layer); demanding a strictly positive depth turned those
     // cells into holes on the composite grid.
     let effective_srh = if eff_bot_h.is_finite() && eff_top_h.is_finite() {
-        winds::helicity(profile, eff_bot_h, eff_top_h, rstu, rstv, -1.0, true)
+        winds::helicity(profile, eff_bot_h, eff_top_h, storm_u, storm_v, -1.0, true)
             .ok()
-            .map(|value| value.0)
+            .map(|value| cyclonic_helicity(profile, value).0)
     } else {
         None
     };
@@ -319,7 +366,7 @@ pub fn compute_all_params(profile: &Profile) -> ComputedParams {
     //     equilibrium level.  EBWD — not the inflow-layer shear — is the term
     //     SCP, STP(CIN) and VTP multiply through, and their 10 / 12.5 m/s
     //     cutoffs zero the whole composite when it is understated.
-    let (eff_shear, effective_bwd) = if eff_inflow.0.is_finite() && eff_inflow.1.is_finite() {
+    let (eff_shear, effective_bwd) = if has_effective_inflow {
         let layer = winds::wind_shear(profile, eff_inflow.0, eff_inflow.1)
             .ok()
             .map(|(u, v)| (u * u + v * v).sqrt() * KTS_TO_MS);
@@ -371,17 +418,29 @@ pub fn compute_all_params(profile: &Profile) -> ComputedParams {
     let shr06_mag = composites::shr_sfc_to_6km(shr06.0, shr06.1);
     let stp_fixed = shr06_mag
         .and_then(|bwd6| composites::stp_fixed(sfcpcl.bplus, sfcpcl.lclhght, srh01.0, bwd6));
-    let stp_cin = effective_bwd.and_then(|ebwd| {
-        composites::stp_cin(
-            mlpcl.bplus,
-            effective_srh.unwrap_or(f64::NAN),
-            ebwd,
-            mlpcl.lclhght,
-            mlpcl.bminus,
-        )
-    });
-    let scp = effective_bwd
-        .and_then(|ebwd| composites::scp(mupcl.bplus, effective_srh.unwrap_or(f64::NAN), ebwd));
+    // SHARPpy defines effective-layer severe composites as zero when no
+    // effective inflow layer exists. Keep the diagnostic inputs missing, but
+    // do not turn the user-facing SCP/STP/VTP maps into NaN holes. If a layer
+    // does exist and one of its calculations fails, retain None honestly.
+    let stp_cin = if has_effective_inflow {
+        effective_bwd.and_then(|ebwd| {
+            composites::stp_cin(
+                mlpcl.bplus,
+                effective_srh.unwrap_or(f64::NAN),
+                ebwd,
+                mlpcl.lclhght,
+                mlpcl.bminus,
+            )
+        })
+    } else {
+        Some(0.0)
+    };
+    let scp = if has_effective_inflow {
+        effective_bwd
+            .and_then(|ebwd| composites::scp(mupcl.bplus, effective_srh.unwrap_or(f64::NAN), ebwd))
+    } else {
+        Some(0.0)
+    };
     let ship = {
         let mu_mr = if mupcl.pres.is_finite() && mupcl.dwpc.is_finite() {
             crate::profile::mixratio(mupcl.pres, mupcl.dwpc)
@@ -421,17 +480,21 @@ pub fn compute_all_params(profile: &Profile) -> ComputedParams {
             sfcpcl.bminus,
         )
     });
-    let vtp_mod = match (effective_srh, effective_bwd, lr75) {
-        (Some(esrh), Some(ebwd), Some(lr75)) => composites::vtp_mod(
-            mlpcl.bplus,
-            esrh,
-            ebwd,
-            mlpcl.lclhght,
-            mlpcl.bminus,
-            mlpcl.b3km,
-            lr75,
-        ),
-        _ => None,
+    let vtp_mod = if has_effective_inflow {
+        match (effective_srh, effective_bwd, lr75) {
+            (Some(esrh), Some(ebwd), Some(lr75)) => composites::vtp_mod(
+                mlpcl.bplus,
+                esrh,
+                ebwd,
+                mlpcl.lclhght,
+                mlpcl.bminus,
+                mlpcl.b3km,
+                lr75,
+            ),
+            _ => None,
+        }
+    } else {
+        Some(0.0)
     };
 
     // -- TEI --
@@ -472,7 +535,7 @@ pub fn compute_all_params(profile: &Profile) -> ComputedParams {
     let watch = watch_type::best_watch(&watch_params);
 
     // -- Critical angle --
-    let critical_angle = winds::critical_angle(profile, rstu, rstv).unwrap_or(f64::NAN);
+    let critical_angle = winds::critical_angle(profile, storm_u, storm_v).unwrap_or(f64::NAN);
 
     // -- Mean mixing ratio / RH --
     let mean_mixr = indices::mean_mixratio(profile, None, None);
@@ -576,6 +639,7 @@ fn build_param_table(profile: &Profile, p: &ComputedParams) -> ParamTableData {
     let p3500m = profile.pres_at_height(profile.to_msl(3500.0));
     let p6km = profile.pres_at_height(profile.to_msl(6000.0));
     let p12km = profile.pres_at_height(profile.to_msl(12000.0));
+    let (storm_u, storm_v) = cyclonic_storm_motion(profile, p.rstu, p.rstv, p.lstu, p.lstv);
 
     let shear_mag = |pbot: f64, ptop: f64| -> f64 {
         winds::wind_shear(profile, pbot, ptop)
@@ -588,7 +652,7 @@ fn build_param_table(profile: &Profile, p: &ComputedParams) -> ParamTableData {
             .unwrap_or(f64::NAN)
     };
     let sr_wind = |pbot: f64, ptop: f64| -> (f64, f64, f64) {
-        if let Ok((su, sv)) = winds::sr_wind(profile, pbot, ptop, p.rstu, p.rstv, -1.0) {
+        if let Ok((su, sv)) = winds::sr_wind(profile, pbot, ptop, storm_u, storm_v, -1.0) {
             let (dir, spd) = crate::profile::comp2vec(su, sv);
             (dir, spd, spd)
         } else {
@@ -596,8 +660,8 @@ fn build_param_table(profile: &Profile, p: &ComputedParams) -> ParamTableData {
         }
     };
     let srh_layer = |bottom_agl: f64, top_agl: f64| -> f64 {
-        winds::helicity(profile, bottom_agl, top_agl, p.rstu, p.rstv, -1.0, true)
-            .map(|value| value.0)
+        winds::helicity(profile, bottom_agl, top_agl, storm_u, storm_v, -1.0, true)
+            .map(|value| cyclonic_helicity(profile, value).0)
             .unwrap_or(f64::NAN)
     };
     let ehi_for_srh = |srh: f64| composites::ehi(p.sfcpcl.bplus, srh).unwrap_or(f64::NAN);
@@ -927,7 +991,8 @@ fn build_stp_climo() -> StpClimatology {
 
 /// Build storm slinky points from parcel trace and storm motion.
 fn build_slinky(profile: &Profile, p: &ComputedParams) -> Vec<SlinkyPoint> {
-    if !p.rstu.is_finite() || !p.rstv.is_finite() {
+    let (storm_u, storm_v) = cyclonic_storm_motion(profile, p.rstu, p.rstv, p.lstu, p.lstv);
+    if !storm_u.is_finite() || !storm_v.is_finite() {
         return Vec::new();
     }
     let pcl = &p.sfcpcl;
@@ -957,8 +1022,8 @@ fn build_slinky(profile: &Profile, p: &ComputedParams) -> Vec<SlinkyPoint> {
         }
         points.push(SlinkyPoint {
             height_m: h_agl,
-            sr_u: u - p.rstu,
-            sr_v: v - p.rstv,
+            sr_u: u - storm_u,
+            sr_v: v - storm_v,
         });
     }
     points
@@ -1200,10 +1265,96 @@ mod tests {
             StationInfo {
                 station_id: "TST".into(),
                 datetime: "250402/0000".into(),
+                latitude: 35.0,
                 ..Default::default()
             },
         )
         .unwrap()
+    }
+
+    fn stable_profile_without_effective_inflow() -> Profile {
+        let pres = [1000.0, 925.0, 850.0, 700.0, 500.0, 300.0, 200.0];
+        let hght = [100.0, 800.0, 1500.0, 3100.0, 5600.0, 9200.0, 12000.0];
+        let tmpc = [10.0, 12.0, 10.0, 3.0, -12.0, -38.0, -52.0];
+        let dwpc = [-20.0, -24.0, -28.0, -35.0, -45.0, -58.0, -68.0];
+        let wdir = [180.0, 195.0, 210.0, 235.0, 260.0, 275.0, 280.0];
+        let wspd = [10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 70.0];
+        Profile::new(
+            &pres,
+            &hght,
+            &tmpc,
+            &dwpc,
+            &wdir,
+            &wspd,
+            &[],
+            StationInfo {
+                station_id: "STABLE".into(),
+                latitude: 35.0,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn hemisphere_test_profile() -> Profile {
+        // Extend the ordinary renderer fixture far enough above the parcel EL
+        // that effective bulk wind difference is available for the severe
+        // composites as well as for the mover/helicity checks.
+        let pres = [
+            1000.0, 925.0, 850.0, 700.0, 500.0, 300.0, 200.0, 150.0, 100.0,
+        ];
+        let hght = [
+            100.0, 800.0, 1500.0, 3100.0, 5600.0, 9200.0, 12000.0, 14000.0, 16500.0,
+        ];
+        let tmpc = [30.0, 24.0, 18.0, 4.0, -15.0, -40.0, -55.0, -61.0, -67.0];
+        let dwpc = [22.0, 18.0, 12.0, -4.0, -30.0, -50.0, -65.0, -71.0, -77.0];
+        let wdir = [
+            180.0, 200.0, 220.0, 250.0, 270.0, 280.0, 280.0, 285.0, 290.0,
+        ];
+        let wspd = [10.0, 15.0, 20.0, 30.0, 50.0, 60.0, 70.0, 75.0, 80.0];
+        Profile::new(
+            &pres,
+            &hght,
+            &tmpc,
+            &dwpc,
+            &wdir,
+            &wspd,
+            &[],
+            StationInfo {
+                station_id: "TST-NH".into(),
+                datetime: "250402/0000".into(),
+                latitude: 35.0,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn mirrored_southern_profile(north: &Profile) -> Profile {
+        let mirrored_u: Vec<f64> = north.u.iter().map(|u| -*u).collect();
+        Profile::from_uv(
+            &north.pres,
+            &north.hght,
+            &north.tmpc,
+            &north.dwpc,
+            &mirrored_u,
+            &north.v,
+            &north.omeg,
+            StationInfo {
+                station_id: "TST-SH".into(),
+                latitude: -35.0,
+                ..north.station.clone()
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_close(actual: f64, expected: f64, label: &str) {
+        let tolerance = 1e-8 * expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label}: actual {actual}, expected {expected}, tolerance {tolerance}"
+        );
     }
 
     fn assert_same_value(actual: f64, expected: f64) {
@@ -1229,6 +1380,59 @@ mod tests {
         assert!(params.sfcpcl.bplus.is_finite() || params.sfcpcl.bplus.is_nan());
         // Storm motion should have been computed.
         assert!(params.rstu.is_finite() || params.rstu.is_nan());
+    }
+
+    #[test]
+    fn no_effective_layer_keeps_inputs_missing_but_composites_zero() {
+        let params = compute_all_params(&stable_profile_without_effective_inflow());
+        assert!(!params.eff_inflow.0.is_finite());
+        assert!(!params.eff_inflow.1.is_finite());
+        assert_eq!(params.effective_srh, None);
+        assert_eq!(params.eff_shear, None);
+        assert_eq!(params.effective_bwd, None);
+        assert_eq!(params.scp, Some(0.0));
+        assert_eq!(params.stp_cin, Some(0.0));
+        assert_eq!(params.vtp_mod, Some(0.0));
+    }
+
+    #[test]
+    fn mirrored_southern_profile_uses_left_mover_with_cyclonic_positive_helicity() {
+        let north_profile = hemisphere_test_profile();
+        let south_profile = mirrored_southern_profile(&north_profile);
+        let north = compute_all_params(&north_profile);
+        let south = compute_all_params(&south_profile);
+
+        // Reflection across the north-south axis swaps the physical right and
+        // left movers. The Southern Hemisphere analysis must select that
+        // reflected left mover, not continue using the right mover.
+        assert_close(south.lstu, -north.rstu, "active mover u");
+        assert_close(south.lstv, north.rstv, "active mover v");
+        assert_close(south.srh01.0, north.srh01.0, "0-1 km cyclonic SRH");
+        assert_close(south.srh03.0, north.srh03.0, "0-3 km cyclonic SRH");
+
+        let north_esrh = north.effective_srh.expect("north effective SRH");
+        let south_esrh = south.effective_srh.expect("south effective SRH");
+        assert_close(south_esrh, north_esrh, "effective cyclonic SRH");
+        assert_close(
+            south.scp.expect("south SCP"),
+            north.scp.expect("north SCP"),
+            "SCP",
+        );
+        assert_close(
+            south.stp_cin.expect("south STP(CIN)"),
+            north.stp_cin.expect("north STP(CIN)"),
+            "STP(CIN)",
+        );
+        assert_close(
+            south.stp_fixed.expect("south fixed STP"),
+            north.stp_fixed.expect("north fixed STP"),
+            "fixed STP",
+        );
+        assert_close(
+            south.vtp_mod.expect("south VTP"),
+            north.vtp_mod.expect("north VTP"),
+            "VTP",
+        );
     }
 
     #[test]

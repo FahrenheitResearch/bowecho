@@ -188,3 +188,31 @@ both implementations and compares them. Before these changes the map disagreed
 with the sounding window by 46.3% on EBWD (27.73 kt vs 51.63 kt), 48.8% on
 Bunkers RM v, 14.8% on Bunkers RM u and 3.4% on effective SRH. After them every
 compared quantity agrees to 0.00%.
+
+#### 2026-08-21 — RC correctness hardening
+
+7. **`src/profile.rs` + `src/winds.rs`** — exact native pressure endpoints.
+
+   `pres_at_height` previously round-tripped an exact native level through
+   `exp(ln(p))`. For pressures such as 950 hPa that produces
+   `950.0000000000001`, fractionally above the sounding surface;
+   `interp_wind` then rejected the endpoint as out of bounds and the exact
+   helicity path returned no data. Native height/pressure endpoints now return
+   their stored values directly, and pressure interpolation accepts values
+   within the crate's `1e-10` tolerance of a native level. Regression tests
+   cover the 950-hPa helicity failure and every native-level wind round trip.
+
+8. **`src/render/compositor.rs`** — explicit global storm convention and
+   missing-effective-layer semantics.
+
+   Northern Hemisphere diagnostics use the Bunkers right mover. Southern
+   Hemisphere diagnostics use the Bunkers left mover and normalize the raw
+   negative cyclonic helicity into a positive analysis magnitude before it is
+   fed to EHI/SCP/STP/VTP and the watch classifier. Both raw right/left vectors
+   remain available for display. A mirrored north/south fixture pins equal
+   cyclonic SRH and severe composites.
+
+   When no effective inflow layer exists, effective SRH and both effective
+   shear inputs remain missing, while SCP, STP(CIN), and VTP are explicit zero
+   values. This matches SHARPpy's public composite behavior without disguising
+   a failed calculation inside an otherwise valid effective layer.

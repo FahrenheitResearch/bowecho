@@ -766,6 +766,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exact_helicity_accepts_an_upward_rounding_surface_pressure() {
+        // exp(ln(950 hPa)) is 950.0000000000001 on IEEE-754 f64. Before
+        // Profile's native-endpoint guard, the exact helicity path converted
+        // 0 m AGL to that pressure and then rejected the surface wind as
+        // fractionally outside the profile.
+        let pres = [950.0, 850.0, 775.0, 650.0, 500.0, 300.0, 200.0];
+        let hght = [650.0, 1500.0, 2300.0, 3800.0, 5700.0, 9200.0, 12000.0];
+        let tmpc = [25.0, 18.0, 11.0, 1.0, -18.0, -42.0, -55.0];
+        let dwpc = [19.0, 13.0, 7.0, -6.0, -28.0, -50.0, -65.0];
+        let wdir = [170.0, 190.0, 215.0, 240.0, 265.0, 280.0, 285.0];
+        let wspd = [12.0, 18.0, 24.0, 34.0, 50.0, 65.0, 75.0];
+        let prof = Profile::new(
+            &pres,
+            &hght,
+            &tmpc,
+            &dwpc,
+            &wdir,
+            &wspd,
+            &[],
+            StationInfo::default(),
+        )
+        .unwrap();
+        let (rstu, rstv, _, _) = non_parcel_bunkers_motion(&prof).unwrap();
+        let (total, pos, neg) = helicity(&prof, 0.0, 1000.0, rstu, rstv, -1.0, true).unwrap();
+        assert!(total.is_finite());
+        assert!(pos.is_finite());
+        assert!(neg.is_finite());
+    }
+
     // ---- max_wind ----
 
     #[test]
