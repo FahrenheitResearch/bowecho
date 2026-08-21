@@ -67,8 +67,9 @@ pub fn rhi_fixed_azimuth_deg(cut: &ElevationCut) -> f32 {
 /// Highest beam height (m, above the radar) reached anywhere in the sweep —
 /// the natural top of the RHI panel.
 pub fn rhi_coverage_top_m(cut: &ElevationCut, grid: &MomentGrid) -> f32 {
-    let max_slant_m = f64::from(grid.gate_range.first_gate_m)
-        + f64::from(grid.gate_range.gate_spacing_m) * grid.gate_range.gate_count as f64;
+    let Some(max_slant_m) = outer_gate_edge_slant_m(grid) else {
+        return 0.0;
+    };
     cut.radials
         .iter()
         .map(|radial| {
@@ -80,14 +81,31 @@ pub fn rhi_coverage_top_m(cut: &ElevationCut, grid: &MomentGrid) -> f32 {
 
 /// Furthest ground range (m) reached by any gate in the sweep.
 pub fn rhi_coverage_range_m(cut: &ElevationCut, grid: &MomentGrid) -> f32 {
-    let max_slant_m = f64::from(grid.gate_range.first_gate_m)
-        + f64::from(grid.gate_range.gate_spacing_m) * grid.gate_range.gate_count as f64;
+    let Some(max_slant_m) = outer_gate_edge_slant_m(grid) else {
+        return 0.0;
+    };
     cut.radials
         .iter()
         .map(|radial| {
             radar_core::beam_ground_range_m(max_slant_m, f64::from(radial.elevation_deg)) as f32
         })
         .fold(0.0f32, f32::max)
+}
+
+/// Slant range at the far edge of the last gate.
+///
+/// `first_gate_m` names gate zero's centre. A grid with `count` gates therefore
+/// spans from half a spacing before that centre through `count - 0.5`
+/// spacings after it. This is the same boundary used by [`rhi_section`].
+fn outer_gate_edge_slant_m(grid: &MomentGrid) -> Option<f64> {
+    let spacing_m = f64::from(grid.gate_range.gate_spacing_m);
+    if grid.gate_range.gate_count == 0 || spacing_m <= 0.0 {
+        return None;
+    }
+    Some(
+        f64::from(grid.gate_range.first_gate_m)
+            + spacing_m * (grid.gate_range.gate_count as f64 - 0.5),
+    )
 }
 
 /// Invert the 4/3-Earth beam model: ground range `s` and height-above-radar
@@ -358,6 +376,22 @@ mod tests {
         let range = rhi_coverage_range_m(&cut, &grid);
         // Lowest beam carries gates nearly the full 60 km downrange.
         assert!((58_000.0..60_500.0).contains(&range), "range was {range}");
+    }
+
+    #[test]
+    fn coverage_uses_outer_edge_of_center_based_last_gate() {
+        let (cut, mut grid) = rhi_cut(950, 125);
+        grid.gate_range.first_gate_m = 62;
+
+        // Gate centres are 62, 187, ...; the last gate's far edge is 62 +
+        // 949.5 * 125 = 118749.5 m, not first + count * spacing (118812 m).
+        let edge_m = 118_749.5;
+        assert_eq!(outer_gate_edge_slant_m(&grid), Some(edge_m));
+
+        let expected_top = radar_core::beam_height_above_radar_m(edge_m, 30.0) as f32;
+        assert!((rhi_coverage_top_m(&cut, &grid) - expected_top).abs() < 0.01);
+        let expected_range = radar_core::beam_ground_range_m(edge_m, 0.5) as f32;
+        assert!((rhi_coverage_range_m(&cut, &grid) - expected_range).abs() < 0.01);
     }
 
     #[test]
