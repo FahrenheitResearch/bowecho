@@ -49,7 +49,10 @@
 //! Sub-rows are synthesized only between beams whose azimuth gap is small
 //! (sector-scan edges keep their native hole).
 
-use crate::InterpPolicy;
+use crate::{
+    InterpPolicy,
+    volumetric::{CC_GUARD_FLOOR, VELOCITY_GUARD_SPREAD_MPS},
+};
 use radar_core::{ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType};
 use rayon::prelude::*;
 
@@ -62,10 +65,6 @@ pub const INTERP_MAX_FACTOR: usize = 4;
 /// Budget for the cached F32 grid (the moment-cache entry that holds it).
 pub const INTERP_MAX_GRID_BYTES: usize = 64 << 20;
 
-/// Same threshold as `volumetric.rs`'s `InterpPolicy::VelocityGuard`.
-const VELOCITY_GUARD_SPREAD_MPS: f32 = 30.0;
-/// Same floor as `volumetric.rs`'s `InterpPolicy::CcGuard`.
-const CC_GUARD_FLOOR: f32 = 0.97;
 /// Beams closer than this are duplicates — nothing to synthesize between.
 const MIN_SYNTH_DELTA_DEG: f32 = 0.01;
 

@@ -244,12 +244,24 @@ struct ProfileSample {
     v: f32,
 }
 
+/// Correlation-coefficient floor below which vertical interpolation falls
+/// back to the nearest observed tilt. The 0.90–0.97 rho_hv interval bounds
+/// the melting-layer designation in Giangrande, Krause & Ryzhkov (2008).
+pub(crate) const CC_GUARD_FLOOR: f32 = 0.97;
+
+/// Velocity spread (m/s) above which vertical interpolation falls back to the
+/// nearest observed tilt. This is a conservative house rule for residual
+/// aliasing and strong shear; a future policy can scale it by radial Nyquist.
+pub(crate) const VELOCITY_GUARD_SPREAD_MPS: f32 = 30.0;
+
 /// Interpolation policy per moment family (docs/xsection-3d-spec.md):
-/// reflectivity/ZDR blend linearly; CC must not blend through the melting
-/// layer (Giangrande, Krause & Ryzhkov 2008: the rho_hv minimum is the
-/// signature — blending fabricates intermediate values), so any bracket
-/// below 0.97 falls back to nearest-gate; velocity guards against blending
-/// across strong shear or residual aliasing.
+/// scalar moments blend in their native units (including reflectivity in
+/// dBZ); CC must not blend through the melting layer, so a bracket below
+/// [`CC_GUARD_FLOOR`] falls back to nearest-gate; velocity similarly guards
+/// against blending across strong shear or residual aliasing. Lakshmanan
+/// (2012) and Warren & Protat (2019) disagree about dBZ versus linear-Z
+/// interpolation, so changing the current dBZ default requires an explicit
+/// policy rather than a silent unit conversion.
 #[derive(Clone, Copy, PartialEq)]
 pub enum InterpPolicy {
     LinearAngle,
@@ -323,8 +335,10 @@ fn interp_profile_xs(prof: &[ProfileSample], z: f64, s: f64, policy: InterpPolic
         if z >= lo.h && z <= hi.h {
             let nearest = if (z - lo.h) <= (hi.h - z) { lo.v } else { hi.v };
             match policy {
-                InterpPolicy::CcGuard if lo.v.min(hi.v) < 0.97 => return Some(nearest),
-                InterpPolicy::VelocityGuard if (hi.v - lo.v).abs() > 30.0 => {
+                InterpPolicy::CcGuard if lo.v.min(hi.v) < CC_GUARD_FLOOR => {
+                    return Some(nearest);
+                }
+                InterpPolicy::VelocityGuard if (hi.v - lo.v).abs() > VELOCITY_GUARD_SPREAD_MPS => {
                     return Some(nearest);
                 }
                 _ => {}
@@ -927,9 +941,10 @@ pub struct CrossSection {
 
 /// Reflectivity vertical cross-section between two ground points given as
 /// (east_km, north_km) from the radar. Resamples every reflectivity tilt along
-/// the path with 4/3-Earth beam geometry (Doviak & Zrnić 1993) and linearly
-/// interpolates in height between tilt samples — the standard RHI-from-volume
-/// reconstruction used to see BWER/vault, overhang and descending cores.
+/// the path with 4/3-Earth beam geometry (Doviak & Zrnić 1993) and blends
+/// between bracketing tilts linearly in elevation angle, not height — the
+/// standard RHI-from-volume reconstruction used to see BWER/vault, overhang
+/// and descending cores.
 pub fn reflectivity_cross_section(
     volume: &RadarVolume,
     start_km: (f32, f32),
@@ -1320,7 +1335,8 @@ fn velocity_cross_section_from_indexed_grids<'a>(
 }
 
 /// Shared RHI reconstruction: walk along the ground path, sample each column,
-/// and interpolate in height. Works for any moment's columns.
+/// and interpolate between bracketing elevation angles. Works for any
+/// moment's columns.
 fn cross_section_from_columns(
     cols: &[CutColumn<'_>],
     start_km: (f32, f32),
@@ -2175,6 +2191,93 @@ mod tests {
             none.scaled_value(0, 40).is_none_or(|v| v.is_nan()),
             "35 dBZ should produce no hail signal"
         );
+    }
+
+    /// Height above radar where a beam at ground distance `s` has the given
+    /// elevation angle, found by bisection against the production inverse.
+    fn height_for_angle(s: f64, theta_deg: f64) -> f64 {
+        let (mut low, mut high) = (0.0f64, 80_000.0f64);
+        for _ in 0..200 {
+            let middle = 0.5 * (low + high);
+            if invert_beam(s, middle).1 < theta_deg {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        0.5 * (low + high)
+    }
+
+    fn profile_sample(s: f64, theta_deg: f64, value: f32) -> ProfileSample {
+        let h = height_for_angle(s, theta_deg);
+        let (r_m, _) = invert_beam(s, h);
+        ProfileSample {
+            h,
+            theta_deg,
+            r_m,
+            v: value,
+        }
+    }
+
+    #[test]
+    fn vertical_blend_weights_by_elevation_angle_not_height() {
+        let s = 30_000.0;
+        let profile = [profile_sample(s, 0.5, 0.0), profile_sample(s, 45.0, 25.0)];
+        let midpoint_height = 0.5 * (profile[0].h + profile[1].h);
+        let got = interp_profile_xs(&profile, midpoint_height, s, InterpPolicy::VelocityGuard)
+            .expect("blend");
+
+        let theta = invert_beam(s, midpoint_height).1;
+        let angle_weight =
+            (theta - profile[0].theta_deg) / (profile[1].theta_deg - profile[0].theta_deg);
+        let expected_by_angle = 25.0 * angle_weight as f32;
+        let expected_by_height = 12.5f32;
+        assert!((expected_by_angle - expected_by_height).abs() > 0.5);
+        assert!((got - expected_by_angle).abs() < 0.05, "got {got}");
+    }
+
+    #[test]
+    fn reflectivity_blends_in_dbz_not_linear_z() {
+        let s = 30_000.0;
+        let profile = [profile_sample(s, 1.0, 20.0), profile_sample(s, 5.0, 60.0)];
+        let z = height_for_angle(s, 3.0);
+        let got = interp_profile_xs(&profile, z, s, InterpPolicy::LinearAngle).expect("blend");
+
+        // At the midpoint, native-dBZ interpolation is 40 dBZ; converting to
+        // linear Z first would produce about 57 dBZ.
+        assert!((got - 40.0).abs() < 0.05, "got {got}");
+        let linear_z = 10.0 * (0.5f64 * (1.0e2 + 1.0e6)).log10();
+        assert!((f64::from(got) - linear_z).abs() > 5.0);
+    }
+
+    #[test]
+    fn interpolation_endpoints_and_named_guards_are_pinned() {
+        let s = 30_000.0;
+        let profile = [profile_sample(s, 1.0, 23.5), profile_sample(s, 5.0, 61.25)];
+        assert_eq!(
+            interp_profile_xs(&profile, profile[0].h, s, InterpPolicy::LinearAngle),
+            Some(23.5)
+        );
+        assert_eq!(
+            interp_profile_xs(&profile, profile[1].h, s, InterpPolicy::LinearAngle),
+            Some(61.25)
+        );
+
+        let cc = [
+            profile_sample(s, 1.0, CC_GUARD_FLOOR - 0.05),
+            profile_sample(s, 5.0, 1.0),
+        ];
+        let z = height_for_angle(s, 3.5);
+        let cc_value = interp_profile_xs(&cc, z, s, InterpPolicy::CcGuard).expect("cc");
+        assert!(cc_value == cc[0].v || cc_value == cc[1].v);
+
+        let velocity = [
+            profile_sample(s, 1.0, -VELOCITY_GUARD_SPREAD_MPS),
+            profile_sample(s, 5.0, VELOCITY_GUARD_SPREAD_MPS),
+        ];
+        let velocity_value =
+            interp_profile_xs(&velocity, z, s, InterpPolicy::VelocityGuard).expect("velocity");
+        assert!(velocity_value == velocity[0].v || velocity_value == velocity[1].v);
     }
 
     #[test]

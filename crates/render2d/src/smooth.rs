@@ -9,9 +9,27 @@
 //! a gate with no finite neighbors stays empty. Note: RF gates therefore
 //! render transparent in smoothed mode — analysts who need the RF purple
 //! should use the native (unsmoothed) display.
+//!
+//! Differential phase is angular modulo 360 degrees, so it uses a weighted
+//! circular mean. The arithmetic mean used by scalar moments would turn a
+//! physically adjacent 359/1-degree neighborhood into a false 180-degree
+//! feature. All other moments retain the existing scalar kernel.
 
-use radar_core::{MomentGrid, MomentStorage};
+use radar_core::{MomentGrid, MomentStorage, MomentType};
 use rayon::prelude::*;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MomentAlgebra {
+    Linear,
+    CircularDegrees,
+}
+
+fn moment_algebra(moment: &MomentType) -> MomentAlgebra {
+    match moment {
+        MomentType::DifferentialPhase => MomentAlgebra::CircularDegrees,
+        _ => MomentAlgebra::Linear,
+    }
+}
 
 /// Smooth a moment grid's values into a new F32 grid with identical
 /// geometry. Azimuth wraps; range is clamped at the ends.
@@ -33,6 +51,7 @@ pub fn smooth_moment_grid(grid: &MomentGrid) -> MomentGrid {
                 }
             });
         const KERNEL: [f32; 3] = [1.0, 2.0, 1.0];
+        let algebra = moment_algebra(&grid.moment);
         values
             .par_chunks_mut(gates)
             .enumerate()
@@ -43,8 +62,11 @@ pub fn smooth_moment_grid(grid: &MomentGrid) -> MomentGrid {
                     if !source[row * gates + gate].is_finite() {
                         continue;
                     }
-                    let mut sum = 0.0f32;
-                    let mut weight = 0.0f32;
+                    let mut linear_sum = 0.0f32;
+                    let mut linear_weight = 0.0f32;
+                    let mut circular_x = 0.0f64;
+                    let mut circular_y = 0.0f64;
+                    let mut circular_weight = 0.0f64;
                     for (di, &kr) in KERNEL.iter().enumerate() {
                         let r = ((row as i64 + di as i64 - 1).rem_euclid(rows as i64)) as usize;
                         for (dj, &kg) in KERNEL.iter().enumerate() {
@@ -55,13 +77,41 @@ pub fn smooth_moment_grid(grid: &MomentGrid) -> MomentGrid {
                             let v = source[r * gates + g as usize];
                             if v.is_finite() {
                                 let k = kr * kg;
-                                sum += v * k;
-                                weight += k;
+                                match algebra {
+                                    MomentAlgebra::Linear => {
+                                        // Keep the original f32 accumulation
+                                        // order and precision for scalar
+                                        // moments.
+                                        linear_sum += v * k;
+                                        linear_weight += k;
+                                    }
+                                    MomentAlgebra::CircularDegrees => {
+                                        let radians = f64::from(v).to_radians();
+                                        let weight = f64::from(k);
+                                        circular_x += weight * radians.cos();
+                                        circular_y += weight * radians.sin();
+                                        circular_weight += weight;
+                                    }
+                                }
                             }
                         }
                     }
-                    if weight > 0.0 {
-                        *cell = sum / weight;
+                    match algebra {
+                        MomentAlgebra::Linear if linear_weight > 0.0 => {
+                            *cell = linear_sum / linear_weight;
+                        }
+                        MomentAlgebra::CircularDegrees if circular_weight > 0.0 => {
+                            // An exactly antipodal neighborhood has no defined
+                            // mean direction. Preserve its measured center
+                            // instead of inventing an angle.
+                            if circular_x.hypot(circular_y) < 1e-12 * circular_weight {
+                                *cell = source[row * gates + gate];
+                            } else {
+                                let degrees = circular_y.atan2(circular_x).to_degrees();
+                                *cell = degrees.rem_euclid(360.0) as f32;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             });
@@ -143,5 +193,99 @@ mod tests {
         let high_side = s.scaled_value(3, 4).unwrap();
         assert!(low_side > 0.0 && low_side < 20.0, "{low_side}");
         assert!(high_side > 20.0 && high_side < 40.0, "{high_side}");
+    }
+
+    fn phi_grid(rows: usize, gates: usize, data: Vec<f32>) -> MomentGrid {
+        let mut grid = grid(rows, gates, data);
+        grid.moment = MomentType::DifferentialPhase;
+        grid
+    }
+
+    #[test]
+    fn phi_smooths_across_the_360_wrap() {
+        let mut data = vec![0.0f32; 64];
+        for row in 0..8 {
+            for gate in 0..8 {
+                data[row * 8 + gate] = if gate < 4 { 359.0 } else { 1.0 };
+            }
+        }
+
+        let smoothed = smooth_moment_grid(&phi_grid(8, 8, data));
+        for row in 0..8 {
+            for gate in 0..8 {
+                let value = smoothed.scaled_value(row, gate).unwrap();
+                let distance_from_zero = value.rem_euclid(360.0);
+                let distance_from_zero = distance_from_zero.min(360.0 - distance_from_zero);
+                assert!(
+                    distance_from_zero <= 1.0,
+                    "gate ({row},{gate}) smoothed to {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_moments_keep_the_arithmetic_kernel() {
+        let mut data = vec![0.0f32; 64];
+        for row in 0..8 {
+            for gate in 0..8 {
+                data[row * 8 + gate] = if gate < 4 { 359.0 } else { 1.0 };
+            }
+        }
+
+        let smoothed = smooth_moment_grid(&grid(8, 8, data));
+        assert_eq!(smoothed.scaled_value(3, 3), Some(269.5));
+    }
+
+    #[test]
+    fn wrap_free_phi_matches_the_scalar_mean() {
+        let mut data = vec![0.0f32; 64];
+        for row in 0..8 {
+            for gate in 0..8 {
+                data[row * 8 + gate] = 40.0 + gate as f32 * 3.0;
+            }
+        }
+
+        let circular = smooth_moment_grid(&phi_grid(8, 8, data.clone()));
+        let linear = smooth_moment_grid(&grid(8, 8, data));
+        for row in 0..8 {
+            for gate in 0..8 {
+                let circular = circular.scaled_value(row, gate).unwrap();
+                let linear = linear.scaled_value(row, gate).unwrap();
+                assert!((circular - linear).abs() < 0.05, "{circular} vs {linear}");
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_phi_at_the_wrap_is_unchanged() {
+        for expected in [0.0f32, 90.0, 180.0, 359.5] {
+            let smoothed = smooth_moment_grid(&phi_grid(8, 8, vec![expected; 64]));
+            for row in 0..8 {
+                for gate in 0..8 {
+                    let value = smoothed.scaled_value(row, gate).unwrap();
+                    let delta = (value - expected).rem_euclid(360.0);
+                    assert!(delta.min(360.0 - delta) < 1e-2, "{expected} -> {value}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phi_smoothing_does_not_grow_coverage() {
+        let mut data = vec![f32::NAN; 64];
+        for row in 0..8 {
+            for gate in 0..4 {
+                data[row * 8 + gate] = 359.0;
+            }
+        }
+
+        let smoothed = smooth_moment_grid(&phi_grid(8, 8, data));
+        assert!(
+            smoothed
+                .scaled_value(0, 4)
+                .is_none_or(|value| value.is_nan())
+        );
+        assert!((smoothed.scaled_value(0, 3).unwrap() - 359.0).abs() < 1e-2);
     }
 }
