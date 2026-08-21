@@ -1316,22 +1316,15 @@ fn support_color(value: f32) -> vec3<f32> {
     return mix(middle, high, (value - 0.5) * 2.0);
 }
 
-// Score one contributing sample for Maximum Projection. "Maximum" follows
-// the visible transfer, not blindly the raw scalar: Above keeps the largest
-// value, Below keeps the smallest value, and Outside keeps the largest
-// excursion beyond the excluded central band. Velocity two-box rendering is
-// deliberately different: reflectivity remains the eligibility/structure
-// field, but the winning eligible sample is the strongest signed-velocity
-// magnitude and retains that sample's inbound/outbound LUT color.
-fn maximum_projection_score(
+// Deterministic tiebreak for equally visible Maximum Projection samples.
+// Above keeps the largest value, Below the smallest value, and Outside the
+// farthest excursion beyond the excluded central band. In velocity two-box
+// mode REF controls visibility while |velocity| breaks ties and the signed
+// velocity coordinate remains available for LUT color.
+fn maximum_projection_extremity(
     structure: f32,
-    color_value: f32,
-    transfer: f32,
-    emphasis: f32
+    color_value: f32
 ) -> f32 {
-    if (transfer * emphasis <= 0.0) {
-        return -1.0;
-    }
     if (u.velocity_mode > 0.5) {
         return clamp(abs(color_value - 0.5) * 2.0, 0.0, 1.0);
     }
@@ -1470,7 +1463,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             ).r;
             var have_previous = false;
             var shell_drawn = false;
-            var maximum_score = -1.0;
+            var maximum_visibility = -1.0;
+            var maximum_extremity = -1.0;
+            var maximum_alpha = 0.0;
             var maximum_lut = 0.0;
             var maximum_support = 0.0;
             var maximum_uvw = vec3<f32>(0.5);
@@ -1517,13 +1512,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
                 // Maximum projection follows the active transfer sense. In
                 // velocity two-box mode REF only gates eligibility; the
-                // strongest |velocity| wins and keeps its signed LUT color.
+                // strongest visible sample wins, then |velocity| breaks a tie
+                // and keeps its signed LUT color. This prevents a barely
+                // eligible gate-edge extreme from defeating an opaque echo.
                 if (u.render_mode > 2.5 && u.render_mode < 3.5) {
-                    let candidate = maximum_projection_score(
-                        structure, lut_coord, transfer, emphasis
+                    let candidate_palette = textureSampleLevel(
+                        t_lut, s_lut, vec2<f32>(lut_coord, 0.5), 0.0
                     );
-                    if (candidate > maximum_score) {
-                        maximum_score = candidate;
+                    let candidate_support = support_weight(support);
+                    let candidate_visibility = candidate_palette.a
+                        * max(transfer, 0.0)
+                        * max(emphasis, 0.0)
+                        * candidate_support;
+                    let candidate_extremity = maximum_projection_extremity(
+                        structure, lut_coord
+                    );
+                    let visibility_tied = abs(
+                        candidate_visibility - maximum_visibility
+                    ) <= 0.000001;
+                    if (candidate_visibility > 0.0
+                        && (candidate_visibility > maximum_visibility + 0.000001
+                            || (visibility_tied
+                                && candidate_extremity > maximum_extremity))) {
+                        maximum_visibility = candidate_visibility;
+                        maximum_extremity = candidate_extremity;
+                        maximum_alpha = clamp(u.opacity * candidate_visibility, 0.0, 1.0);
                         maximum_lut = lut_coord;
                         maximum_support = support;
                         maximum_uvw = uvw;
@@ -1615,14 +1628,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 t = t + max(step_dt, base_dt * 0.35);
             }
 
-            if (u.render_mode > 2.5 && u.render_mode < 3.5 && maximum_score >= 0.0) {
+            if (u.render_mode > 2.5 && u.render_mode < 3.5 && maximum_visibility > 0.0) {
                 let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(maximum_lut, 0.5), 0.0);
-                let support_scale = support_weight(maximum_support);
-                let alpha = clamp(u.opacity * max(support_scale, 0.1), 0.08, 1.0);
                 var rgb = shaded_rgb(maximum_uvw, rd, palette.rgb);
                 if (u.support_mode > 1.5) { rgb = support_color(maximum_support); }
-                color = rgb * alpha;
-                accumulated = alpha;
+                color = rgb * maximum_alpha;
+                accumulated = maximum_alpha;
             }
         }
     }

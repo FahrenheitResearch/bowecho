@@ -771,19 +771,14 @@ mod tests {
         );
     }
 
-    fn projection_score_contract(
+    fn projection_extremity_contract(
         structure: f32,
         color_value: f32,
-        transfer: f32,
-        emphasis: f32,
         threshold_mode: f32,
         threshold_low: f32,
         threshold_high: f32,
         velocity_mode: f32,
     ) -> f32 {
-        if transfer * emphasis <= 0.0 {
-            return -1.0;
-        }
         if velocity_mode > 0.5 {
             return ((color_value - 0.5).abs() * 2.0).clamp(0.0, 1.0);
         }
@@ -796,10 +791,53 @@ mod tests {
         structure
     }
 
+    /// CPU mirror of the WGSL MIP candidate contract. The first component is
+    /// the visibility rank, the second is the deterministic meteorological
+    /// tiebreak, and the third is the actual straight-alpha contribution.
+    #[allow(clippy::too_many_arguments)]
+    fn projection_candidate_contract(
+        structure: f32,
+        color_value: f32,
+        transfer: f32,
+        emphasis: f32,
+        palette_alpha: f32,
+        support_weight: f32,
+        opacity: f32,
+        threshold_mode: f32,
+        threshold_low: f32,
+        threshold_high: f32,
+        velocity_mode: f32,
+    ) -> Option<[f32; 3]> {
+        let visibility = palette_alpha.max(0.0)
+            * transfer.max(0.0)
+            * emphasis.max(0.0)
+            * support_weight.max(0.0);
+        if visibility <= 0.0 {
+            return None;
+        }
+        Some([
+            visibility,
+            projection_extremity_contract(
+                structure,
+                color_value,
+                threshold_mode,
+                threshold_low,
+                threshold_high,
+                velocity_mode,
+            ),
+            (opacity * visibility).clamp(0.0, 1.0),
+        ])
+    }
+
+    fn projection_candidate_wins(candidate: [f32; 3], incumbent: [f32; 3]) -> bool {
+        candidate[0] > incumbent[0] + 1.0e-6
+            || ((candidate[0] - incumbent[0]).abs() <= 1.0e-6 && candidate[1] > incumbent[1])
+    }
+
     #[test]
     fn maximum_projection_score_follows_transfer_sense() {
         let score = |value, mode, low, high| {
-            projection_score_contract(value, value, 1.0, 1.0, mode, low, high, 0.0)
+            projection_extremity_contract(value, value, mode, low, high, 0.0)
         };
         assert!(score(0.85, 0.0, 0.4, -1.0) > score(0.55, 0.0, 0.4, -1.0));
         assert!(score(0.20, 1.0, 0.8, -1.0) > score(0.70, 1.0, 0.8, -1.0));
@@ -807,26 +845,75 @@ mod tests {
         let low_arm = score(0.10, 2.0, 0.40, 0.60);
         let high_arm = score(0.90, 2.0, 0.40, 0.60);
         assert!((low_arm - high_arm).abs() < 1.0e-6);
-        assert_eq!(
-            projection_score_contract(0.50, 0.50, -1.0, 1.0, 2.0, 0.40, 0.60, 0.0),
-            -1.0,
-            "the excluded Outside band cannot win the projection"
-        );
-
         assert!(
-            projection_score_contract(0.55, 0.95, 1.0, 0.2, 2.0, 0.40, 0.60, 1.0)
-                > projection_score_contract(0.85, 0.65, 1.0, 1.0, 2.0, 0.40, 0.60, 1.0),
-            "eligible velocity two-box projection must select strongest |velocity|, not REF"
+            projection_extremity_contract(0.55, 0.95, 2.0, 0.40, 0.60, 1.0)
+                > projection_extremity_contract(0.85, 0.65, 2.0, 0.40, 0.60, 1.0),
+            "equally visible velocity candidates must tiebreak on |velocity|, not REF"
         );
         assert_eq!(
-            projection_score_contract(0.75, 0.05, 1.0, 1.0, 2.0, 0.40, 0.60, 1.0),
-            projection_score_contract(0.75, 0.95, 1.0, 1.0, 2.0, 0.40, 0.60, 1.0),
+            projection_extremity_contract(0.75, 0.05, 2.0, 0.40, 0.60, 1.0),
+            projection_extremity_contract(0.75, 0.95, 2.0, 0.40, 0.60, 1.0),
             "equal inbound/outbound magnitudes must score symmetrically"
         );
+    }
+
+    #[test]
+    fn maximum_projection_prioritizes_visibility_and_preserves_honest_alpha() {
+        let candidate = |color_value, transfer, support_weight| {
+            projection_candidate_contract(
+                0.75,
+                color_value,
+                transfer,
+                1.0,
+                1.0,
+                support_weight,
+                0.60,
+                2.0,
+                0.40,
+                0.60,
+                1.0,
+            )
+            .expect("visible candidate")
+        };
+        let barely_eligible_extreme = candidate(0.99, 0.01, 1.0);
+        let fully_visible_weaker = candidate(0.90, 1.0, 1.0);
+        assert!(barely_eligible_extreme[1] > fully_visible_weaker[1]);
+        assert!(
+            projection_candidate_wins(fully_visible_weaker, barely_eligible_extreme),
+            "a 1%-eligible raw extreme must lose to a fully visible sample"
+        );
+
+        let equally_visible_stronger = candidate(0.95, 1.0, 1.0);
+        assert!(
+            projection_candidate_wins(equally_visible_stronger, fully_visible_weaker),
+            "mode-aware extremity must deterministically break a visibility tie"
+        );
+
+        let low_support = candidate(0.95, 1.0, 0.02);
+        assert!((low_support[0] - 0.02).abs() < 1.0e-6);
+        assert!((low_support[2] - 0.012).abs() < 1.0e-6);
+        assert!(
+            low_support[2] < 0.08,
+            "HonestFade alpha must not be raised by the old MIP opacity floor"
+        );
         assert_eq!(
-            projection_score_contract(0.85, 0.95, 1.0, 0.0, 0.0, 0.4, -1.0, 1.0),
-            -1.0,
-            "a fully suppressed velocity sample cannot win"
+            projection_candidate_contract(
+                0.85, 0.95, 1.0, 0.0, 1.0, 1.0, 0.60, 0.0, 0.4, -1.0, 1.0,
+            ),
+            None,
+            "a fully suppressed sample cannot enter the MIP winner set"
+        );
+        assert!(
+            super::super::SHADER.contains("* candidate_support"),
+            "WGSL winner visibility must retain the honest support factor"
+        );
+        assert!(
+            super::super::SHADER.contains("color = rgb * maximum_alpha"),
+            "WGSL must use the stored winner contribution for output alpha"
+        );
+        assert!(
+            !super::super::SHADER.contains("clamp(u.opacity * max(support_scale, 0.1), 0.08, 1.0)"),
+            "the old MIP opacity/support floors must not return"
         );
     }
 }
