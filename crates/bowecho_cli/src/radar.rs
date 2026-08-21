@@ -1541,8 +1541,12 @@ fn grid_statistics(grid: &MomentGrid) -> FiniteStatistics {
 }
 
 fn grid_max_range_km(grid: &MomentGrid) -> f32 {
-    ((grid.gate_range.first_gate_m as f64
-        + grid.gate_range.gate_spacing_m as f64 * grid.gate_range.gate_count as f64)
+    let spacing_m = f64::from(grid.gate_range.gate_spacing_m);
+    if grid.gate_range.gate_count == 0 || spacing_m <= 0.0 {
+        return 0.0;
+    }
+    ((f64::from(grid.gate_range.first_gate_m)
+        + spacing_m * (grid.gate_range.gate_count as f64 - 0.5))
         / 1000.0)
         .max(0.0) as f32
 }
@@ -2163,6 +2167,32 @@ fn output_error(error: std::io::Error) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_max_range_uses_outer_edge_of_center_based_last_gate() {
+        let mut grid = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            radar_core::GateRange {
+                first_gate_m: 62,
+                gate_spacing_m: 125,
+                gate_count: 950,
+            },
+            1.0,
+            0.0,
+            None,
+            None,
+        );
+
+        // Gate zero is centred at 62 m, so the far edge is half a gate past
+        // gate 949: 62 + 125 * 949.5 = 118749.5 m.
+        assert!((grid_max_range_km(&grid) - 118.7495).abs() < 0.000_01);
+
+        grid.gate_range.gate_count = 0;
+        assert_eq!(grid_max_range_km(&grid), 0.0);
+        grid.gate_range.gate_count = 950;
+        grid.gate_range.gate_spacing_m = 0;
+        assert_eq!(grid_max_range_km(&grid), 0.0);
+    }
 
     fn context() -> RuntimeContext {
         RuntimeContext::new("test", "test-commit")

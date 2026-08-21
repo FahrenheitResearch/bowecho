@@ -46065,10 +46065,14 @@ fn site_id_is_terminal_radar(site_id: &str) -> bool {
 }
 
 fn grid_range_km(grid: &MomentGrid) -> Option<f32> {
-    let first_gate_m = grid.gate_range.first_gate_m.max(0) as f32;
-    let gate_spacing_m = grid.gate_range.gate_spacing_m.max(0) as f32;
-    let range_km = (first_gate_m + gate_spacing_m * grid.gate_range.gate_count as f32) / 1000.0;
-    (range_km > 0.0).then_some(range_km)
+    let spacing_m = f64::from(grid.gate_range.gate_spacing_m);
+    if grid.gate_range.gate_count == 0 || spacing_m <= 0.0 {
+        return None;
+    }
+    let range_km = (f64::from(grid.gate_range.first_gate_m)
+        + spacing_m * (grid.gate_range.gate_count as f64 - 0.5))
+        / 1000.0;
+    (range_km > 0.0).then_some(range_km as f32)
 }
 
 fn gate_for_range(grid: &MomentGrid, range_km: f32) -> Option<usize> {
@@ -56510,6 +56514,33 @@ mod tests {
         let range = selected_grid_range_km_for(&volume, 0, &product).expect("velocity range");
 
         assert!(range > 0.0);
+    }
+
+    #[test]
+    fn grid_range_uses_outer_edge_of_center_based_last_gate() {
+        let mut grid = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            radar_core::GateRange {
+                first_gate_m: 62,
+                gate_spacing_m: 125,
+                gate_count: 950,
+            },
+            1.0,
+            0.0,
+            None,
+            None,
+        );
+
+        // Gate zero is centred at 62 m, so the far edge is half a gate past
+        // gate 949: 62 + 125 * 949.5 = 118749.5 m.
+        let range_km = grid_range_km(&grid).expect("non-empty gate coverage");
+        assert!((range_km - 118.7495).abs() < 0.000_01);
+
+        grid.gate_range.gate_count = 0;
+        assert_eq!(grid_range_km(&grid), None);
+        grid.gate_range.gate_count = 950;
+        grid.gate_range.gate_spacing_m = 0;
+        assert_eq!(grid_range_km(&grid), None);
     }
 
     #[test]
