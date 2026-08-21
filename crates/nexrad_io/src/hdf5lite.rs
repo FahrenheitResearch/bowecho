@@ -34,7 +34,12 @@
 //! Everything else (fractal heaps, dense attributes, v2 B-trees, shared
 //! messages, fill values beyond zero, named datatypes, ...) is out of scope
 //! and produces an explicit error rather than silent misreads.
+//!
+//! Hostile input is assumed: recursion and decoded allocation are bounded so
+//! a malformed file returns an error instead of overflowing a worker stack or
+//! exhausting the process allocator.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
@@ -52,6 +57,10 @@ const UNDEFINED_ADDR: u64 = u64::MAX;
 const MAX_GROUP_DEPTH: usize = 16;
 /// Defense against corrupt B-trees: most nodes visited per tree walk.
 const MAX_BTREE_NODES: usize = 1 << 16;
+/// Deepest chain of internal B-tree nodes either recursive walker accepts.
+/// Node count alone does not prevent a single-child chain from exhausting a
+/// worker thread's stack.
+const MAX_BTREE_DEPTH: usize = 32;
 /// Defense against corrupt/self-referencing v2 header continuations: most
 /// header blocks (chunk 0 + OCHK continuations) per object header.
 const MAX_HEADER_BLOCKS: usize = 1 << 10;
@@ -62,6 +71,10 @@ const MAX_DATA_CHUNKS: usize = 1 << 18;
 const MAX_DATASPACE_RANK: usize = 32;
 const MAX_DATASPACE_DIM: usize = 100 * 1024 * 1024;
 const MAX_HDF5_DATASET_BYTES: usize = 256 * 1024 * 1024;
+/// Aggregate declared dataset bytes that one HDF5 file view may materialize.
+/// This bounds declaration bombs made from many individually valid planes,
+/// including unwritten planes synthesized from fill values.
+pub(crate) const MAX_HDF5_TOTAL_DATASET_BYTES: usize = 512 * 1024 * 1024;
 const MAX_HDF5_ATTRIBUTE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HDF5_FILTERS: usize = 32;
 const MAX_HDF5_FILTER_VALUES: usize = 1024;
@@ -147,10 +160,18 @@ pub struct H5File<'a> {
     /// Absolute path ("/a/b") → object header address for every object
     /// reachable from the root group.
     objects: BTreeMap<String, u64>,
+    budget_total: usize,
+    budget_left: Cell<usize>,
 }
 
 impl<'a> H5File<'a> {
     pub fn open(bytes: &'a [u8]) -> Result<Self> {
+        Self::open_within_budget(bytes, MAX_HDF5_TOTAL_DATASET_BYTES)
+    }
+
+    /// Open with an explicit aggregate decode budget. Tests use a small value
+    /// to exercise the ceiling without allocating hundreds of megabytes.
+    pub(crate) fn open_within_budget(bytes: &'a [u8], budget: usize) -> Result<Self> {
         if !looks_like_hdf5_bytes(bytes) {
             return Err(invalid(0, "missing HDF5 superblock signature"));
         }
@@ -186,12 +207,30 @@ impl<'a> H5File<'a> {
             offset_size,
             length_size,
             objects: BTreeMap::new(),
+            budget_total: budget,
+            budget_left: Cell::new(budget),
         };
         let header = file.parse_object_header(root_header)?;
         file.objects.insert("/".to_owned(), root_header);
         let mut visited_groups = BTreeSet::from([root_header]);
         file.walk_group("", &header, &mut visited_groups, 0)?;
         Ok(file)
+    }
+
+    fn charge_decode_budget(&self, bytes: usize, what: &str) -> Result<()> {
+        let left = self.budget_left.get();
+        if bytes > left {
+            return Err(invalid(
+                0,
+                format!(
+                    "HDF5 decode budget exhausted: {what} needs {bytes} bytes, {left} of the \
+                     {} byte whole-file budget left",
+                    self.budget_total
+                ),
+            ));
+        }
+        self.budget_left.set(left - bytes);
+        Ok(())
     }
 
     /// Names of the direct children of `path` (groups and datasets).
@@ -258,6 +297,9 @@ impl<'a> H5File<'a> {
             MAX_HDF5_DATASET_BYTES,
             "HDF5 dataset",
         )?;
+        // Charge the declaration before every allocation path, including an
+        // unwritten contiguous plane materialized entirely as fill values.
+        self.charge_decode_budget(byte_len, &format!("dataset '{path}'"))?;
         let raw = match layout {
             Layout::Compact(data) => data,
             Layout::Contiguous { address, size } => {
@@ -307,7 +349,7 @@ impl<'a> H5File<'a> {
             let heap_data = self.local_heap_data(heap)?;
             let mut entries = Vec::new();
             let mut visited_nodes = BTreeSet::new();
-            self.collect_group_entries(btree, &mut entries, &mut visited_nodes)?;
+            self.collect_group_entries(btree, &mut entries, &mut visited_nodes, 0)?;
             for (name_offset, child_address) in entries {
                 let name = heap_string(self.bytes, heap_data, name_offset)?;
                 let path = format!("{prefix}/{name}");
@@ -329,7 +371,11 @@ impl<'a> H5File<'a> {
         node_address: u64,
         out: &mut Vec<(u64, u64)>,
         visited: &mut BTreeSet<u64>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > MAX_BTREE_DEPTH {
+            return Err(invalid(0, "HDF5 group B-tree nested too deep"));
+        }
         if !visited.insert(node_address) {
             return Err(invalid(
                 address_to_usize(node_address)?,
@@ -356,7 +402,7 @@ impl<'a> H5File<'a> {
             if level == 0 {
                 self.read_snod(child, out)?;
             } else {
-                self.collect_group_entries(child, out, visited)?;
+                self.collect_group_entries(child, out, visited, depth + 1)?;
             }
         }
         Ok(())
@@ -1057,6 +1103,7 @@ impl<'a> H5File<'a> {
             chunk_dims.len() + 1,
             &mut chunks,
             &mut visited_nodes,
+            0,
         )?;
         let chunk_elements = checked_product(chunk_dims, "HDF5 chunk element count")?;
         let chunk_bytes = checked_allocation_bytes(
@@ -1104,7 +1151,11 @@ impl<'a> H5File<'a> {
         key_dims: usize,
         out: &mut Vec<ChunkRef>,
         visited: &mut BTreeSet<u64>,
+        depth: usize,
     ) -> Result<()> {
+        if depth > MAX_BTREE_DEPTH {
+            return Err(invalid(0, "HDF5 chunk B-tree nested too deep"));
+        }
         if !visited.insert(node_address) {
             return Err(invalid(
                 address_to_usize(node_address)?,
@@ -1160,7 +1211,7 @@ impl<'a> H5File<'a> {
                     offsets,
                 });
             } else {
-                self.collect_chunks(child, key_dims, out, visited)?;
+                self.collect_chunks(child, key_dims, out, visited, depth + 1)?;
             }
         }
         Ok(())
@@ -1636,6 +1687,8 @@ mod tests {
             offset_size: 8,
             length_size: 8,
             objects: BTreeMap::new(),
+            budget_total: MAX_HDF5_TOTAL_DATASET_BYTES,
+            budget_left: Cell::new(MAX_HDF5_TOTAL_DATASET_BYTES),
         }
     }
 
@@ -1723,7 +1776,7 @@ mod tests {
         let mut entries = Vec::new();
         let mut visited = BTreeSet::new();
         let err = file
-            .collect_group_entries(0, &mut entries, &mut visited)
+            .collect_group_entries(0, &mut entries, &mut visited, 0)
             .expect_err("group B-tree cycle must fail");
         assert!(err.to_string().contains("cycle"));
 
@@ -1736,9 +1789,87 @@ mod tests {
         let mut refs = Vec::new();
         let mut visited = BTreeSet::new();
         let err = file
-            .collect_chunks(0, 1, &mut refs, &mut visited)
+            .collect_chunks(0, 1, &mut refs, &mut visited, 0)
             .expect_err("chunk B-tree cycle must fail");
         assert!(err.to_string().contains("cycle"));
+    }
+
+    /// Build a chain of single-entry v1 internal B-tree nodes. This is the
+    /// crafted shape for which node count does not bound recursion depth.
+    fn btree_chain(node_type: u8, links: usize, key_size: usize) -> Vec<u8> {
+        const OFFSET_SIZE: usize = 8;
+        let header = 8 + 2 * OFFSET_SIZE;
+        let stride = header + key_size + OFFSET_SIZE;
+        let mut bytes = vec![0u8; stride * links];
+        for index in 0..links {
+            let at = index * stride;
+            bytes[at..at + 4].copy_from_slice(b"TREE");
+            bytes[at + 4] = node_type;
+            bytes[at + 5] = 1;
+            bytes[at + 6..at + 8].copy_from_slice(&1u16.to_le_bytes());
+            let child = ((index + 1) * stride) as u64;
+            let child_at = at + header + key_size;
+            bytes[child_at..child_at + OFFSET_SIZE].copy_from_slice(&child.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn btree_walks_reject_crafted_depth() {
+        let chunks = btree_chain(1, 200, 8 + 8);
+        let file = parser(&chunks);
+        let err = file
+            .collect_chunks(0, 1, &mut Vec::new(), &mut BTreeSet::new(), 0)
+            .expect_err("a deep chunk B-tree chain must fail");
+        assert!(err.to_string().contains("too deep"), "{err}");
+
+        let groups = btree_chain(0, 200, 8);
+        let file = parser(&groups);
+        let err = file
+            .collect_group_entries(0, &mut Vec::new(), &mut BTreeSet::new(), 0)
+            .expect_err("a deep group B-tree chain must fail");
+        assert!(err.to_string().contains("too deep"), "{err}");
+    }
+
+    #[test]
+    fn a_deep_btree_chain_cannot_overflow_a_small_stack() {
+        let chain = btree_chain(1, 20_000, 8 + 8);
+        let outcome = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let file = parser(&chain);
+                file.collect_chunks(0, 1, &mut Vec::new(), &mut BTreeSet::new(), 0)
+                    .map_err(|err| err.to_string())
+            })
+            .expect("spawn decoding thread")
+            .join()
+            .expect("the decoding thread must survive the file");
+        assert!(
+            outcome.is_err_and(|message| message.contains("too deep")),
+            "a crafted chain must error, not recurse"
+        );
+    }
+
+    #[test]
+    fn the_decode_budget_bounds_the_sum_of_datasets() {
+        const SYNTH: &[u8] = include_bytes!("../tests/data/odim_pvol_synth.h5");
+        const PLANE_BYTES: usize = 36 * 25;
+
+        let file = H5File::open_within_budget(SYNTH, PLANE_BYTES).expect("open");
+        file.dataset("/dataset1/data1/data")
+            .expect("the first plane fits the budget");
+        let err = file
+            .dataset("/dataset1/data2/data")
+            .expect_err("the sum of planes must be bounded");
+        assert!(err.to_string().contains("decode budget"), "{err}");
+
+        let file = H5File::open(SYNTH).expect("open");
+        let planes = file.child_names("/dataset1");
+        assert!(planes.len() > 2, "fixture must have several planes");
+        for plane in planes.iter().filter(|name| name.starts_with("data")) {
+            file.dataset(&format!("/dataset1/{plane}/data"))
+                .unwrap_or_else(|err| panic!("{plane} must decode: {err}"));
+        }
     }
 
     /// Jenkins lookup3 (hashlittle) known-answer vectors. The 30-byte

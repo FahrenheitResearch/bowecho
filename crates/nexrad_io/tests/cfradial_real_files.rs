@@ -64,6 +64,11 @@ fn real_xsapr_ppi_decodes_site_geometry_and_gates() {
     let cut = &volume.cuts[0];
     assert_close(cut.elevation_deg, 0.5, 1e-3, "fixed angle");
     assert_eq!(cut.radials.len(), 40);
+    // time(time) counts from 10:54:08Z while time_coverage_start is
+    // 10:54:16Z. Offsets in the shared model are relative to the latter.
+    assert_eq!(cut.radials[0].time_offset_ms, 0);
+    assert_eq!(cut.radials[20].time_offset_ms, -7000);
+    assert_eq!(cut.radials[39].time_offset_ms, -1000);
     assert_close(cut.radials[0].azimuth_deg, 359.9368, 1e-3, "az0");
     assert_close(cut.radials[0].elevation_deg, 0.4834, 1e-3, "el0");
     assert_close(
@@ -72,19 +77,20 @@ fn real_xsapr_ppi_decodes_site_geometry_and_gates() {
         1e-3,
         "nyq",
     );
-    // Py-ART's decimation left range centers 0, 960, ... -> derived start
-    // is -480 m (center minus half a gate). Faithful to the file.
+    // Py-ART's decimation left range centers 0, 960, ...; first_gate_m is
+    // the gate-0 center, matching every GateRange consumer.
     let gates = &cut.radials[0].gate_range;
     assert_eq!(
         (gates.first_gate_m, gates.gate_spacing_m, gates.gate_count),
-        (-480, 960, 42)
+        (0, 960, 42)
     );
 
-    // Field name "reflectivity_horizontal" has no canonical stem: stays an
-    // Unknown moment under its CF name rather than guessing.
+    // `reflectivity_horizontal` is CfRadial's standard field spelling and
+    // must reach the shared reflectivity slot rather than loading invisibly
+    // as an unknown product.
     let reflectivity = cut
         .moments
-        .get(&MomentType::Unknown("reflectivity_horizontal".to_owned()))
+        .get(&MomentType::Reflectivity)
         .expect("reflectivity_horizontal");
     assert_close(
         reflectivity.scaled_value(0, 0).unwrap(),
@@ -162,7 +168,7 @@ fn real_dow8_rhi_decodes_scan_mode_geometry_and_gates() {
     let gates = &cut.radials[0].gate_range;
     assert_eq!(
         (gates.first_gate_m, gates.gate_spacing_m, gates.gate_count),
-        (0, 125, 950)
+        (62, 125, 950)
     );
     assert_close(
         cut.radials[0].nyquist_velocity_mps.expect("nyquist"),

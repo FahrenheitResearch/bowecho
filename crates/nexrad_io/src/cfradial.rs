@@ -31,10 +31,29 @@ use radar_core::{
     RayInstrumentMetadata, ScanLegMetadata, ScanMode, VcpInfo,
 };
 
-use crate::dorade::canonical_moment;
+use crate::dorade::canonical_moment as canonical_dorade_moment;
 pub use crate::netcdf3::looks_like_netcdf3_bytes;
 use crate::netcdf3::{Nc3File, NcArray, NcVar};
 use crate::{NexradError, Result};
+
+/// Hard ceiling for per-sweep bookkeeping. A conformant CfRadial volume has
+/// at most one sweep per ray; real volumes are orders of magnitude below this.
+const MAX_SWEEPS: usize = 4096;
+
+fn bounded_sweep_count(declared: usize, ray_count: usize) -> usize {
+    declared.min(ray_count).min(MAX_SWEEPS)
+}
+
+fn reserve_sweep_rows(decoded: &mut usize, rows: usize, budget: usize) -> bool {
+    let Some(next) = decoded.checked_add(rows) else {
+        return false;
+    };
+    if next > budget {
+        return false;
+    }
+    *decoded = next;
+    true
+}
 
 /// Decode a CfRadial 1.x byte buffer into the shared radar model.
 pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
@@ -77,18 +96,17 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
         || ray_pulse_count.is_some()
         || ray_independent_samples.is_some();
 
-    // Gate geometry: range(range) gate centers in metres (spec §5.5); the
-    // start_range/gate spacing attributes are optional, so derive from the
-    // coordinate values themselves.
+    // Gate geometry: range(range) holds gate centers in metres (spec §5.5).
+    // GateRange::first_gate_m is also the center of gate 0: the NEXRAD path
+    // stores the ICD's "range to center of first range gate" unchanged, and
+    // render/derived samplers resolve round((range - first) / spacing).
     let range = read_f64s(&file, "range")?;
     if range.len() < 2 {
         return Err(invalid("range coordinate needs at least two gates"));
     }
     let spacing = (range[1] - range[0]).round().max(1.0);
-    // Center of first gate − half a gate = range to gate start.
-    let first_gate = (range[0] - spacing / 2.0).round();
     let gate_range = GateRange {
-        first_gate_m: first_gate as i32,
+        first_gate_m: range[0].round() as i32,
         gate_spacing_m: spacing as i32,
         gate_count: n_gates,
     };
@@ -97,16 +115,23 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     let fixed_angles = read_f64s(&file, "fixed_angle").unwrap_or_default();
     let sweep_starts = read_f64s(&file, "sweep_start_ray_index").unwrap_or_default();
     let sweep_ends = read_f64s(&file, "sweep_end_ray_index").unwrap_or_default();
-    let sweep_count = fixed_angles.len().max(1);
+    let indexed_sweeps = sweep_starts.len().min(sweep_ends.len());
+    let declared_sweeps = fixed_angles.len().max(indexed_sweeps).max(1);
+    // Sweep index arrays partition the ray list, so a declared sweep count
+    // larger than the ray count cannot be legitimate. Without this bound a
+    // small header can replicate a complete moment grid thousands of times.
+    let sweep_count = bounded_sweep_count(declared_sweeps, n_rays);
     let sweep_modes = read_sweep_modes(&file, sweep_count);
 
+    let time_epoch = time_units_epoch(&file);
+    let volume_time = parse_time_coverage_start(&file)
+        .or(time_epoch)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
     let mut volume = RadarVolume {
         site: parse_site(&file),
+        volume_time,
         ..RadarVolume::default()
     };
-    if let Some(start) = parse_time_coverage_start(&file) {
-        volume.volume_time = start;
-    }
     volume.metadata.archive_version = Some(
         file.gattr_str("version")
             .map(str::to_owned)
@@ -154,8 +179,13 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     volume.metadata.microphysics_scheme = metadata_text(&file, "microphysics_scheme");
     volume.metadata.scattering_model = metadata_text(&file, "scattering_model");
 
-    // Ray times (seconds offset from time_coverage_start).
+    // `time(time)` is relative to the epoch named by its own CF `units`,
+    // which is not always time_coverage_start. Store offsets relative to the
+    // volume time carried by the shared model.
     let ray_seconds = read_f64s(&file, "time").ok();
+    let time_epoch_shift_ms = time_epoch
+        .map(|epoch| (epoch - volume_time).num_milliseconds() as f64)
+        .unwrap_or(0.0);
     let source_row_indices = read_f64s(&file, "vcp_source_row_index").ok();
     let vcp_azimuth_rates = read_f64s(&file, "vcp_azimuth_rate").ok();
     let vcp_source_periods = read_f64s(&file, "vcp_source_period").ok();
@@ -189,6 +219,12 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     // once and distribute its rows across every sweep. The former
     // sweep-outer loop reread and reconverted each full field once per sweep.
     let mut sweeps = Vec::with_capacity(sweep_count);
+    volume.metadata.skipped_message_count += declared_sweeps - sweep_count;
+    // One ray of slack per sweep tolerates writers with exclusive end
+    // indices. Beyond that, overlapping sweeps would duplicate the ray list
+    // and its complete moment grids without bound.
+    let row_budget = n_rays.saturating_add(sweep_count);
+    let mut decoded_rows = 0usize;
     for sweep in 0..sweep_count {
         let start_ray = sweep_starts.get(sweep).map(|v| *v as usize).unwrap_or(0);
         let end_ray = sweep_ends
@@ -196,6 +232,11 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
             .map(|v| (*v as usize).min(n_rays.saturating_sub(1)))
             .unwrap_or(n_rays.saturating_sub(1));
         if start_ray > end_ray || end_ray >= n_rays {
+            volume.metadata.skipped_message_count += 1;
+            continue;
+        }
+        let sweep_rows = end_ray - start_ray + 1;
+        if !reserve_sweep_rows(&mut decoded_rows, sweep_rows, row_budget) {
             volume.metadata.skipped_message_count += 1;
             continue;
         }
@@ -211,7 +252,8 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
             let time_offset_ms = ray_seconds
                 .as_ref()
                 .and_then(|seconds| seconds.get(ray))
-                .map(|seconds| (seconds * 1000.0) as i32)
+                .filter(|seconds| seconds.is_finite())
+                .map(|seconds| (seconds * 1000.0 + time_epoch_shift_ms) as i32)
                 .unwrap_or(0);
             cut.radials.push(Radial {
                 azimuth_deg: (azimuth[ray] as f32).rem_euclid(360.0),
@@ -266,7 +308,7 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
         .ok_or_else(|| invalid("CfRadial field dimensions overflow addressable memory"))?;
     let mut canonical_fields = BTreeSet::new();
     for field in fields {
-        let moment = match canonical_moment(&field.name) {
+        let moment = match canonical_moment_for_field(field) {
             Some(moment) if canonical_fields.insert(moment.clone()) => moment,
             _ => MomentType::Unknown(field.name.clone()),
         };
@@ -318,6 +360,70 @@ struct DecodedSweep {
     end_ray: usize,
     cut: ElevationCut,
     scan_leg: ScanLegMetadata,
+}
+
+/// Resolve a CfRadial field by its own name first, then by the CF
+/// `standard_name` it declares. Whole-name matching keeps diagnostics such as
+/// velocity texture out of the measured velocity slot.
+fn canonical_moment_for_field(var: &NcVar) -> Option<MomentType> {
+    canonical_moment_from_names(&var.name, var.attr_str("standard_name"))
+}
+
+fn canonical_moment_from_names(name: &str, standard_name: Option<&str>) -> Option<MomentType> {
+    canonical_cfradial_name(name).or_else(|| {
+        if field_name_is_derived_diagnostic(name) {
+            return None;
+        }
+        standard_name.and_then(canonical_cfradial_name)
+    })
+}
+
+/// Py-ART derives texture/simulated fields by copying a measured field's
+/// metadata, including its `standard_name`. Those values are diagnostics, not
+/// the source moment, so the attribute fallback must not promote them.
+fn field_name_is_derived_diagnostic(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_uppercase();
+    normalized
+        .strip_suffix("_TEXTURE")
+        .is_some_and(|stem| !stem.is_empty())
+        || normalized == "SIMULATED_VELOCITY"
+}
+
+fn canonical_cfradial_name(name: &str) -> Option<MomentType> {
+    if let Some(moment) = canonical_dorade_moment(name) {
+        return Some(moment);
+    }
+    match name.trim().to_ascii_uppercase().as_str() {
+        "EQUIVALENT_REFLECTIVITY_FACTOR"
+        | "REFLECTIVITY"
+        | "REFLECTIVITY_HORIZONTAL"
+        | "REFLECTIVITY_VERTICAL"
+        | "CORRECTED_REFLECTIVITY"
+        | "CORRECTED_REFLECTIVITY_HORIZONTAL" => Some(MomentType::Reflectivity),
+        "RADIAL_VELOCITY_OF_SCATTERERS_AWAY_FROM_INSTRUMENT"
+        | "MEAN_DOPPLER_VELOCITY"
+        | "DOPPLER_VELOCITY"
+        | "RADIAL_VELOCITY"
+        | "VELOCITY"
+        | "CORRECTED_VELOCITY" => Some(MomentType::Velocity),
+        "DOPPLER_SPECTRUM_WIDTH" | "SPECTRAL_WIDTH" => Some(MomentType::SpectrumWidth),
+        "LOG_DIFFERENTIAL_REFLECTIVITY_HV"
+        | "DIFFERENTIAL_REFLECTIVITY"
+        | "CORRECTED_DIFFERENTIAL_REFLECTIVITY" => Some(MomentType::DifferentialReflectivity),
+        "CROSS_CORRELATION_RATIO_HV"
+        | "RADAR_CORRELATION_COEFFICIENT_HV"
+        | "CROSS_CORRELATION_RATIO"
+        | "COPOL_COEFF"
+        | "COPOL_CORRELATION_COEFF" => Some(MomentType::CorrelationCoefficient),
+        "DIFFERENTIAL_PHASE_HV"
+        | "DIFFERENTIAL_PHASE"
+        | "UNFOLDED_DIFFERENTIAL_PHASE"
+        | "CORRECTED_DIFFERENTIAL_PHASE" => Some(MomentType::DifferentialPhase),
+        "SPECIFIC_DIFFERENTIAL_PHASE_HV"
+        | "SPECIFIC_DIFFERENTIAL_PHASE"
+        | "CORRECTED_SPECIFIC_DIFFERENTIAL_PHASE" => Some(MomentType::SpecificDifferentialPhase),
+        _ => None,
+    }
 }
 
 fn numeric_at(values: &Option<Vec<f64>>, index: usize) -> Option<f64> {
@@ -437,12 +543,21 @@ fn read_field_physical(file: &Nc3File<'_>, var: &NcVar) -> Result<Vec<f32>> {
         let value = raw.get_f64(index);
         match value {
             Some(value) if Some(value) != fill && value.is_finite() => {
-                out.push((value * scale + offset) as f32);
+                out.push(packed_physical_f32(value, scale, offset));
             }
             _ => out.push(f32::NAN),
         }
     }
     Ok(out)
+}
+
+fn packed_physical_f32(value: f64, scale: f64, offset: f64) -> f32 {
+    let physical = (value * scale + offset) as f32;
+    if physical.is_finite() {
+        physical
+    } else {
+        f32::NAN
+    }
 }
 
 fn read_f64s(file: &Nc3File<'_>, name: &str) -> Result<Vec<f64>> {
@@ -536,9 +651,32 @@ fn parse_time_coverage_start(file: &Nc3File<'_>) -> Option<DateTime<Utc>> {
         }
         _ => file.gattr_str("time_coverage_start")?.to_owned(),
     };
-    let trimmed = text.trim().trim_end_matches('Z');
-    let naive = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S")
-        .or_else(|_| NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S"))
+    parse_iso8601_utc(&text)
+}
+
+/// Epoch named by `time(time)`'s CF "seconds since <datetime>" units.
+fn time_units_epoch(file: &Nc3File<'_>) -> Option<DateTime<Utc>> {
+    let units = file.vars.get("time")?.attr_str("units")?;
+    let (unit, epoch) = units.split_once(" since ")?;
+    if !matches!(
+        unit.trim().to_ascii_lowercase().as_str(),
+        "second" | "seconds" | "sec" | "secs" | "s"
+    ) {
+        return None;
+    }
+    parse_iso8601_utc(epoch)
+}
+
+fn parse_iso8601_utc(text: &str) -> Option<DateTime<Utc>> {
+    let mut trimmed = text.trim();
+    for suffix in ["Z", "z", "UTC", "+00:00", "-00:00", "+0000", "-0000"] {
+        if let Some(rest) = trimmed.strip_suffix(suffix) {
+            trimmed = rest.trim_end();
+            break;
+        }
+    }
+    let naive = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f"))
         .ok()?;
     Some(Utc.from_utc_datetime(&naive))
 }
@@ -800,6 +938,96 @@ fn invalid(reason: impl Into<String>) -> NexradError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cf_and_arm_field_names_reach_canonical_moments() {
+        assert_eq!(
+            canonical_moment_from_names("reflectivity_horizontal", None),
+            Some(MomentType::Reflectivity)
+        );
+        assert_eq!(
+            canonical_moment_from_names("DR", Some("log_differential_reflectivity_hv")),
+            Some(MomentType::DifferentialReflectivity)
+        );
+        for name in [
+            "copol_coeff",
+            "copol_correlation_coeff",
+            "radar_correlation_coefficient_hv",
+        ] {
+            assert_eq!(
+                canonical_moment_from_names(name, None),
+                Some(MomentType::CorrelationCoefficient),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_standard_names_do_not_promote_derived_diagnostics() {
+        assert_eq!(
+            canonical_moment_from_names(
+                "velocity_texture",
+                Some("radial_velocity_of_scatterers_away_from_instrument")
+            ),
+            None
+        );
+        assert_eq!(
+            canonical_moment_from_names(
+                "reflectivity_texture",
+                Some("equivalent_reflectivity_factor")
+            ),
+            None
+        );
+        assert_eq!(
+            canonical_moment_from_names(
+                "simulated_velocity",
+                Some("radial_velocity_of_scatterers_away_from_instrument")
+            ),
+            None
+        );
+        assert_eq!(
+            canonical_moment_from_names("co_to_crosspol_correlation_coeff", None),
+            None
+        );
+        assert_eq!(
+            canonical_moment_from_names(
+                "correlation_texture",
+                Some("radar_correlation_coefficient_copolar_h_crosspolar_v")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cfradial_iso_times_accept_fractional_seconds_and_zero_offsets() {
+        let expected = Utc.with_ymd_and_hms(2026, 8, 20, 11, 36, 6).unwrap()
+            + chrono::Duration::milliseconds(500);
+        for text in ["2026-08-20T11:36:06.500Z", "2026-08-20 11:36:06.500+00:00"] {
+            assert_eq!(parse_iso8601_utc(text), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn sweep_bookkeeping_is_bounded_by_rays_and_a_hard_ceiling() {
+        assert_eq!(bounded_sweep_count(20_000, 4), 4);
+        assert_eq!(bounded_sweep_count(20_000, 100_000), MAX_SWEEPS);
+        assert_eq!(bounded_sweep_count(19, 3600), 19);
+
+        let mut decoded = 0usize;
+        assert!(reserve_sweep_rows(&mut decoded, 100, 102));
+        assert!(reserve_sweep_rows(&mut decoded, 2, 102));
+        assert!(!reserve_sweep_rows(&mut decoded, 1, 102));
+        assert_eq!(decoded, 102);
+        let mut overflow = usize::MAX;
+        assert!(!reserve_sweep_rows(&mut overflow, 1, usize::MAX));
+    }
+
+    #[test]
+    fn nonfinite_packed_values_become_missing_data() {
+        assert_eq!(packed_physical_f32(10.0, 0.5, -1.0), 4.0);
+        assert!(packed_physical_f32(1.0e300, 1.0, 0.0).is_nan());
+        assert!(packed_physical_f32(1.0, 0.0, f64::INFINITY).is_nan());
+    }
 
     #[test]
     fn sweep_mode_vocabulary_maps_to_scan_modes() {

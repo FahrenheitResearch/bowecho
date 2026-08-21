@@ -46,8 +46,8 @@ fn decodes_synthetic_cfradial1_volume() {
     assert_eq!(cut.radials[0].azimuth_deg, 15.0);
     assert_eq!(cut.radials[3].azimuth_deg, 105.0);
     assert_eq!(cut.radials[0].elevation_deg, 0.5);
-    // range centers start at 125 m with 250 m spacing → gate start 0 m.
-    assert_eq!(cut.radials[0].gate_range.first_gate_m, 0);
+    // range centers start at 125 m; first_gate_m is the gate-0 center.
+    assert_eq!(cut.radials[0].gate_range.first_gate_m, 125);
     assert_eq!(cut.radials[0].gate_range.gate_spacing_m, 250);
     assert_eq!(cut.radials[0].gate_range.gate_count, 20);
     assert_eq!(cut.radials[0].nyquist_velocity_mps, Some(26.4));
