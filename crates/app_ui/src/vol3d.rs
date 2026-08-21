@@ -92,6 +92,128 @@ impl Vol3dThresholdMode {
     }
 }
 
+/// Physical-value contract used by the one-click 3D presets. Radar moments do
+/// not share reflectivity's dBZ range or even its transfer sense: low CC is the
+/// signal of interest, while signed velocity uses an excluded band around
+/// zero. Keeping the range, default threshold, and mode together prevents a
+/// visual preset from silently installing a dBZ constant into another field.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vol3dScalarDomain {
+    value_min: f32,
+    value_max: f32,
+    default_threshold: f32,
+    threshold_mode: Vol3dThresholdMode,
+}
+
+impl Vol3dScalarDomain {
+    pub fn new(
+        value_min: f32,
+        value_max: f32,
+        default_threshold: f32,
+        threshold_mode: Vol3dThresholdMode,
+    ) -> Self {
+        let (value_min, value_max) =
+            if value_min.is_finite() && value_max.is_finite() && value_max > value_min {
+                (value_min, value_max)
+            } else {
+                (0.0, 1.0)
+            };
+        let default_threshold = match threshold_mode {
+            Vol3dThresholdMode::Outside => default_threshold
+                .abs()
+                .clamp(0.0, value_min.abs().max(value_max.abs())),
+            _ => default_threshold.clamp(value_min, value_max),
+        };
+        Self {
+            value_min,
+            value_max,
+            default_threshold,
+            threshold_mode,
+        }
+    }
+
+    pub fn value_min(self) -> f32 {
+        self.value_min
+    }
+
+    pub fn value_max(self) -> f32 {
+        self.value_max
+    }
+
+    pub fn span(self) -> f32 {
+        self.value_max - self.value_min
+    }
+
+    pub fn threshold_mode(self) -> Vol3dThresholdMode {
+        self.threshold_mode
+    }
+
+    pub fn balanced_threshold(self) -> f32 {
+        self.default_threshold
+    }
+
+    /// Broad structural context: move halfway toward the inclusive endpoint.
+    /// Above includes lower values, Below includes higher values, and Outside
+    /// narrows the excluded near-zero band.
+    pub fn structure_threshold(self) -> f32 {
+        match self.threshold_mode {
+            Vol3dThresholdMode::Above => midpoint(self.default_threshold, self.value_min, 0.5),
+            Vol3dThresholdMode::Below => midpoint(self.default_threshold, self.value_max, 0.5),
+            Vol3dThresholdMode::Outside => self.default_threshold * (2.0 / 3.0),
+        }
+    }
+
+    /// Selective core/anomaly context. Above moves toward the high endpoint,
+    /// Below toward the low endpoint, and Outside widens the excluded band.
+    pub fn core_threshold(self) -> f32 {
+        match self.threshold_mode {
+            Vol3dThresholdMode::Above => midpoint(self.default_threshold, self.value_max, 0.125),
+            Vol3dThresholdMode::Below => midpoint(self.default_threshold, self.value_min, 0.25),
+            Vol3dThresholdMode::Outside => midpoint(
+                self.default_threshold,
+                self.value_min.abs().max(self.value_max.abs()),
+                0.25,
+            ),
+        }
+    }
+
+    pub fn hybrid_iso_value(self) -> f32 {
+        self.selective_value(0.10)
+    }
+
+    pub fn surface_iso_value(self) -> f32 {
+        self.selective_value(0.225)
+    }
+
+    /// About 2.5% of the physical palette span: 2.25 dBZ on the standard
+    /// -10..80 REF domain, but 0.021 rho on the 0.20..1.05 CC domain.
+    pub fn suggested_iso_width(self) -> f32 {
+        self.span() * 0.025
+    }
+
+    /// UI range for shell width in physical units. The shader receives the
+    /// normalized value, but a forecaster must edit dBZ, rho, dB, and so on.
+    pub fn iso_width_range(self) -> std::ops::RangeInclusive<f32> {
+        self.span() * 0.0025..=self.span() * 0.15
+    }
+
+    fn selective_value(self, fraction: f32) -> f32 {
+        match self.threshold_mode {
+            Vol3dThresholdMode::Above => midpoint(self.default_threshold, self.value_max, fraction),
+            Vol3dThresholdMode::Below => midpoint(self.default_threshold, self.value_min, fraction),
+            Vol3dThresholdMode::Outside => midpoint(
+                self.default_threshold,
+                self.value_min.abs().max(self.value_max.abs()),
+                fraction,
+            ),
+        }
+    }
+}
+
+fn midpoint(start: f32, end: f32, fraction: f32) -> f32 {
+    start + (end - start) * fraction.clamp(0.0, 1.0)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Vol3dQuality {
     Draft,
@@ -503,24 +625,27 @@ impl Vol3d {
         self.enter_orbit_mode();
     }
 
-    pub fn apply_balanced_preset(&mut self) {
-        self.threshold_dbz = 25.0;
+    pub fn apply_balanced_preset(&mut self, domain: Vol3dScalarDomain) {
+        self.threshold_mode = domain.threshold_mode();
+        self.threshold_dbz = domain.balanced_threshold();
         self.opacity = 0.48;
         self.density = 1.0;
         self.shading = 0.65;
         self.quality = Vol3dQuality::Balanced;
     }
 
-    pub fn apply_structure_preset(&mut self) {
-        self.threshold_dbz = 12.0;
+    pub fn apply_structure_preset(&mut self, domain: Vol3dScalarDomain) {
+        self.threshold_mode = domain.threshold_mode();
+        self.threshold_dbz = domain.structure_threshold();
         self.opacity = 0.28;
         self.density = 0.78;
         self.shading = 0.90;
         self.quality = Vol3dQuality::High;
     }
 
-    pub fn apply_core_preset(&mut self) {
-        self.threshold_dbz = 40.0;
+    pub fn apply_core_preset(&mut self, domain: Vol3dScalarDomain) {
+        self.threshold_mode = domain.threshold_mode();
+        self.threshold_dbz = domain.core_threshold();
         self.opacity = 0.72;
         self.density = 1.35;
         self.shading = 0.48;
@@ -570,19 +695,20 @@ impl Vol3d {
         self.jitter_strength = 0.72;
     }
 
-    pub fn apply_sota_hybrid_preset(&mut self) {
+    pub fn apply_sota_hybrid_preset(&mut self, domain: Vol3dScalarDomain) {
         self.render_mode = Vol3dRenderMode::HybridShell;
         self.support_mode = SupportMode::HonestFade;
-        self.iso_value = 40.0;
-        self.iso_width = 2.0;
+        self.iso_value = domain.hybrid_iso_value();
+        self.iso_width = domain.suggested_iso_width();
         self.preintegration = true;
         self.adaptive_strength = 0.9;
     }
 
-    pub fn apply_sota_surface_preset(&mut self) {
+    pub fn apply_sota_surface_preset(&mut self, domain: Vol3dScalarDomain) {
         self.render_mode = Vol3dRenderMode::Isosurface;
         self.support_mode = SupportMode::HonestFade;
-        self.iso_value = 45.0;
+        self.iso_value = domain.surface_iso_value();
+        self.iso_width = domain.suggested_iso_width();
         self.preintegration = false;
         self.adaptive_strength = 1.0;
     }
@@ -1190,6 +1316,34 @@ fn support_color(value: f32) -> vec3<f32> {
     return mix(middle, high, (value - 0.5) * 2.0);
 }
 
+// Score one contributing sample for Maximum Projection. "Maximum" follows
+// the visible transfer, not blindly the raw scalar: Above keeps the largest
+// value, Below keeps the smallest value, and Outside keeps the largest
+// excursion beyond the excluded central band. Velocity two-box rendering is
+// deliberately different: reflectivity remains the eligibility/structure
+// field, but the winning eligible sample is the strongest signed-velocity
+// magnitude and retains that sample's inbound/outbound LUT color.
+fn maximum_projection_score(
+    structure: f32,
+    color_value: f32,
+    transfer: f32,
+    emphasis: f32
+) -> f32 {
+    if (transfer * emphasis <= 0.0) {
+        return -1.0;
+    }
+    if (u.velocity_mode > 0.5) {
+        return clamp(abs(color_value - 0.5) * 2.0, 0.0, 1.0);
+    }
+    if (u.threshold_mode > 1.5) {
+        return max(u.threshold - structure, structure - u.threshold_high);
+    }
+    if (u.threshold_mode > 0.5) {
+        return 1.0 - structure;
+    }
+    return structure;
+}
+
 fn refined_iso_t(ro: vec3<f32>, rd: vec3<f32>, ta_in: f32, tb_in: f32) -> f32 {
     var ta = ta_in;
     var tb = tb_in;
@@ -1316,7 +1470,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             ).r;
             var have_previous = false;
             var shell_drawn = false;
-            var maximum_value = -1.0;
+            var maximum_score = -1.0;
             var maximum_lut = 0.0;
             var maximum_support = 0.0;
             var maximum_uvw = vec3<f32>(0.5);
@@ -1361,12 +1515,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     );
                 }
 
-                // Maximum projection keeps the strongest contributing structure
-                // while preserving velocity color at that same voxel.
+                // Maximum projection follows the active transfer sense. In
+                // velocity two-box mode REF only gates eligibility; the
+                // strongest |velocity| wins and keeps its signed LUT color.
                 if (u.render_mode > 2.5 && u.render_mode < 3.5) {
-                    let candidate = transfer * emphasis;
-                    if (candidate > 0.0 && structure > maximum_value) {
-                        maximum_value = structure;
+                    let candidate = maximum_projection_score(
+                        structure, lut_coord, transfer, emphasis
+                    );
+                    if (candidate > maximum_score) {
+                        maximum_score = candidate;
                         maximum_lut = lut_coord;
                         maximum_support = support;
                         maximum_uvw = uvw;
@@ -1458,7 +1615,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 t = t + max(step_dt, base_dt * 0.35);
             }
 
-            if (u.render_mode > 2.5 && u.render_mode < 3.5 && maximum_value >= 0.0) {
+            if (u.render_mode > 2.5 && u.render_mode < 3.5 && maximum_score >= 0.0) {
                 let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(maximum_lut, 0.5), 0.0);
                 let support_scale = support_weight(maximum_support);
                 let alpha = clamp(u.opacity * max(support_scale, 0.1), 0.08, 1.0);
@@ -2657,6 +2814,102 @@ mod tests {
         assert!(v.vel_ref_gate_dbz > 0.0 && v.vel_ref_gate_dbz < 80.0);
         assert!((0.0..=1.0).contains(&v.vel_couplet_emphasis));
         assert!(!v.velocity_color_active);
+    }
+
+    #[test]
+    fn scalar_preset_domains_follow_each_moments_range_and_transfer_sense() {
+        let cases = [
+            (
+                "CC",
+                Vol3dScalarDomain::new(0.20, 1.05, 0.92, Vol3dThresholdMode::Below),
+            ),
+            (
+                "ZDR",
+                Vol3dScalarDomain::new(-4.0, 8.0, 1.25, Vol3dThresholdMode::Above),
+            ),
+            (
+                "KDP",
+                Vol3dScalarDomain::new(-1.0, 7.0, 0.8, Vol3dThresholdMode::Above),
+            ),
+            (
+                "SW",
+                Vol3dScalarDomain::new(0.0, 24.0, 5.0, Vol3dThresholdMode::Above),
+            ),
+            (
+                "PHI",
+                Vol3dScalarDomain::new(0.0, 360.0, 60.0, Vol3dThresholdMode::Above),
+            ),
+        ];
+
+        for (label, domain) in cases {
+            let structure = domain.structure_threshold();
+            let balanced = domain.balanced_threshold();
+            let core = domain.core_threshold();
+            let hybrid = domain.hybrid_iso_value();
+            let surface = domain.surface_iso_value();
+            for value in [structure, balanced, core, hybrid, surface] {
+                assert!(
+                    value.is_finite() && value >= domain.value_min() && value <= domain.value_max(),
+                    "{label} preset value {value} outside [{}, {}]",
+                    domain.value_min(),
+                    domain.value_max()
+                );
+            }
+            assert!(
+                domain
+                    .iso_width_range()
+                    .contains(&domain.suggested_iso_width()),
+                "{label} shell width must scale inside its own physical domain"
+            );
+            match domain.threshold_mode() {
+                Vol3dThresholdMode::Above => {
+                    assert!(structure < balanced, "{label} Structure must be broader");
+                    assert!(
+                        balanced < hybrid && hybrid < core && core < surface,
+                        "{label} selective presets must tighten monotonically"
+                    );
+                }
+                Vol3dThresholdMode::Below => {
+                    assert!(structure > balanced, "{label} Structure must be broader");
+                    assert!(
+                        balanced > hybrid && hybrid > surface && surface > core,
+                        "{label} low-value anomaly presets must tighten downward"
+                    );
+                }
+                Vol3dThresholdMode::Outside => unreachable!(),
+            }
+
+            let mut renderer = Vol3d::default();
+            renderer.apply_structure_preset(domain);
+            assert_eq!(renderer.threshold_mode, domain.threshold_mode());
+            assert!((renderer.threshold_dbz - structure).abs() < 1.0e-6);
+            renderer.apply_balanced_preset(domain);
+            assert!((renderer.threshold_dbz - balanced).abs() < 1.0e-6);
+            renderer.apply_core_preset(domain);
+            assert!((renderer.threshold_dbz - core).abs() < 1.0e-6);
+            renderer.apply_sota_hybrid_preset(domain);
+            assert!((renderer.iso_value - hybrid).abs() < 1.0e-6);
+            assert!((renderer.iso_width - domain.suggested_iso_width()).abs() < 1.0e-6);
+            renderer.apply_sota_surface_preset(domain);
+            assert!((renderer.iso_value - surface).abs() < 1.0e-6);
+            assert!((renderer.iso_width - domain.suggested_iso_width()).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn reflectivity_and_velocity_domains_retain_familiar_preset_strengths() {
+        let reflectivity = Vol3dScalarDomain::new(-10.0, 80.0, 35.0, Vol3dThresholdMode::Above);
+        assert!((reflectivity.structure_threshold() - 12.5).abs() < 1.0e-6);
+        assert!((reflectivity.core_threshold() - 40.625).abs() < 1.0e-6);
+        assert!((reflectivity.hybrid_iso_value() - 39.5).abs() < 1.0e-6);
+        assert!((reflectivity.surface_iso_value() - 45.125).abs() < 1.0e-6);
+        assert!((reflectivity.suggested_iso_width() - 2.25).abs() < 1.0e-6);
+
+        let velocity = Vol3dScalarDomain::new(-100.0, 100.0, 18.0, Vol3dThresholdMode::Outside);
+        assert!(velocity.structure_threshold() < velocity.balanced_threshold());
+        assert!(velocity.balanced_threshold() < velocity.hybrid_iso_value());
+        assert!(velocity.hybrid_iso_value() < velocity.surface_iso_value());
+        assert!(velocity.surface_iso_value() < velocity.core_threshold());
     }
 
     #[test]

@@ -9,6 +9,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+const PREINTEGRATION_LUT_SIZE: usize = 256;
+
 pub const FINE_BRICK_X: usize = 8;
 pub const FINE_BRICK_Y: usize = 8;
 pub const FINE_BRICK_Z: usize = 8;
@@ -314,12 +316,12 @@ fn threshold_strength(value: f32, low: f32, high: f32, mode: f32, width: f32) ->
 }
 
 fn lut_sample(lut: &[u8], value: f32) -> [f32; 4] {
-    if lut.len() < 256 * 4 {
+    if lut.len() < PREINTEGRATION_LUT_SIZE * 4 {
         return [0.0; 4];
     }
-    let x = value.clamp(0.0, 1.0) * 255.0;
+    let x = value.clamp(0.0, 1.0) * (PREINTEGRATION_LUT_SIZE - 1) as f32;
     let i0 = x.floor() as usize;
-    let i1 = (i0 + 1).min(255);
+    let i1 = (i0 + 1).min(PREINTEGRATION_LUT_SIZE - 1);
     let t = x - i0 as f32;
     let mut out = [0.0f32; 4];
     for channel in 0..4 {
@@ -328,6 +330,16 @@ fn lut_sample(lut: &[u8], value: f32) -> [f32; 4] {
         out[channel] = a + (b - a) * t;
     }
     out
+}
+
+/// Byte offset for the texel sampled by WGSL as
+/// `vec2(previous_structure, structure)`: texture X is the segment start and
+/// texture Y is the segment end. A row-major upload therefore stores the end
+/// index first. Reversing these axes reverses front-to-back color integration
+/// on every rising/falling field gradient even though segment alpha can look
+/// deceptively similar.
+fn preintegration_texel_offset(previous: usize, current: usize) -> usize {
+    (current * PREINTEGRATION_LUT_SIZE + previous) * 4
 }
 
 /// Build a 256x256 segment-preintegration table. RGB is stored straight-alpha;
@@ -341,14 +353,15 @@ pub fn build_preintegrated_lut(
     opacity: f32,
 ) -> Vec<u8> {
     const SUBSTEPS: usize = 16;
-    let mut out = vec![0u8; 256 * 256 * 4];
-    for start in 0..256usize {
-        for end in 0..256usize {
+    let mut out = vec![0u8; PREINTEGRATION_LUT_SIZE * PREINTEGRATION_LUT_SIZE * 4];
+    for start in 0..PREINTEGRATION_LUT_SIZE {
+        for end in 0..PREINTEGRATION_LUT_SIZE {
             let mut color = [0.0f32; 3];
             let mut accumulated = 0.0f32;
             for step in 0..SUBSTEPS {
                 let t = (step as f32 + 0.5) / SUBSTEPS as f32;
-                let value = (start as f32 + (end as f32 - start as f32) * t) / 255.0;
+                let value = (start as f32 + (end as f32 - start as f32) * t)
+                    / (PREINTEGRATION_LUT_SIZE - 1) as f32;
                 let palette = lut_sample(lut, value);
                 let transfer =
                     threshold_strength(value, threshold_low, threshold_high, threshold_mode, 0.08);
@@ -359,7 +372,7 @@ pub fn build_preintegrated_lut(
                 }
                 accumulated += (1.0 - accumulated) * alpha;
             }
-            let oi = (start * 256 + end) * 4;
+            let oi = preintegration_texel_offset(start, end);
             if accumulated > 1.0e-6 {
                 for c in 0..3 {
                     out[oi + c] = ((color[c] / accumulated).clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -705,15 +718,115 @@ mod tests {
 
     #[test]
     fn preintegration_stays_bounded() {
-        let mut lut = vec![0u8; 256 * 4];
-        for i in 0..256 {
+        let mut lut = vec![0u8; PREINTEGRATION_LUT_SIZE * 4];
+        for i in 0..PREINTEGRATION_LUT_SIZE {
             lut[i * 4] = i as u8;
             lut[i * 4 + 1] = i as u8;
             lut[i * 4 + 2] = i as u8;
             lut[i * 4 + 3] = 255;
         }
         let table = build_preintegrated_lut(&lut, 0.2, 0.8, 0.0, 0.5);
-        assert_eq!(table.len(), 256 * 256 * 4);
+        assert_eq!(
+            table.len(),
+            PREINTEGRATION_LUT_SIZE * PREINTEGRATION_LUT_SIZE * 4
+        );
         assert!(table.iter().any(|value| *value > 0));
+    }
+
+    #[test]
+    fn preintegration_axes_preserve_front_to_back_segment_direction() {
+        let mut lut = vec![0u8; PREINTEGRATION_LUT_SIZE * 4];
+        for index in 0..PREINTEGRATION_LUT_SIZE {
+            // Low values are blue, high values are red. With finite opacity,
+            // front-to-back integration must retain more of the segment's
+            // starting color, so reversing the segment reverses the bias.
+            lut[index * 4] = index as u8;
+            lut[index * 4 + 2] = (PREINTEGRATION_LUT_SIZE - 1 - index) as u8;
+            lut[index * 4 + 3] = 255;
+        }
+        let table = build_preintegrated_lut(&lut, 0.0, 1.0, 0.0, 0.85);
+        let texel = |previous, current| {
+            let offset = preintegration_texel_offset(previous, current);
+            &table[offset..offset + 4]
+        };
+        let rising = texel(32, 224);
+        let falling = texel(224, 32);
+        assert!(
+            rising[2] > rising[0],
+            "rising segment must retain more of its blue starting color: {rising:?}"
+        );
+        assert!(
+            falling[0] > falling[2],
+            "falling segment must retain more of its red starting color: {falling:?}"
+        );
+        assert_ne!(rising, falling, "front-to-back color is directional");
+        assert_eq!(
+            preintegration_texel_offset(32, 224),
+            (224 * PREINTEGRATION_LUT_SIZE + 32) * 4,
+            "row-major upload must place previous on texture X and current on texture Y"
+        );
+        assert!(
+            super::super::SHADER.contains("vec2<f32>(previous_structure, structure)"),
+            "CPU table axes must stay paired with the WGSL lookup order"
+        );
+    }
+
+    fn projection_score_contract(
+        structure: f32,
+        color_value: f32,
+        transfer: f32,
+        emphasis: f32,
+        threshold_mode: f32,
+        threshold_low: f32,
+        threshold_high: f32,
+        velocity_mode: f32,
+    ) -> f32 {
+        if transfer * emphasis <= 0.0 {
+            return -1.0;
+        }
+        if velocity_mode > 0.5 {
+            return ((color_value - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+        }
+        if threshold_mode > 1.5 {
+            return (threshold_low - structure).max(structure - threshold_high);
+        }
+        if threshold_mode > 0.5 {
+            return 1.0 - structure;
+        }
+        structure
+    }
+
+    #[test]
+    fn maximum_projection_score_follows_transfer_sense() {
+        let score = |value, mode, low, high| {
+            projection_score_contract(value, value, 1.0, 1.0, mode, low, high, 0.0)
+        };
+        assert!(score(0.85, 0.0, 0.4, -1.0) > score(0.55, 0.0, 0.4, -1.0));
+        assert!(score(0.20, 1.0, 0.8, -1.0) > score(0.70, 1.0, 0.8, -1.0));
+
+        let low_arm = score(0.10, 2.0, 0.40, 0.60);
+        let high_arm = score(0.90, 2.0, 0.40, 0.60);
+        assert!((low_arm - high_arm).abs() < 1.0e-6);
+        assert_eq!(
+            projection_score_contract(0.50, 0.50, -1.0, 1.0, 2.0, 0.40, 0.60, 0.0),
+            -1.0,
+            "the excluded Outside band cannot win the projection"
+        );
+
+        assert!(
+            projection_score_contract(0.55, 0.95, 1.0, 0.2, 2.0, 0.40, 0.60, 1.0)
+                > projection_score_contract(0.85, 0.65, 1.0, 1.0, 2.0, 0.40, 0.60, 1.0),
+            "eligible velocity two-box projection must select strongest |velocity|, not REF"
+        );
+        assert_eq!(
+            projection_score_contract(0.75, 0.05, 1.0, 1.0, 2.0, 0.40, 0.60, 1.0),
+            projection_score_contract(0.75, 0.95, 1.0, 1.0, 2.0, 0.40, 0.60, 1.0),
+            "equal inbound/outbound magnitudes must score symmetrically"
+        );
+        assert_eq!(
+            projection_score_contract(0.85, 0.95, 1.0, 0.0, 0.0, 0.4, -1.0, 1.0),
+            -1.0,
+            "a fully suppressed velocity sample cannot win"
+        );
     }
 }

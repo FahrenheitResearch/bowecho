@@ -40695,6 +40695,49 @@ impl ViewerApp {
         defaults
     }
 
+    fn vol3d_product_scalar_domain(
+        product: &DisplayProduct,
+        value_min: f32,
+        value_max: f32,
+    ) -> vol3d::Vol3dScalarDomain {
+        let defaults = Self::vol3d_product_defaults(product, value_min, value_max);
+        vol3d::Vol3dScalarDomain::new(
+            value_min,
+            value_max,
+            defaults.threshold,
+            defaults.threshold_mode,
+        )
+    }
+
+    /// Physical domain used by Hybrid/Surface geometry. A true velocity
+    /// two-box uses reflectivity for geometry and signed velocity only for
+    /// color, so its isovalue and shell width must be interpreted as dBZ.
+    /// The explicit velocity-only fallback continues to use velocity units.
+    fn vol3d_surface_scalar_domain(
+        &self,
+        product: &DisplayProduct,
+        value_min: f32,
+        value_max: f32,
+    ) -> (vol3d::Vol3dScalarDomain, bool) {
+        if Self::vol3d_is_velocity_family(product) && self.vol3d.velocity_color_active {
+            let (reflectivity_min, reflectivity_max) = self.vol3d_reflectivity_value_range();
+            let reflectivity = DisplayProduct::Moment(MomentType::Reflectivity);
+            (
+                Self::vol3d_product_scalar_domain(
+                    &reflectivity,
+                    reflectivity_min,
+                    reflectivity_max,
+                ),
+                true,
+            )
+        } else {
+            (
+                Self::vol3d_product_scalar_domain(product, value_min, value_max),
+                false,
+            )
+        }
+    }
+
     fn vol3d_threshold_slider_range(
         mode: vol3d::Vol3dThresholdMode,
         value_min: f32,
@@ -40888,6 +40931,7 @@ impl ViewerApp {
         let product_label = product.label().to_owned();
         if self.vol3d.product_label != product_label {
             let defaults = Self::vol3d_product_defaults(product, value_min, value_max);
+            let scalar_domain = Self::vol3d_product_scalar_domain(product, value_min, value_max);
             self.vol3d.product_label = product_label.clone();
             self.vol3d.threshold_mode = defaults.threshold_mode;
             self.vol3d.threshold_dbz = defaults.threshold;
@@ -40899,6 +40943,8 @@ impl ViewerApp {
             self.vol3d.floor_opacity = defaults.floor_opacity;
             self.vol3d.floor_threshold_mode = defaults.floor_threshold_mode;
             self.vol3d.floor_threshold_dbz = defaults.floor_threshold;
+            self.vol3d.iso_value = scalar_domain.hybrid_iso_value();
+            self.vol3d.iso_width = scalar_domain.suggested_iso_width();
             // Velocity products render the two-box path (reflectivity structure
             // + velocity color); seed its dedicated controls. The Outside |v|
             // threshold above still governs the single-box fallback used when a
@@ -40956,7 +41002,31 @@ impl ViewerApp {
             match receiver.try_recv() {
                 Ok(Some(volume_box)) => {
                     self.vol3d.resample_rx = None;
+                    let previous_velocity_color = self.vol3d.velocity_color_active;
                     self.vol3d.velocity_color_active = volume_box.color_data.is_some();
+                    if previous_velocity_color != self.vol3d.velocity_color_active
+                        && matches!(
+                            self.vol3d.render_mode,
+                            vol3d::Vol3dRenderMode::HybridShell
+                                | vol3d::Vol3dRenderMode::Isosurface
+                        )
+                    {
+                        // A change between the velocity-only fallback and the
+                        // normal REF-structure/velocity-color box also changes
+                        // the physical unit of surface geometry. Rebase rather
+                        // than silently reinterpreting an old m/s value as dBZ
+                        // (or vice versa).
+                        let product = self.selected_product.clone();
+                        let (value_min, value_max) = self.vol3d_product_value_range(&product);
+                        let (domain, _) =
+                            self.vol3d_surface_scalar_domain(&product, value_min, value_max);
+                        self.vol3d.iso_value = match self.vol3d.render_mode {
+                            vol3d::Vol3dRenderMode::HybridShell => domain.hybrid_iso_value(),
+                            vol3d::Vol3dRenderMode::Isosurface => domain.surface_iso_value(),
+                            _ => unreachable!("surface mode checked above"),
+                        };
+                        self.vol3d.iso_width = domain.suggested_iso_width();
+                    }
                     let echo_cells = volume_box.data.iter().filter(|&&value| value > 0).count();
                     // Hierarchy occupancy telemetry. VERIFY.md asks for the
                     // occupied-brick share alongside the volume so a slow frame
@@ -41382,9 +41452,10 @@ impl ViewerApp {
     fn vol3d_analysis_controls_body(
         &mut self,
         ui: &mut egui::Ui,
-        value_min: f32,
-        value_max: f32,
-        value_suffix: &str,
+        surface_domain: vol3d::Vol3dScalarDomain,
+        surface_suffix: &str,
+        velocity_family: bool,
+        velocity_ref_geometry: bool,
     ) {
         ui.strong("Advanced renderer");
         ui.horizontal_wrapped(|ui| {
@@ -41392,10 +41463,10 @@ impl ViewerApp {
                 self.vol3d.apply_sota_volume_preset();
             }
             if ui.small_button("Hybrid").clicked() {
-                self.vol3d.apply_sota_hybrid_preset();
+                self.vol3d.apply_sota_hybrid_preset(surface_domain);
             }
             if ui.small_button("Surface").clicked() {
-                self.vol3d.apply_sota_surface_preset();
+                self.vol3d.apply_sota_surface_preset(surface_domain);
             }
             if ui.small_button("Support").clicked() {
                 self.vol3d.apply_sota_support_preset();
@@ -41438,14 +41509,59 @@ impl ViewerApp {
             self.vol3d.render_mode,
             vol3d::Vol3dRenderMode::HybridShell | vol3d::Vol3dRenderMode::Isosurface
         ) {
+            let value_min = surface_domain.value_min();
+            let value_max = surface_domain.value_max();
             let mut iso = self.vol3d.iso_value.clamp(value_min, value_max);
             ui.add(
                 egui::Slider::new(&mut iso, value_min..=value_max)
-                    .suffix(value_suffix)
-                    .text("isosurface value"),
-            );
+                    .suffix(surface_suffix)
+                    .text(if velocity_ref_geometry {
+                        "REF isosurface value"
+                    } else {
+                        "isosurface value"
+                    }),
+            )
+            .on_hover_text(if velocity_ref_geometry {
+                "Reflectivity defines the surface geometry; signed velocity supplies color only"
+            } else {
+                "Surface geometry uses the active product's physical value"
+            });
             self.vol3d.iso_value = iso;
-            ui.add(egui::Slider::new(&mut self.vol3d.iso_width, 0.2..=8.0).text("shell width"));
+            let width_range = surface_domain.iso_width_range();
+            self.vol3d.iso_width = self
+                .vol3d
+                .iso_width
+                .clamp(*width_range.start(), *width_range.end());
+            ui.add(
+                egui::Slider::new(&mut self.vol3d.iso_width, width_range)
+                    .suffix(surface_suffix)
+                    .text(if velocity_ref_geometry {
+                        "REF shell width"
+                    } else {
+                        "shell width"
+                    }),
+            );
+            if velocity_ref_geometry {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Two-box velocity: REF defines Hybrid/Surface geometry in dBZ; velocity supplies signed palette color only.",
+                        )
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+            } else if velocity_family {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Velocity-only fallback: no co-located REF structure box is active, so Hybrid/Surface geometry uses velocity units.",
+                        )
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+            }
         }
         if self.vol3d.render_mode == vol3d::Vol3dRenderMode::OrthogonalSlices {
             ui.add(egui::Slider::new(&mut self.vol3d.slice_x, 0.0..=1.0).text("east-west slice"));
@@ -41488,6 +41604,14 @@ impl ViewerApp {
             format!(" {value_units}")
         };
         let velocity_family = Self::vol3d_is_velocity_family(&vol3d_product);
+        let scalar_domain = Self::vol3d_product_scalar_domain(&vol3d_product, value_min, value_max);
+        let (surface_domain, velocity_ref_geometry) =
+            self.vol3d_surface_scalar_domain(&vol3d_product, value_min, value_max);
+        let surface_suffix = if velocity_ref_geometry {
+            " dBZ"
+        } else {
+            value_suffix.as_str()
+        };
         ui.horizontal_wrapped(|ui| {
             ui.menu_button("Presets", |ui| {
                 ui.set_min_width(180.0);
@@ -41518,15 +41642,15 @@ impl ViewerApp {
                     }
                 } else {
                     if ui.button("Balanced").clicked() {
-                        self.vol3d.apply_balanced_preset();
+                        self.vol3d.apply_balanced_preset(scalar_domain);
                         ui.close();
                     }
                     if ui.button("Storm structure").clicked() {
-                        self.vol3d.apply_structure_preset();
+                        self.vol3d.apply_structure_preset(scalar_domain);
                         ui.close();
                     }
                     if ui.button("Core isolation").clicked() {
-                        self.vol3d.apply_core_preset();
+                        self.vol3d.apply_core_preset(scalar_domain);
                         ui.close();
                     }
                 }
@@ -41737,9 +41861,10 @@ impl ViewerApp {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         self.vol3d_analysis_controls_body(
                             ui,
-                            value_min,
-                            value_max,
-                            value_suffix.as_str(),
+                            surface_domain,
+                            surface_suffix,
+                            velocity_family,
+                            velocity_ref_geometry,
                         );
                     });
                 }
@@ -41991,10 +42116,10 @@ impl ViewerApp {
                     support_fade: self.vol3d.support_fade,
                     iso_value: Self::normalized_vol3d_value(
                         self.vol3d.iso_value,
-                        value_min,
-                        value_max,
+                        surface_domain.value_min(),
+                        surface_domain.value_max(),
                     ),
-                    iso_width: (self.vol3d.iso_width / (value_max - value_min).abs().max(1.0e-6))
+                    iso_width: (self.vol3d.iso_width / surface_domain.span().abs().max(1.0e-6))
                         .clamp(0.001, 0.25),
                     jitter_strength: self.vol3d.jitter_strength,
                     preintegration: if self.vol3d.preintegration { 1.0 } else { 0.0 },
@@ -76539,6 +76664,88 @@ mod tests {
         assert!(threshold > 0.0 && threshold < 1.0);
         assert!(high < 0.0);
         assert_eq!(defaults.quality, vol3d::Vol3dQuality::High);
+    }
+
+    #[test]
+    fn vol3d_scalar_domains_follow_production_moment_ranges() {
+        use vol3d::Vol3dThresholdMode::{Above, Below};
+
+        let app = test_viewer_app_with_hazards(Vec::new());
+        let cases = [
+            (MomentType::CorrelationCoefficient, Below),
+            (MomentType::DifferentialReflectivity, Above),
+            (MomentType::SpecificDifferentialPhase, Above),
+            (MomentType::SpectrumWidth, Above),
+            (MomentType::DifferentialPhase, Above),
+        ];
+
+        for (moment, expected_mode) in cases {
+            let product = DisplayProduct::Moment(moment.clone());
+            let (value_min, value_max) = app.vol3d_product_value_range(&product);
+            let domain = ViewerApp::vol3d_product_scalar_domain(&product, value_min, value_max);
+            assert_eq!(domain.threshold_mode(), expected_mode, "{moment:?}");
+            for value in [
+                domain.structure_threshold(),
+                domain.balanced_threshold(),
+                domain.core_threshold(),
+                domain.hybrid_iso_value(),
+                domain.surface_iso_value(),
+            ] {
+                assert!(
+                    (value_min..=value_max).contains(&value),
+                    "{moment:?} preset {value} outside {value_min}..={value_max}"
+                );
+            }
+            assert!(
+                domain
+                    .iso_width_range()
+                    .contains(&domain.suggested_iso_width()),
+                "{moment:?} shell width must stay in its physical domain"
+            );
+        }
+    }
+
+    #[test]
+    fn vol3d_velocity_two_box_surface_uses_reflectivity_normalization() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        let (velocity_min, velocity_max) = app.vol3d_product_value_range(&product);
+
+        app.vol3d.velocity_color_active = true;
+        let (surface_domain, uses_reflectivity) =
+            app.vol3d_surface_scalar_domain(&product, velocity_min, velocity_max);
+        let (reflectivity_min, reflectivity_max) = app.vol3d_reflectivity_value_range();
+        assert!(uses_reflectivity);
+        assert_eq!(surface_domain.value_min(), reflectivity_min);
+        assert_eq!(surface_domain.value_max(), reflectivity_max);
+        assert_eq!(
+            surface_domain.threshold_mode(),
+            vol3d::Vol3dThresholdMode::Above
+        );
+
+        let physical_iso = surface_domain.surface_iso_value();
+        let shader_iso = ViewerApp::normalized_vol3d_value(
+            physical_iso,
+            surface_domain.value_min(),
+            surface_domain.value_max(),
+        );
+        let expected_iso =
+            (physical_iso - reflectivity_min) / (reflectivity_max - reflectivity_min);
+        assert!((shader_iso - expected_iso).abs() < 1.0e-6);
+        assert!(
+            (surface_domain.suggested_iso_width() / surface_domain.span() - 0.025).abs() < 1.0e-6
+        );
+
+        app.vol3d.velocity_color_active = false;
+        let (fallback_domain, uses_reflectivity) =
+            app.vol3d_surface_scalar_domain(&product, velocity_min, velocity_max);
+        assert!(!uses_reflectivity);
+        assert_eq!(fallback_domain.value_min(), velocity_min);
+        assert_eq!(fallback_domain.value_max(), velocity_max);
+        assert_eq!(
+            fallback_domain.threshold_mode(),
+            vol3d::Vol3dThresholdMode::Outside
+        );
     }
 
     #[test]
