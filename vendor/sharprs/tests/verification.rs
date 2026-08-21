@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Retain the complete cross-language reference fixture catalog.
+
 //! Comprehensive verification test suite for sharprs.
 //!
 //! Tests are organised around five canonical sounding profiles that span
@@ -43,6 +45,7 @@ macro_rules! assert_close {
 }
 
 /// Assert within a percentage tolerance (for CAPE/CIN).
+#[allow(unused_macros)]
 macro_rules! assert_pct {
     ($a:expr, $b:expr, $pct:expr, $msg:expr) => {
         let (a, b) = ($a as f64, $b as f64);
@@ -934,7 +937,7 @@ fn reference_value_total_totals_ordering() {
 fn fosberg_ordering_across_soundings() {
     // Compute FWI for each sounding surface conditions
     let fwi1 = fire::fosberg(28.0, 19.0, 15.0); // supercell
-    let fwi2 = fire::fosberg(-2.0, -4.0, 5.0); // null
+    let _fwi2 = fire::fosberg(-2.0, -4.0, 5.0); // null
     let fwi4 = fire::fosberg(28.0, 26.0, 8.0); // tropical
     let fwi5 = fire::fosberg(38.0, 5.0, 20.0); // fire wx
 
