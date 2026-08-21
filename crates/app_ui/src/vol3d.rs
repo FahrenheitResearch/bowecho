@@ -2526,9 +2526,7 @@ mod tests {
         let floor = empty_box().floor_data.expect("empty floor upload");
         assert_eq!(floor.len(), FLOOR_N * FLOOR_N * 2);
         assert!(
-            floor
-                .chunks_exact(2)
-                .all(|texel| texel == [0, 0]),
+            floor.chunks_exact(2).all(|texel| texel == [0, 0]),
             "no-data floor texels must carry a zero validity channel"
         );
     }
@@ -2609,8 +2607,12 @@ mod tests {
 
     #[test]
     fn normalize_box_data_matches_helper() {
-        let values = vec![-40.0, -10.0, 0.0, 25.0, 60.0, f32::NAN];
-        let vbox = normalize_box_with_range(&values, 1, values.len(), -50.0, 60.0);
+        // Stage 2's acceleration hierarchy has a fixed production lattice.
+        // Keep this helper-parity fixture on that contract instead of asking
+        // the hierarchy to accept the old pre-SOTA 1x1x6 test shape.
+        let mut values = vec![f32::NAN; BOX_N * BOX_N * BOX_NZ];
+        values[..6].copy_from_slice(&[-40.0, -10.0, 0.0, 25.0, 60.0, f32::NAN]);
+        let vbox = normalize_box_with_range(&values, BOX_N, BOX_NZ, -50.0, 60.0);
         assert_eq!(vbox.data, normalize_values(&values, -50.0, 60.0));
         assert!(vbox.color_data.is_none(), "single box has no color plane");
     }
