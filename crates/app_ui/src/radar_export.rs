@@ -445,14 +445,14 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
         ray_base += cut.radials.len();
     }
 
-    // Gate CENTERS (CfRadial spec §5.5). The reader reconstructs
-    // spacing = round(range[1]-range[0]) and
-    // first_gate = round(range[0] - spacing/2), so centers written as
-    // first + (i+0.5)*spacing reproduce the integer GateRange exactly.
+    // Gate CENTERS (CfRadial spec §5.5). `GateRange::first_gate_m` is the
+    // centre of gate zero throughout radar_core and the renderers, so the
+    // coordinate starts at `first` with no half-gate shift. The reader
+    // reconstructs the same contract from range[0] and range[1]-range[0].
     let spacing = geometry.gate_spacing_m as f64;
     let first = geometry.first_gate_m as f64;
     let range: Vec<f32> = (0..n_gates)
-        .map(|gate| (first + (gate as f64 + 0.5) * spacing) as f32)
+        .map(|gate| (first + gate as f64 * spacing) as f32)
         .collect();
 
     // Field matrices: (time, range) row-major, fill-padded. Union of the
@@ -664,10 +664,7 @@ pub(crate) fn export_volume_cfradial(volume: &RadarVolume, path: &Path) -> Resul
             Nc3Attr::text("long_name", "range to center of gate"),
             Nc3Attr::text("units", "meters"),
             Nc3Attr::text("spacing_is_constant", "true"),
-            Nc3Attr::floats(
-                "meters_to_center_of_first_gate",
-                vec![(first + 0.5 * spacing) as f32],
-            ),
+            Nc3Attr::floats("meters_to_center_of_first_gate", vec![first as f32]),
             Nc3Attr::floats("meters_between_gates", vec![spacing as f32]),
         ],
     });
@@ -1232,8 +1229,13 @@ mod tests {
                     radial.nyquist_velocity_mps, expected.radials[az_index].nyquist_velocity_mps,
                     "cut {cut_index} ray {az_index}"
                 );
-                // Gate geometry EXACT; gate_count padded to the volume max.
-                assert_eq!(radial.gate_range.first_gate_m, 1000);
+                // Gate geometry EXACT; CfRadial range values and GateRange
+                // both name gate centres, so no half-spacing offset is valid.
+                assert_eq!(
+                    radial.gate_range.first_gate_m,
+                    expected.radials[az_index].gate_range.first_gate_m,
+                    "cut {cut_index} ray {az_index}: first gate centre shifted"
+                );
                 assert_eq!(radial.gate_range.gate_spacing_m, 250);
                 assert_eq!(radial.gate_range.gate_count, 16);
                 global_ray += 1;
