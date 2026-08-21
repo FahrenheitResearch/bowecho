@@ -3916,6 +3916,10 @@ struct ViewerApp {
     sidebar_layout: sidebar_layout::LayoutDocument,
     sidebar_layout_newer_schema: bool,
     sidebar_layout_editor_target: sidebar_layout::EditorTarget,
+    /// One-shot request from workflow links such as an empty custom tab's
+    /// `Add sections...` button. The destination tab may retain an unrelated
+    /// scroll offset, so opening the fold alone does not make it visible.
+    pending_sidebar_section_scroll: Option<sidebar_layout::SectionId>,
     /// Set only while a customized/custom tab renders one registered section.
     /// Existing panel bodies consult it through `remembered_section` so they
     /// can be reused without duplicating control behavior.
@@ -10392,6 +10396,7 @@ impl ViewerApp {
             sidebar_layout: loaded_sidebar_layout.document,
             sidebar_layout_newer_schema: loaded_sidebar_layout.newer_schema,
             sidebar_layout_editor_target: sidebar_layout::EditorTarget::default(),
+            pending_sidebar_section_scroll: None,
             sidebar_section_render: None,
             forced_sidebar_section: None,
             last_live_hazard_refresh: None,
@@ -25224,8 +25229,9 @@ impl ViewerApp {
         default_open: bool,
         body: impl FnOnce(&mut Self, &mut egui::Ui) -> R,
     ) -> Option<R> {
+        let section = sidebar_layout::SectionId::from_legacy_key(key);
         let rendered_key = if let Some(render) = self.sidebar_section_render {
-            if sidebar_layout::SectionId::from_legacy_key(key) != Some(render.section) {
+            if section != Some(render.section) {
                 return None;
             }
             match render.scope {
@@ -25237,6 +25243,14 @@ impl ViewerApp {
         } else {
             key.to_owned()
         };
+        if self.pending_sidebar_section_scroll == section && section.is_some() {
+            // This executes inside the active tab's ScrollArea, immediately
+            // before the requested section. Aligning the cursor to the top
+            // makes navigation deterministic even when that tab retained a
+            // distant scroll offset or a long section precedes the target.
+            ui.scroll_to_cursor(Some(egui::Align::Min));
+            self.pending_sidebar_section_scroll = None;
+        }
         let open = self.section_open(&rendered_key, default_open);
         let response = panel_kit::section(ui, &rendered_key, label, open, |ui| body(self, ui));
         if response.toggled {
@@ -25256,6 +25270,7 @@ impl ViewerApp {
 
     fn reveal_sidebar_section(&mut self, section: sidebar_layout::SectionId) {
         let spec = section.spec();
+        self.pending_sidebar_section_scroll = Some(section);
         match self.sidebar_layout.destination_for(section) {
             sidebar_layout::SectionDestination::Builtin => {
                 self.sidebar_tab = SidebarTab::from_builtin(spec.tab);
@@ -51854,6 +51869,59 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_reveal_scrolls_to_the_exact_requested_section_once() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let target = sidebar_layout::SectionId::SettingsSidebarLayout;
+        app.pending_sidebar_section_scroll = Some(target);
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 180.0));
+        let mut scroll_offset = 0.0;
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            let output = egui::ScrollArea::vertical()
+                .id_salt("sidebar_reveal_scroll_test")
+                .animated(false)
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    ui.add_space(420.0);
+                    let _ = app.remembered_section(
+                        ui,
+                        "settings_display",
+                        "Display",
+                        false,
+                        |_app, _ui| {},
+                    );
+                    assert_eq!(
+                        app.pending_sidebar_section_scroll,
+                        Some(target),
+                        "an unrelated section must not consume the navigation request"
+                    );
+                    let _ = app.remembered_section(
+                        ui,
+                        "settings_sidebar_layout",
+                        "Sidebar & custom tabs",
+                        true,
+                        |_app, ui| {
+                            ui.label("custom tab editor");
+                        },
+                    );
+                    ui.add_space(420.0);
+                });
+            scroll_offset = output.state.offset.y;
+        });
+
+        assert_eq!(app.pending_sidebar_section_scroll, None);
+        assert!(
+            scroll_offset > 300.0,
+            "the requested editor must be scrolled into view, got offset {scroll_offset}"
+        );
+    }
+
+    #[test]
     fn sidebar_edge_handle_only_appears_where_visible_map_meets_boundary() {
         let map_left_of_sounding =
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(760.0, 900.0));
@@ -75395,6 +75463,7 @@ mod tests {
             sidebar_layout: sidebar_layout::LayoutDocument::default(),
             sidebar_layout_newer_schema: false,
             sidebar_layout_editor_target: sidebar_layout::EditorTarget::default(),
+            pending_sidebar_section_scroll: None,
             sidebar_section_render: None,
             forced_sidebar_section: None,
             last_live_hazard_refresh: None,
