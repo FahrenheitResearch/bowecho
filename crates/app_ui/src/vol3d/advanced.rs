@@ -903,6 +903,13 @@ mod tests {
             None,
             "a fully suppressed sample cannot enter the MIP winner set"
         );
+        assert_eq!(
+            projection_candidate_contract(
+                0.85, 0.95, 1.0, 1.0, 1.0, 0.0, 0.60, 0.0, 0.4, -1.0, 1.0,
+            ),
+            None,
+            "a two-box voxel missing either field has zero co-located support and cannot win MIP"
+        );
         assert!(
             super::super::SHADER.contains("* candidate_support"),
             "WGSL winner visibility must retain the honest support factor"

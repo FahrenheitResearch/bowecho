@@ -720,6 +720,20 @@ impl Vol3d {
         self.adaptive_strength = 1.0;
     }
 
+    /// Rebase the stored isosurface controls when their physical domain
+    /// changes (notably velocity-only m/s versus two-box REF dBZ). These
+    /// values remain latent in Direct/MIP/Slices modes, so they must still be
+    /// rebased there before a later render-mode ComboBox selection exposes
+    /// them under a different unit label.
+    pub fn rebase_surface_controls(&mut self, domain: Vol3dScalarDomain) {
+        self.iso_value = if self.render_mode == Vol3dRenderMode::Isosurface {
+            domain.surface_iso_value()
+        } else {
+            domain.hybrid_iso_value()
+        };
+        self.iso_width = domain.suggested_iso_width();
+    }
+
     pub fn normalized_horizontal_crop(&self) -> (f32, f32, f32, f32) {
         let x0 = self.crop_x_min.clamp(0.0, 0.99);
         let x1 = self.crop_x_max.clamp(x0 + 0.01, 1.0);
@@ -814,6 +828,83 @@ pub fn normalize_box_with_support(
         floor_data: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N).saturating_mul(2)]),
         floor_elevation_deg: None,
     }
+}
+
+/// Assemble the velocity two-box contract on one exactly aligned Cartesian
+/// lattice. Reflectivity supplies structure while velocity supplies color, so
+/// a voxel is displayable only where both reconstructions are finite and
+/// supported. Invalid velocity is stored as neutral flow as well as masked;
+/// this prevents linear texture filtering from turning a NaN into palette byte
+/// zero (typically the strongest inbound color) along a support boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_velocity_two_box_with_support(
+    structure_values: &[f32],
+    structure_support: &[u8],
+    velocity_values: &[f32],
+    velocity_support: &[u8],
+    n: usize,
+    nz: usize,
+    structure_min: f32,
+    structure_max: f32,
+    velocity_min: f32,
+    velocity_max: f32,
+) -> Option<VolumeBox> {
+    let expected = n.checked_mul(n)?.checked_mul(nz)?;
+    if n != BOX_N
+        || nz != BOX_NZ
+        || expected == 0
+        || structure_values.len() != expected
+        || structure_support.len() != expected
+        || velocity_values.len() != expected
+        || velocity_support.len() != expected
+        || !structure_min.is_finite()
+        || !structure_max.is_finite()
+        || structure_max <= structure_min
+        || !velocity_min.is_finite()
+        || !velocity_max.is_finite()
+        || velocity_max <= velocity_min
+    {
+        return None;
+    }
+
+    let neutral_velocity = if velocity_min < 0.0 && velocity_max > 0.0 {
+        normalize_value(0.0, velocity_min, velocity_max)
+    } else {
+        // A malformed/one-sided custom velocity palette has no physical zero
+        // coordinate. Keep unsupported texels away from either endpoint; the
+        // co-located support mask still makes them ineligible to render.
+        128
+    };
+    let mut co_located_support = Vec::with_capacity(expected);
+    let mut color_data = Vec::with_capacity(expected);
+    for index in 0..expected {
+        let valid = structure_values[index].is_finite()
+            && velocity_values[index].is_finite()
+            && structure_support[index] > 0
+            && velocity_support[index] > 0;
+        if valid {
+            co_located_support.push(structure_support[index].min(velocity_support[index]));
+            color_data.push(normalize_value(
+                velocity_values[index],
+                velocity_min,
+                velocity_max,
+            ));
+        } else {
+            co_located_support.push(0);
+            color_data.push(neutral_velocity);
+        }
+    }
+
+    let mut volume_box = normalize_box_with_support(
+        structure_values,
+        &co_located_support,
+        n,
+        nz,
+        structure_min,
+        structure_max,
+    );
+    volume_box.color_data = Some(color_data);
+    Some(volume_box)
 }
 
 /// All-no-data box used to blank the render between products and while a live
@@ -2786,15 +2877,68 @@ mod tests {
     }
 
     #[test]
-    fn two_box_color_plane_matches_structure_dims() {
+    fn two_box_requires_aligned_co_located_ref_and_velocity_support() {
         // In velocity mode the structure (reflectivity) box and the velocity
         // color box must share the same lattice so the shader can sample both
         // at one uvw.
-        let refl = vec![5.0f32; BOX_N * BOX_N * BOX_NZ];
-        let vel = vec![3.0f32; BOX_N * BOX_N * BOX_NZ];
-        let mut vbox = normalize_box_with_range(&refl, BOX_N, BOX_NZ, 0.0, 80.0);
-        vbox.color_data = Some(normalize_values(&vel, -100.0, 100.0));
-        assert_eq!(vbox.color_data.as_ref().unwrap().len(), vbox.data.len());
+        let len = BOX_N * BOX_N * BOX_NZ;
+        let refl = vec![35.0f32; len];
+        let refl_support = vec![220u8; len];
+        let mut velocity = vec![20.0f32; len];
+        let mut velocity_support = vec![140u8; len];
+        velocity[0] = f32::NAN;
+        velocity_support[1] = 0;
+
+        let vbox = normalize_velocity_two_box_with_support(
+            &refl,
+            &refl_support,
+            &velocity,
+            &velocity_support,
+            BOX_N,
+            BOX_NZ,
+            -10.0,
+            80.0,
+            -100.0,
+            100.0,
+        )
+        .expect("aligned two-box");
+        let colors = vbox.color_data.as_ref().expect("velocity color plane");
+        assert_eq!(colors.len(), vbox.data.len());
+        assert_eq!(vbox.support_data[0], 0, "NaN velocity must be masked");
+        assert_eq!(vbox.support_data[1], 0, "missing velocity must be masked");
+        assert_eq!(
+            vbox.support_data[2], 140,
+            "support is the co-located minimum"
+        );
+        assert_eq!(
+            colors[0], 128,
+            "invalid velocity is neutral, never byte zero"
+        );
+        assert_eq!(
+            colors[1], 128,
+            "unsupported velocity is neutral at the boundary"
+        );
+        assert!(
+            colors[2] > 128,
+            "valid outbound velocity retains signed color"
+        );
+
+        assert!(
+            normalize_velocity_two_box_with_support(
+                &refl,
+                &refl_support,
+                &velocity[..len - 1],
+                &velocity_support,
+                BOX_N,
+                BOX_NZ,
+                -10.0,
+                80.0,
+                -100.0,
+                100.0,
+            )
+            .is_none(),
+            "a mismatched velocity grid must fail closed"
+        );
     }
 
     #[test]

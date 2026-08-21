@@ -40945,8 +40945,23 @@ impl ViewerApp {
         ((value - value_min) / span).clamp(0.0, 1.0)
     }
 
+    /// Change the physical surface-geometry contract atomically with the
+    /// uploaded volume type. The controls are latent outside Hybrid/Surface,
+    /// but still need rebasing so a later ComboBox mode change cannot
+    /// reinterpret a stored velocity value as dBZ (or vice versa).
+    fn set_vol3d_velocity_color_active(&mut self, active: bool) {
+        if self.vol3d.velocity_color_active == active {
+            return;
+        }
+        self.vol3d.velocity_color_active = active;
+        let product = self.selected_product.clone();
+        let (value_min, value_max) = self.vol3d_product_value_range(&product);
+        let (domain, _) = self.vol3d_surface_scalar_domain(&product, value_min, value_max);
+        self.vol3d.rebase_surface_controls(domain);
+    }
+
     fn clear_vol3d_texture(&mut self) {
-        self.vol3d.velocity_color_active = false;
+        self.set_vol3d_velocity_color_active(false);
         if let Ok(mut pending) = self.vol3d.pending.lock() {
             pending.volume = Some(vol3d::empty_box());
         }
@@ -41076,7 +41091,6 @@ impl ViewerApp {
             if product.color_family() == ColorTableFamily::Velocity {
                 self.vol3d.apply_velocity_broad_preset();
             }
-            self.vol3d.velocity_color_active = false;
             self.vol3d.volume_key = None;
             self.vol3d.resample_rx = None;
             self.vol3d.last_top_deg = 0.0;
@@ -41126,31 +41140,7 @@ impl ViewerApp {
             match receiver.try_recv() {
                 Ok(Some(volume_box)) => {
                     self.vol3d.resample_rx = None;
-                    let previous_velocity_color = self.vol3d.velocity_color_active;
-                    self.vol3d.velocity_color_active = volume_box.color_data.is_some();
-                    if previous_velocity_color != self.vol3d.velocity_color_active
-                        && matches!(
-                            self.vol3d.render_mode,
-                            vol3d::Vol3dRenderMode::HybridShell
-                                | vol3d::Vol3dRenderMode::Isosurface
-                        )
-                    {
-                        // A change between the velocity-only fallback and the
-                        // normal REF-structure/velocity-color box also changes
-                        // the physical unit of surface geometry. Rebase rather
-                        // than silently reinterpreting an old m/s value as dBZ
-                        // (or vice versa).
-                        let product = self.selected_product.clone();
-                        let (value_min, value_max) = self.vol3d_product_value_range(&product);
-                        let (domain, _) =
-                            self.vol3d_surface_scalar_domain(&product, value_min, value_max);
-                        self.vol3d.iso_value = match self.vol3d.render_mode {
-                            vol3d::Vol3dRenderMode::HybridShell => domain.hybrid_iso_value(),
-                            vol3d::Vol3dRenderMode::Isosurface => domain.surface_iso_value(),
-                            _ => unreachable!("surface mode checked above"),
-                        };
-                        self.vol3d.iso_width = domain.suggested_iso_width();
-                    }
+                    self.set_vol3d_velocity_color_active(volume_box.color_data.is_some());
                     let echo_cells = volume_box.data.iter().filter(|&&value| value > 0).count();
                     // Hierarchy occupancy telemetry. VERIFY.md asks for the
                     // occupied-brick share alongside the volume so a slow frame
@@ -41366,21 +41356,22 @@ impl ViewerApp {
                                 );
                             match (structure_resample, color_resample) {
                                 (Some(structure), Some(color)) => {
-                                    let mut volume_box = vol3d::normalize_box_with_support(
+                                    vol3d::normalize_velocity_two_box_with_support(
                                         &structure.values,
                                         &structure.support,
+                                        &color.values,
+                                        &color.support,
                                         vol3d::BOX_N,
                                         vol3d::BOX_NZ,
                                         refl_min,
                                         refl_max,
-                                    );
-                                    volume_box.color_data = Some(vol3d::normalize_values(
-                                        &color.values,
                                         value_min,
                                         value_max,
-                                    ));
-                                    build_floor(&mut volume_box);
-                                    Some(volume_box)
+                                    )
+                                    .map(|mut volume_box| {
+                                        build_floor(&mut volume_box);
+                                        volume_box
+                                    })
                                 }
                                 // No reflectivity in this feed: fall back to the
                                 // single-box velocity render (color_data None).
@@ -77147,6 +77138,59 @@ mod tests {
             fallback_domain.threshold_mode(),
             vol3d::Vol3dThresholdMode::Outside
         );
+    }
+
+    #[test]
+    fn vol3d_velocity_domain_transition_rebases_hidden_surface_controls() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        app.selected_product = product.clone();
+        let (velocity_min, velocity_max) = app.vol3d_product_value_range(&product);
+        let fallback_domain =
+            ViewerApp::vol3d_product_scalar_domain(&product, velocity_min, velocity_max);
+
+        // Reproduce the regression: an asynchronous two-box upload lands
+        // while its isosurface controls are hidden in another render mode.
+        app.vol3d.render_mode = vol3d::Vol3dRenderMode::MaximumProjection;
+        app.vol3d.iso_value = fallback_domain.surface_iso_value();
+        app.vol3d.iso_width = fallback_domain.suggested_iso_width();
+        app.set_vol3d_velocity_color_active(true);
+
+        let (reflectivity_domain, uses_reflectivity) =
+            app.vol3d_surface_scalar_domain(&product, velocity_min, velocity_max);
+        assert!(uses_reflectivity);
+        assert!((app.vol3d.iso_value - reflectivity_domain.hybrid_iso_value()).abs() < 1.0e-6);
+        assert!((app.vol3d.iso_width - reflectivity_domain.suggested_iso_width()).abs() < 1.0e-6);
+
+        // A later direct ComboBox mode switch must expose the already-rebased
+        // dBZ value, not reinterpret the former velocity magnitude as dBZ.
+        app.vol3d.render_mode = vol3d::Vol3dRenderMode::HybridShell;
+        let shader_iso = ViewerApp::normalized_vol3d_value(
+            app.vol3d.iso_value,
+            reflectivity_domain.value_min(),
+            reflectivity_domain.value_max(),
+        );
+        assert!(
+            (shader_iso
+                - ViewerApp::normalized_vol3d_value(
+                    reflectivity_domain.hybrid_iso_value(),
+                    reflectivity_domain.value_min(),
+                    reflectivity_domain.value_max(),
+                ))
+            .abs()
+                < 1.0e-6
+        );
+
+        app.vol3d.render_mode = vol3d::Vol3dRenderMode::OrthogonalSlices;
+        app.set_vol3d_velocity_color_active(false);
+        assert!((app.vol3d.iso_value - fallback_domain.hybrid_iso_value()).abs() < 1.0e-6);
+        assert!((app.vol3d.iso_width - fallback_domain.suggested_iso_width()).abs() < 1.0e-6);
+
+        // Isosurface is the one active mode that intentionally seeds the more
+        // selective surface value at the moment the domain changes.
+        app.vol3d.render_mode = vol3d::Vol3dRenderMode::Isosurface;
+        app.set_vol3d_velocity_color_active(true);
+        assert!((app.vol3d.iso_value - reflectivity_domain.surface_iso_value()).abs() < 1.0e-6);
     }
 
     #[test]
