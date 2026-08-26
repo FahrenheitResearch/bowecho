@@ -1456,6 +1456,21 @@ impl ViewerApp {
                     }
                 }
                 rw_ui::SatelliteEvent::StartRequested(spec) => {
+                    // Starting a live follow is an explicit request to view
+                    // the selected satellite product, not merely cache it in
+                    // the background. Keep the radar-map layer attached to
+                    // the player just like the one-shot "Load live loop" and
+                    // RGB actions do. Previously this route left the default
+                    // `sat_map_follow = false`, so polling could download and
+                    // publish hundreds of megabytes of healthy native Full
+                    // Disk frames while nothing was ever requested for the
+                    // radar map.
+                    self.sat_map_follow = true;
+                    if let Some((key, hhmm)) = self.sat_last_frame.clone()
+                        && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
+                    {
+                        self.request_sat_map_frame(key, hhmm);
+                    }
                     if let Some(sat) = &self.sat {
                         sat.send(sat_worker::SatRequest::Follow(spec));
                     }
@@ -1467,7 +1482,27 @@ impl ViewerApp {
                 }
             }
         }
+        // A native Full Disk player can request the selected overview plus
+        // neighboring prefetch frames in one UI pass. Those are expensive
+        // whole-product renders. Admit every authoritative selection first
+        // so its lightweight tiled map request reaches the worker ahead of
+        // that preview/prefetch batch instead of sitting behind tens of
+        // seconds of unrelated overview work.
+        let mut deferred_player_events = Vec::new();
         for event in player_events {
+            match event {
+                rw_ui::SatPlayerEvent::FrameSelected { key, hhmm } => {
+                    self.sat_last_frame = Some((key.clone(), hhmm));
+                    if self.sat_map_follow
+                        && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
+                    {
+                        self.request_sat_map_frame(key, hhmm);
+                    }
+                }
+                other => deferred_player_events.push(other),
+            }
+        }
+        for event in deferred_player_events {
             match event {
                 rw_ui::SatPlayerEvent::FrameWanted { key, hhmm } => {
                     let request = self.satellite_player_frame_request(key, hhmm);
@@ -1475,17 +1510,14 @@ impl ViewerApp {
                         sat.send(request);
                     }
                 }
-                rw_ui::SatPlayerEvent::FrameSelected { key, hhmm } => {
-                    self.sat_last_frame = Some((key.clone(), hhmm));
-                    if self.sat_map_follow {
-                        self.request_sat_map_frame(key, hhmm);
-                    }
-                }
                 rw_ui::SatPlayerEvent::RefreshRequested => {
                     if let Some(sat) = &self.sat {
                         sat.send(sat_worker::SatRequest::Scan);
                     }
                 }
+                rw_ui::SatPlayerEvent::FrameSelected { .. } => unreachable!(
+                    "authoritative satellite selections are handled before preview prefetch"
+                ),
             }
         }
     }
@@ -1588,15 +1620,15 @@ impl ViewerApp {
                     self.sat_run_listings = runs.clone();
                     self.sat_player.set_runs(runs);
                     self.sat_player.select_frame(key.clone(), hhmm);
-                    let request = self.satellite_player_frame_request(key.clone(), hhmm);
-                    if let Some(sat) = &self.sat {
-                        sat.send(request);
-                    }
                     if self.sat_map_follow
                         && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
                     {
-                        self.request_sat_map_frame(key, hhmm);
+                        self.request_sat_map_frame(key.clone(), hhmm);
                     }
+                    // SatPlayer owns preview requests and marks them pending
+                    // on its next UI pass. Sending one directly here made the
+                    // same native RGB overview render twice, because the
+                    // player could not see that host-side request.
                 }
                 sat_worker::SatResponse::FollowStarted => self.sat_panel.begin_follow(),
                 sat_worker::SatResponse::FollowFinished(result) => {
@@ -1738,15 +1770,14 @@ impl ViewerApp {
                         sat.send(sat_worker::SatRequest::Scan);
                     }
                     self.sat_player.select_frame(key.clone(), hhmm);
-                    let request = self.satellite_player_frame_request(key.clone(), hhmm);
-                    if let Some(sat) = &self.sat {
-                        sat.send(request);
-                    }
                     if self.sat_map_follow
                         && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
                     {
-                        self.request_sat_map_frame(key, hhmm);
+                        self.request_sat_map_frame(key.clone(), hhmm);
                     }
+                    // The player requests the selected texture (and bounded
+                    // prefetch neighbors) itself. Avoid a duplicate expensive
+                    // full-product overview render here.
                 }
                 sat_worker::SatResponse::MapFrame(result) => match *result {
                     Ok(frame) => {

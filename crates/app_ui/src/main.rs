@@ -62504,6 +62504,23 @@ mod tests {
     }
 
     #[test]
+    fn starting_satellite_follow_also_follows_the_player_on_the_map() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sat_map_follow = false;
+        let spec = app.sat_panel.spec().clone();
+
+        app.handle_satellite_events(
+            vec![rw_ui::SatelliteEvent::StartRequested(spec)],
+            Vec::new(),
+        );
+
+        assert!(
+            app.sat_map_follow,
+            "live polling must display completed frames on the radar map"
+        );
+    }
+
+    #[test]
     fn satellite_timeline_follow_queues_nearest_map_frame_after_scan_index() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let target = Utc.with_ymd_and_hms(2026, 6, 15, 17, 56, 0).unwrap();
