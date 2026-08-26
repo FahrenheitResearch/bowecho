@@ -77,8 +77,8 @@ incremental = true
 strip = false
 
 [patch.crates-io]
-hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "cf0ca3693650153ff0f79a0e60c3ec2da7d0af01" }
-openjp2 = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "cf0ca3693650153ff0f79a0e60c3ec2da7d0af01" }
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "472d7e9d9b5a49f81dce1da1826cc5b2145aaf95" }
+openjp2 = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "472d7e9d9b5a49f81dce1da1826cc5b2145aaf95" }
 
 # sharprs reaches this workspace from TWO git sources: directly from
 # rusty-weather, and transitively via sharppyrs, which pulls it from the
@@ -88,8 +88,9 @@ openjp2 = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "
 # which would move ~30 unrelated crates at once. A [patch] table replaces
 # packages by NAME within a single source, so listing only `sharprs` under the
 # rusty-weather source leaves rw-sat, rw-store, rw-ui, rw-glm, rustwx-sounding,
-# rustwx-render, netcrust, grib-core, hdf5-reader and openjp2 pinned at
-# cf0ca36 and unmoved. See vendor/sharprs/PATCHES.md for import lineage.
+# rustwx-render, netcrust, grib-core, hdf5-reader and openjp2 pinned at the
+# shared 472d7e9 native-satellite correctness revision. See
+# vendor/sharprs/PATCHES.md for import lineage.
 [patch."https://github.com/FahrenheitResearch/sharprs"]
 sharprs = { path = "vendor/sharprs" }
 

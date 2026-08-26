@@ -19,15 +19,15 @@ repository, which depends on the standalone `sharprs` repository. Both are
 unified onto a single crate by `[patch]` entries in the workspace root
 `Cargo.toml`.
 
-Advancing the pinned `rusty-weather` revision to pick up a fix in `sharprs`
-alone is not a targeted change: the rev is shared by `rw-sat`, `rw-store`,
+Advancing the pinned `rusty-weather` revision solely to pick up a `sharprs` fix
+would not be targeted: the same revision also supplies `rw-sat`, `rw-store`,
 `rw-ui`, `rw-glm`, `rustwx-sounding`, `rustwx-render`, `netcrust`, `grib-core`,
-`hdf5-reader`, `openjp2`, `wx-math`, `ecape-rs` and more. Moving it drags
-roughly thirty crates and twenty-plus manifest lines at once, and has repeatedly
-required large app-side repair commits. Vendoring the one crate and redirecting
-it with a `[patch]` keeps every other crate pinned at
-`cf0ca3693650153ff0f79a0e60c3ec2da7d0af01` and unmoved, while giving BowEcho a
-place to carry `sharprs` fixes.
+`hdf5-reader`, `openjp2`, `wx-math`, `ecape-rs`, and more. BowEcho now consumes
+the reconciled Rusty Weather revision plus native-satellite correctness fix
+`472d7e9d9b5a49f81dce1da1826cc5b2145aaf95`; the local `sharprs` patch remains
+independent so its reviewed BowEcho-specific fixes do not force future engine
+pin changes. The vendored baseline and import history remain documented in
+`PATCHES.md`.
 
 ## How it is wired in
 

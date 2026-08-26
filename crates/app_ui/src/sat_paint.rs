@@ -48,6 +48,157 @@ impl SatelliteSource {
 }
 
 const SAT_STALE_DRAPE_GRID: usize = 8;
+const SAT_RENDER_RETRY_BASE: Duration = Duration::from_secs(1);
+const SAT_RENDER_RETRY_MAX_SECS: u64 = 16;
+
+// GOES-R nominal fixed-grid geometry (the same values carried by operational
+// ABI L1b/L2 NetCDF files). `perspective_point_height` is measured above the
+// ellipsoid; the horizon calculation needs distance from Earth's center.
+const GOES_NOMINAL_PERSPECTIVE_HEIGHT_M: f64 = 35_786_023.0;
+const GOES_NOMINAL_SEMI_MAJOR_M: f64 = 6_378_137.0;
+const GOES_NOMINAL_SEMI_MINOR_M: f64 = 6_356_752.314_14;
+const GOES_FULL_DISK_FIT_MARGIN_POINTS: f32 = 16.0;
+/// Only the explicit Full Disk action may cross the ordinary 7 px/degree map
+/// floor. Keeping a separate conservative floor avoids making the global map
+/// zoom capable of opening an almost-antipodal AEQD view.
+const GOES_FULL_DISK_FIT_MIN_SCALE: f32 = 1.5;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GoesFullDiskGeometry {
+    center_lat_deg: f64,
+    center_lon_deg: f64,
+    east_limb_lon_deg: f64,
+    west_limb_lon_deg: f64,
+    north_limb_lat_deg: f64,
+    south_limb_lat_deg: f64,
+    max_limb_arc_deg: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GoesFullDiskMapFit {
+    center_lat_deg: f32,
+    center_lon_deg: f32,
+    map_scale: f32,
+    limb_radius_points: f32,
+}
+
+fn normalize_longitude_f64(longitude: f64) -> f64 {
+    (longitude + 180.0).rem_euclid(360.0) - 180.0
+}
+
+fn longitude_delta_degrees(left: f64, right: f64) -> f64 {
+    normalize_longitude_f64(left - right).abs()
+}
+
+/// Nominal surface-coordinate limb of a GOES-R full disk. East/west use the
+/// equatorial tangent; north/south use the ellipsoid's geodetic polar tangent,
+/// which is about 0.029 degrees farther from nadir and therefore controls fit.
+fn goes_full_disk_geometry(
+    platform: &str,
+    exact_center: Option<(f32, f32)>,
+) -> Option<GoesFullDiskGeometry> {
+    let normalized_platform = platform.trim().to_ascii_lowercase();
+    if !matches!(
+        normalized_platform.as_str(),
+        "g16" | "g17" | "g18" | "g19" | "goes16" | "goes17" | "goes18" | "goes19"
+    ) {
+        return None;
+    }
+
+    let nominal_lon = sat_window::goes_nominal_sub_lon_deg(&normalized_platform);
+    let (center_lat_deg, center_lon_deg) = exact_center
+        .map(|(lat, lon)| (f64::from(lat), normalize_longitude_f64(f64::from(lon))))
+        .filter(|(lat, lon)| {
+            lat.is_finite()
+                && lon.is_finite()
+                && lat.abs() <= 5.0
+                && longitude_delta_degrees(*lon, nominal_lon) <= 10.0
+        })
+        .unwrap_or((0.0, nominal_lon));
+
+    let satellite_radius_m = GOES_NOMINAL_PERSPECTIVE_HEIGHT_M + GOES_NOMINAL_SEMI_MAJOR_M;
+    let equatorial_arc_deg = (GOES_NOMINAL_SEMI_MAJOR_M / satellite_radius_m)
+        .acos()
+        .to_degrees();
+
+    // Ellipsoid tangent in the satellite/earth-center meridian. Convert the
+    // tangent point from geocentric Cartesian coordinates to geodetic latitude
+    // because BowEcho's map coordinates are geodetic lat/lon.
+    let tangent_x_m = GOES_NOMINAL_SEMI_MAJOR_M.powi(2) / satellite_radius_m;
+    let tangent_z_m = GOES_NOMINAL_SEMI_MINOR_M
+        * (1.0 - tangent_x_m.powi(2) / GOES_NOMINAL_SEMI_MAJOR_M.powi(2)).sqrt();
+    let polar_arc_deg = (GOES_NOMINAL_SEMI_MAJOR_M.powi(2) * tangent_z_m)
+        .atan2(GOES_NOMINAL_SEMI_MINOR_M.powi(2) * tangent_x_m)
+        .to_degrees();
+    let max_limb_arc_deg = equatorial_arc_deg.max(polar_arc_deg);
+
+    Some(GoesFullDiskGeometry {
+        center_lat_deg,
+        center_lon_deg,
+        east_limb_lon_deg: normalize_longitude_f64(center_lon_deg + equatorial_arc_deg),
+        west_limb_lon_deg: normalize_longitude_f64(center_lon_deg - equatorial_arc_deg),
+        north_limb_lat_deg: (center_lat_deg + polar_arc_deg).min(90.0),
+        south_limb_lat_deg: (center_lat_deg - polar_arc_deg).max(-90.0),
+        max_limb_arc_deg,
+    })
+}
+
+/// Fit the complete ABI earth limb inside the shorter axis of the actual map
+/// pane. The returned scale is points/degree, matching BowEcho's AEQD map.
+fn goes_full_disk_map_fit(
+    platform: &str,
+    exact_center: Option<(f32, f32)>,
+    pane_size: egui::Vec2,
+) -> Option<GoesFullDiskMapFit> {
+    if !pane_size.is_finite() || pane_size.x <= 0.0 || pane_size.y <= 0.0 {
+        return None;
+    }
+    let geometry = goes_full_disk_geometry(platform, exact_center)?;
+    let short_axis = pane_size.x.min(pane_size.y);
+    let usable_diameter = short_axis - 2.0 * GOES_FULL_DISK_FIT_MARGIN_POINTS;
+    let map_scale = usable_diameter / (2.0 * geometry.max_limb_arc_deg as f32);
+    if !map_scale.is_finite() || map_scale < GOES_FULL_DISK_FIT_MIN_SCALE {
+        return None;
+    }
+    Some(GoesFullDiskMapFit {
+        center_lat_deg: geometry.center_lat_deg as f32,
+        center_lon_deg: geometry.center_lon_deg as f32,
+        map_scale,
+        limb_radius_points: geometry.max_limb_arc_deg as f32 * map_scale,
+    })
+}
+
+fn satellite_full_disk_platform(layer: &SatMapLayer) -> Option<&str> {
+    if let Some(platform) = layer
+        .native
+        .as_ref()
+        .and_then(|native| native.goes_full_disk_platform())
+    {
+        return Some(platform);
+    }
+
+    // Compatibility for old local `.rws` Full Disk frames which predate the
+    // exact native archive. A focused `fulldisk_win…` preview is a crop and
+    // must not advertise itself as the whole disk.
+    let model = layer.key.model.trim().to_ascii_lowercase();
+    let run = layer.key.run.trim().to_ascii_lowercase();
+    let is_goes = matches!(model.as_str(), "g16" | "g17" | "g18" | "g19");
+    let is_whole_disk = run.starts_with("fulldisk_") && !run.starts_with("fulldisk_win");
+    (is_goes && is_whole_disk).then_some(layer.key.model.as_str())
+}
+
+fn radar_map_primary_pane_size(layout: PanelLayout, map_rect: egui::Rect) -> Option<egui::Vec2> {
+    if !map_rect.is_finite() || !map_rect.is_positive() {
+        return None;
+    }
+    if layout == PanelLayout::One {
+        return Some(map_rect.size());
+    }
+    pane_cell_rects(layout, map_rect, 2.0)
+        .first()
+        .map(egui::Rect::size)
+        .filter(|size| size.is_finite())
+}
 
 /// Preserve the GOES panel's provider/detail choices when turning its
 /// single-band follow spec into a one-shot RGB request. The old inline
@@ -197,8 +348,14 @@ impl ViewerApp {
         // (field failure: checksum mismatch on files rusty-weather
         // was mid-writing).
         let store = settings::sat_store_dir();
+        let remote = self.app_settings.community_cache.enabled.then(|| {
+            sat_worker::RemoteSatelliteBootstrap {
+                settings: self.app_settings.community_cache.clone(),
+                cache_root: settings::community_cache_dir(),
+            }
+        });
         let notify = ctx.clone();
-        let worker = sat_worker::SatWorker::spawn(store, move || {
+        let worker = sat_worker::SatWorker::spawn_with_remote(store, remote, move || {
             notify.request_repaint();
         });
         self.sat_panel
@@ -375,6 +532,23 @@ impl ViewerApp {
             SatelliteSource::Goes => {
                 panel_kit::subgroup(ui, "GOES live follow", |_ui| {});
                 panel_events = self.sat_panel.ui(ui);
+                if let Some(usage) = self.sat_storage_usage {
+                    let preview_cap_per_channel = self.sat_panel.spec().max_bytes();
+                    ui.label(
+                        egui::RichText::new(satellite_storage_usage_text(
+                            usage,
+                            preview_cap_per_channel,
+                        ))
+                            .small()
+                            .strong(),
+                    )
+                    .on_hover_text(
+                        "Exact native NetCDF sources power zoom-dependent map tiles and selected RGB overviews. Compact .rws derivatives power scalar-channel loops; neither number is mislabeled as the other.",
+                    );
+                    ui.weak(
+                        "The transfer list and its frames counter are component-channel preview writes. The saved loop exposes only complete product scan minutes.",
+                    );
+                }
                 ui.horizontal_wrapped(|ui| {
                     if fixed_action_button(ui, "Load live loop", 110.0)
                         .on_hover_text(
@@ -812,19 +986,48 @@ impl ViewerApp {
             let mut map_request: Option<(rw_ui::SatRunKey, u16)> = None;
             let mut plot_request: Option<(rw_ui::SatRunKey, u16)> = None;
             let mut center_on_satellite = false;
+            let mut fit_full_disk_on_map = false;
             let frame_available = self.sat_last_frame.is_some();
+            let native_plot_available = self
+                .sat_last_frame
+                .as_ref()
+                .is_some_and(|(key, _)| !satellite_run_key_is_remote(key));
+            let full_disk_identity = self.sat_layer.as_ref().and_then(|layer| {
+                let platform = satellite_full_disk_platform(layer)?.to_owned();
+                let exact_center = layer
+                    .native
+                    .as_ref()
+                    .and_then(|native| native.coverage_center());
+                Some((platform, exact_center))
+            });
+            let map_pane_size = self
+                .media
+                .last_map_rect
+                .and_then(|rect| radar_map_primary_pane_size(self.grid_layout, rect));
+            let full_disk_fit = full_disk_identity.as_ref().zip(map_pane_size).and_then(
+                |((platform, exact_center), pane_size)| {
+                    goes_full_disk_map_fit(platform, *exact_center, pane_size)
+                },
+            );
             let center_action_available = self
                 .sat_layer
                 .as_ref()
                 .zip(self.sat_layer_texture.as_ref())
-                .is_some_and(|(layer, (_, generation, _, has_visible_pixels))| {
+                .is_some_and(|(layer, (_, generation, _, has_visible_pixels, _, _))| {
                     layer.generation == *generation
                         && !*has_visible_pixels
-                        && layer
-                            .lut
-                            .lookup(self.map_center_lat, self.map_center_lon)
-                            .is_none()
-                });
+                        && (layer
+                            .native
+                            .as_ref()
+                            .is_some_and(|native| native.coverage_center().is_some())
+                            || layer.preview.as_ref().is_some_and(|preview| {
+                                preview
+                                    .lut
+                                    .lookup(self.map_center_lat, self.map_center_lon)
+                                    .is_none()
+                            }))
+                })
+                && full_disk_identity.is_none();
             let button_label = if self.sat_layer.is_some() {
                 "Refresh map frame"
             } else {
@@ -855,15 +1058,32 @@ impl ViewerApp {
                     map_request = self.sat_last_frame.clone();
                 }
                 if ui
-                    .add_enabled(frame_available, egui::Button::new("Native plot"))
+                    .add_enabled(native_plot_available, egui::Button::new("Native plot"))
                     .on_hover_text(
-                        "Render the selected satellite frame through BowEcho's georeferenced \
-                         native plotter. Scalar bands retain raw values/units; RGB composites \
-                         retain their baked colors.",
+                        if native_plot_available {
+                            "Render the selected satellite frame through BowEcho's georeferenced native plotter. Scalar bands retain raw values/units; RGB composites retain their baked colors."
+                        } else {
+                            "rw-server satellite tiles are display-only and do not expose native science values for the plotter."
+                        },
                     )
                     .clicked()
                 {
                     plot_request = self.sat_last_frame.clone();
+                }
+                if full_disk_identity.is_some()
+                    && ui
+                        .add_enabled(
+                            full_disk_fit.is_some(),
+                            egui::Button::new("Fit full disk on map"),
+                        )
+                        .on_hover_text(if full_disk_fit.is_some() {
+                            "Center the radar map on the exact GOES subpoint (or the satellite's nominal operational slot for rw-server imagery) and zoom so the complete ABI earth limb fits inside the primary map pane."
+                        } else {
+                            "The current radar-map pane is too small to fit the complete ABI earth limb safely."
+                        })
+                        .clicked()
+                {
+                    fit_full_disk_on_map = true;
                 }
                 if center_action_available
                     && ui
@@ -890,13 +1110,33 @@ impl ViewerApp {
                     .apply_note(format!("Loading native plot for {key} {hhmm:04}Z"));
                 sat.send(sat_worker::SatRequest::LoadFrameForPlot { key, hhmm });
             }
+            if fit_full_disk_on_map && let Some(fit) = full_disk_fit {
+                self.clear_camera_follow_targets();
+                self.center_map_on(fit.center_lat_deg, fit.center_lon_deg);
+                // This is the sole intentional path below MIN_MAP_SCALE. The
+                // ordinary wheel/global clamp remains 7 px/degree; lowering it
+                // globally reintroduces near-antipode AEQD basemap smearing.
+                self.map_scale = fit.map_scale;
+                self.status = format!(
+                    "GOES Full Disk fitted to map at {:.2} px/degree",
+                    fit.map_scale
+                );
+                ui.ctx().request_repaint();
+            }
             if center_on_satellite {
                 let target = self.sat_layer.as_ref().and_then(|layer| {
-                    satellite_visible_coverage_point(
-                        layer.image.as_ref(),
-                        layer.grid.as_ref(),
-                        layer.flip_rows,
-                    )
+                    layer
+                        .native
+                        .as_ref()
+                        .and_then(|native| native.coverage_center())
+                        .or_else(|| {
+                            let preview = layer.preview.as_ref()?;
+                            satellite_visible_coverage_point(
+                                preview.image.as_ref(),
+                                preview.grid.as_ref(),
+                                preview.flip_rows,
+                            )
+                        })
                 });
                 if let Some((lat, lon)) = target {
                     self.center_map_on(lat, lon);
@@ -937,7 +1177,16 @@ impl ViewerApp {
         {
             ui.weak(
                 "This stored frame predates the true-Kelvin calibration and uses the legacy \
-                 auto-stretch — IR enhancements apply to newly ingested frames.",
+                auto-stretch — IR enhancements apply to newly ingested frames.",
+            );
+        }
+        if self
+            .sat_last_frame
+            .as_ref()
+            .is_some_and(|(key, _)| satellite_run_key_is_remote(key))
+        {
+            ui.weak(
+                "This rw-server frame is already rendered into exact tiles; local IR enhancement changes apply to local/native frames only.",
             );
         }
         if selected_enhancement != self.sat_ir_enhancement {
@@ -954,19 +1203,28 @@ impl ViewerApp {
                 // palettes. Each re-pushed frame replaces its cached
                 // texture in place (playback state untouched); the map
                 // frame refreshes below.
-                for (key, hhmm) in sat_enhancement_refresh_frames(
-                    &self.sat_run_listings,
-                    self.sat_player.selected_run(),
-                    self.sat_last_frame.as_ref(),
-                ) {
-                    sat.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
+                if selected_goes_player_product(self.sat_panel.spec()).is_none() {
+                    for (key, hhmm) in sat_enhancement_refresh_frames(
+                        &self.sat_run_listings,
+                        self.sat_player.selected_run(),
+                        self.sat_last_frame.as_ref(),
+                    ) {
+                        sat.send(sat_worker::SatRequest::LoadFrame {
+                            key,
+                            hhmm,
+                            native_product: None,
+                        });
+                    }
                 }
             }
             // The map layer recolors by ITS OWN identity (layer, else the
             // in-flight/queued request): timeline follow can point the map
             // at a different scan than the player, and keying this off
             // `sat_last_frame` left the map on the old palette then.
-            if let Some((key, hhmm)) = self.sat_map_recolor_target() {
+            if let Some((key, hhmm)) = self
+                .sat_map_recolor_target()
+                .filter(|(key, _)| !satellite_run_key_is_remote(key))
+            {
                 self.request_sat_map_frame(key, hhmm);
             }
         }
@@ -984,13 +1242,15 @@ impl ViewerApp {
 
     pub(crate) fn clear_satellite_display_for_spec_change(&mut self) {
         self.sat_last_frame = None;
+        self.sat_storage_usage = None;
         self.sat_legacy_frames.clear();
         self.sat_run_listings.clear();
         self.sat_player.set_runs(Vec::new());
         self.sat_layer = None;
         self.sat_layer_texture = None;
         self.sat_layer_build_rx = None;
-        self.sat_layer_render_rx = None;
+        self.cancel_sat_layer_render();
+        self.reset_sat_layer_render_backoff();
         self.sat_map_inflight = None;
         self.sat_map_pending = None;
         self.sat_layer_generation = self.sat_layer_generation.wrapping_add(1);
@@ -998,6 +1258,40 @@ impl ViewerApp {
         // CONTENT (sha256), so a spec change can never make them wrong —
         // and toggling back to a spec whose grid was already indexed
         // reinstalls the layer without the multi-second LUT rebuild.
+    }
+
+    /// Stop a detached viewport raster at its next bounded checkpoint. Merely
+    /// dropping the result receiver leaves native NetCDF reads (and remote
+    /// HTTP tile requests) running, which made rapid scrub/pan pile up stale
+    /// workers behind the current frame.
+    fn cancel_sat_layer_render(&mut self) {
+        if let Some(cancel) = self.sat_layer_render_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.sat_layer_render_rx = None;
+        self.sat_layer_render_generation = None;
+        self.sat_layer_render_view = None;
+    }
+
+    fn finish_sat_layer_render(&mut self) {
+        self.sat_layer_render_cancel = None;
+        self.sat_layer_render_rx = None;
+        self.sat_layer_render_generation = None;
+        self.sat_layer_render_view = None;
+    }
+
+    fn reset_sat_layer_render_backoff(&mut self) {
+        self.sat_layer_render_retry_after = None;
+        self.sat_layer_render_failures = 0;
+    }
+
+    fn defer_failed_sat_layer_render(&mut self, ctx: &egui::Context) {
+        self.sat_layer_render_failures = self.sat_layer_render_failures.saturating_add(1);
+        let shift = u32::from(self.sat_layer_render_failures.saturating_sub(1).min(4));
+        let seconds = (SAT_RENDER_RETRY_BASE.as_secs() << shift).min(SAT_RENDER_RETRY_MAX_SECS);
+        let delay = Duration::from_secs(seconds);
+        self.sat_layer_render_retry_after = Some(Instant::now() + delay);
+        ctx.request_repaint_after(delay);
     }
 
     pub(crate) fn satellite_run_key_matches_current_spec(&self, key: &rw_ui::SatRunKey) -> bool {
@@ -1017,11 +1311,9 @@ impl ViewerApp {
             return true;
         }
         match self.satellite_source {
-            SatelliteSource::Goes => sat_worker::run_filters_for_spec(self.sat_panel.spec())
-                .map(|(model, prefixes)| {
-                    satellite_run_key_matches_resolved_spec(key, &model, &prefixes)
-                })
-                .unwrap_or(false),
+            SatelliteSource::Goes => {
+                satellite_run_key_matches_goes_spec(key, self.sat_panel.spec())
+            }
             SatelliteSource::Himawari => {
                 satellite_run_key_matches_himawari(key, self.himawari_band)
             }
@@ -1044,7 +1336,39 @@ impl ViewerApp {
                     || selected.is_some_and(|key| key == &run.key)
                     || self.satellite_run_key_matches_current_spec(&run.key)
             })
+            .map(|mut run| {
+                if self.satellite_source == SatelliteSource::Goes
+                    && !satellite_run_key_is_remote(&run.key)
+                    && !satellite_run_key_is_composite(&run.key)
+                    && let Some(product) = selected_goes_player_product(self.sat_panel.spec())
+                {
+                    run.title = local_goes_product_run_title(&run.key, product);
+                }
+                run
+            })
             .collect()
+    }
+
+    /// The player request matching the current GOES product. Baked RGB,
+    /// SimSat, Himawari, Meteosat, and ordinary scalar runs keep their stored
+    /// frame path. A local multi-channel GOES carrier instead asks the worker
+    /// for the exact retained-native product overview.
+    fn satellite_player_frame_request(
+        &self,
+        key: rw_ui::SatRunKey,
+        hhmm: u16,
+    ) -> sat_worker::SatRequest {
+        let native_product = (self.satellite_source == SatelliteSource::Goes
+            && !satellite_run_key_is_composite(&key)
+            && self.satellite_run_key_matches_current_spec(&key))
+        .then(|| selected_goes_player_product(self.sat_panel.spec()))
+        .flatten()
+        .map(|product| product.slug());
+        sat_worker::SatRequest::LoadFrame {
+            key,
+            hhmm,
+            native_product,
+        }
     }
 
     pub(crate) fn request_sat_map_frame(&mut self, key: rw_ui::SatRunKey, hhmm: u16) {
@@ -1065,9 +1389,12 @@ impl ViewerApp {
             self.sat_map_pending = Some((key, hhmm));
             return;
         };
+        let native_product = (self.satellite_source == SatelliteSource::Goes)
+            .then(|| self.sat_panel.spec().layer.clone());
         sat.send(sat_worker::SatRequest::LoadFrameForMap {
             key: key.clone(),
             hhmm,
+            native_product,
         });
         self.sat_map_inflight = Some((key, hhmm));
     }
@@ -1143,8 +1470,9 @@ impl ViewerApp {
         for event in player_events {
             match event {
                 rw_ui::SatPlayerEvent::FrameWanted { key, hhmm } => {
+                    let request = self.satellite_player_frame_request(key, hhmm);
                     if let Some(sat) = &self.sat {
-                        sat.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
+                        sat.send(request);
                     }
                 }
                 rw_ui::SatPlayerEvent::FrameSelected { key, hhmm } => {
@@ -1160,6 +1488,39 @@ impl ViewerApp {
                 }
             }
         }
+    }
+
+    /// Admit a completed player texture load without changing the displayed
+    /// playhead identity. SatPlayer requests the current frame plus prefetch
+    /// neighbors; only `FrameSelected` (or an explicit `SelectFrame` response)
+    /// is authoritative for `sat_last_frame` and map-follow.
+    pub(crate) fn cache_loaded_satellite_frame(
+        &mut self,
+        key: rw_ui::SatRunKey,
+        hhmm: u16,
+        legacy: bool,
+        frame: rw_ui::SatFrameImage,
+    ) -> bool {
+        if frame.key != key
+            || frame.hhmm != hhmm
+            || !self.satellite_run_key_matches_current_spec(&key)
+        {
+            return false;
+        }
+        if legacy {
+            self.sat_legacy_frames.insert((key, hhmm));
+        } else {
+            self.sat_legacy_frames.remove(&(key, hhmm));
+        }
+        let (frame, resized) = sat_player_frame_within_texture_limit(frame);
+        if let Some((old_size, new_size)) = resized {
+            self.sat_panel.apply_note(format!(
+                "preview downsampled {}x{} -> {}x{} for GPU texture limit",
+                old_size[0], old_size[1], new_size[0], new_size[1]
+            ));
+        }
+        self.sat_player.set_frame(frame);
+        true
     }
 
     pub(crate) fn pump_sat_responses(
@@ -1202,6 +1563,15 @@ impl ViewerApp {
                     self.eumetsat_account_status = Some(result);
                     self.sat_panel.apply_note(note);
                 }
+                sat_worker::SatResponse::RemoteCatalogOptions {
+                    satellites,
+                    sectors,
+                    layers,
+                } => {
+                    self.sat_panel.set_satellite_options(satellites);
+                    self.sat_panel.set_sector_options(sectors);
+                    self.sat_panel.set_layer_options(layers);
+                }
                 sat_worker::SatResponse::Runs(runs) => {
                     let runs = self.satellite_runs_for_current_spec(runs);
                     self.sat_run_listings = runs.clone();
@@ -1218,11 +1588,9 @@ impl ViewerApp {
                     self.sat_run_listings = runs.clone();
                     self.sat_player.set_runs(runs);
                     self.sat_player.select_frame(key.clone(), hhmm);
+                    let request = self.satellite_player_frame_request(key.clone(), hhmm);
                     if let Some(sat) = &self.sat {
-                        sat.send(sat_worker::SatRequest::LoadFrame {
-                            key: key.clone(),
-                            hhmm,
-                        });
+                        sat.send(request);
                     }
                     if self.sat_map_follow
                         && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
@@ -1248,12 +1616,52 @@ impl ViewerApp {
                     );
                     self.sat_panel.apply_download_started(id, label, bytes);
                 }
+                sat_worker::SatResponse::DownloadProgress {
+                    id,
+                    received_bytes,
+                    total_bytes,
+                } => {
+                    self.sat_panel
+                        .apply_download_progress(&id, received_bytes, total_bytes);
+                    self.status = match total_bytes.filter(|total| *total > 0) {
+                        Some(total) => format!(
+                            "Satellite: downloading {} / {} ({:.0}%)",
+                            rw_ui::format_bytes(received_bytes),
+                            rw_ui::format_bytes(total),
+                            received_bytes as f64 * 100.0 / total as f64,
+                        ),
+                        None => format!(
+                            "Satellite: downloading {}",
+                            rw_ui::format_bytes(received_bytes)
+                        ),
+                    };
+                }
                 sat_worker::SatResponse::DownloadDone { id, ms, cache_hit } => {
                     self.status = format!(
                         "Satellite: download complete in {ms} ms{} · decoding / storing",
                         if cache_hit { " · cache hit" } else { "" }
                     );
                     self.sat_panel.apply_download_done(&id, ms, cache_hit);
+                }
+                sat_worker::SatResponse::NativeFrameUpdated {
+                    key,
+                    hhmm,
+                    committed_channel,
+                } => {
+                    self.status = format!(
+                        "Satellite: native {key} {hhmm:04}Z C{committed_channel:02} retained at full source resolution"
+                    );
+                    self.sat_panel.apply_note(format!(
+                        "native {key} {hhmm:04}Z C{committed_channel:02} retained at full source resolution"
+                    ));
+                    if let Some(sat) = &self.sat {
+                        sat.send(satellite_native_frame_refresh_request(
+                            key,
+                            hhmm,
+                            self.satellite_source,
+                            self.sat_panel.spec(),
+                        ));
+                    }
                 }
                 sat_worker::SatResponse::FrameWritten {
                     id,
@@ -1265,17 +1673,32 @@ impl ViewerApp {
                     select_live_run,
                 } => {
                     self.status = format!(
-                        "Satellite: stored {run}/t{hhmm:04} · {} in {encode_ms} ms",
+                        "Satellite: compact preview stored {run}/t{hhmm:04} · {} in {encode_ms} ms",
                         rw_ui::format_bytes(bytes)
                     );
-                    self.sat_panel
-                        .apply_frame_written(&id, run.clone(), hhmm, bytes, encode_ms);
-                    if let Some(sat) = &self.sat {
+                    self.sat_panel.apply_frame_written(
+                        &id,
+                        format!("preview {run}"),
+                        hhmm,
+                        bytes,
+                        encode_ms,
+                    );
+                    let selected_product = (self.satellite_source == SatelliteSource::Goes)
+                        .then(|| selected_goes_player_product(self.sat_panel.spec()))
+                        .flatten();
+                    // Named multi-channel products refresh at the preceding
+                    // NativeFrameUpdated durable boundary. Waiting for (or
+                    // duplicating work after) this optional derivative would
+                    // make a preview failure hide a healthy native product.
+                    if selected_product.is_none()
+                        && let Some(sat) = &self.sat
+                    {
                         sat.send(satellite_frame_written_refresh_request(
                             model,
                             run,
                             hhmm,
                             select_live_run,
+                            selected_product,
                         ));
                     }
                 }
@@ -1290,7 +1713,9 @@ impl ViewerApp {
                     self.status = format!("Satellite: {message}");
                     self.sat_panel.apply_note(message);
                 }
-                sat_worker::SatResponse::DiskUsage(usage) => self.sat_panel.set_disk_usage(usage),
+                sat_worker::SatResponse::StorageUsage(usage) => {
+                    self.sat_storage_usage = Some(usage);
+                }
                 sat_worker::SatResponse::SelectFrame { key, hhmm } => {
                     // SimSat is an external producer rather than a provider
                     // tab. Its atomic ScanAndSelect response is therefore the
@@ -1313,11 +1738,9 @@ impl ViewerApp {
                         sat.send(sat_worker::SatRequest::Scan);
                     }
                     self.sat_player.select_frame(key.clone(), hhmm);
+                    let request = self.satellite_player_frame_request(key.clone(), hhmm);
                     if let Some(sat) = &self.sat {
-                        sat.send(sat_worker::SatRequest::LoadFrame {
-                            key: key.clone(),
-                            hhmm,
-                        });
+                        sat.send(request);
                     }
                     if self.sat_map_follow
                         && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
@@ -1353,28 +1776,7 @@ impl ViewerApp {
                     result,
                 } => match *result {
                     Ok(frame) => {
-                        if !self.satellite_run_key_matches_current_spec(&key) {
-                            continue;
-                        }
-                        if legacy {
-                            self.sat_legacy_frames.insert((key.clone(), hhmm));
-                        } else {
-                            self.sat_legacy_frames.remove(&(key.clone(), hhmm));
-                        }
-                        self.sat_last_frame = Some((key.clone(), hhmm));
-                        let (frame, resized) = sat_player_frame_within_texture_limit(frame);
-                        if let Some((old_size, new_size)) = resized {
-                            self.sat_panel.apply_note(format!(
-                                "preview downsampled {}x{} -> {}x{} for GPU texture limit",
-                                old_size[0], old_size[1], new_size[0], new_size[1]
-                            ));
-                        }
-                        self.sat_player.set_frame(frame);
-                        if self.sat_map_follow
-                            && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
-                        {
-                            self.request_sat_map_frame(key, hhmm);
-                        }
+                        self.cache_loaded_satellite_frame(key, hhmm, legacy, frame);
                     }
                     Err(message) => {
                         if self.sat_player.selected_run() == Some(&key) {
@@ -1458,78 +1860,13 @@ impl ViewerApp {
             self.sat_map_pending = Some((frame.key, frame.hhmm));
             return;
         }
-        let key = frame.key.clone();
-        let hhmm = frame.hhmm;
-        let nx = frame.grid.nx;
-        let ny = frame.grid.ny;
-        if let Some(existing) = &self.sat_layer
-            && existing.key == key
-            && existing.nx == nx
-            && existing.ny == ny
-            && existing.flip_rows == frame.flip_rows
-        {
-            let generation = self.sat_layer_generation + 1;
-            self.sat_layer_generation = generation;
-            self.sat_layer = Some(SatMapLayer {
-                key,
-                hhmm,
-                image: Arc::new(frame.image),
-                grid: Arc::clone(&existing.grid),
-                lut: Arc::clone(&existing.lut),
-                nx,
-                ny,
-                flip_rows: existing.flip_rows,
-                opacity: existing.opacity,
-                visible: existing.visible,
-                generation,
-            });
-            // Keep the previous map texture visible until the next frame's
-            // viewport render is ready. Clearing here makes playback blink
-            // blank between frames, especially now that sat overlays render
-            // at full viewport resolution.
-            self.sat_layer_render_rx = None;
-            self.status = format!("Satellite map: {hhmm:04}Z");
-            return;
-        }
-        // Different run key, but a grid we have already indexed (successive
-        // runs of a product write bit-identical grids; spec toggles come
-        // back to the same grid): reuse the cached LUT synchronously
-        // instead of parking playback behind a multi-second rebuild.
-        if let Some(lut) = self.sat_lut_cache_get(&frame.grid.hash, nx, ny) {
-            let generation = self.sat_layer_generation + 1;
-            self.sat_layer_generation = generation;
-            let opacity = self
-                .sat_layer
-                .as_ref()
-                .map(|layer| layer.opacity)
-                .unwrap_or_else(|| self.style_registry.drapes().goes_opacity);
-            let visible = self
-                .sat_layer
-                .as_ref()
-                .map(|layer| layer.visible)
-                .unwrap_or(true);
-            self.sat_layer = Some(SatMapLayer {
-                key,
-                hhmm,
-                image: Arc::new(frame.image),
-                grid: frame.grid,
-                lut,
-                nx,
-                ny,
-                flip_rows: frame.flip_rows,
-                opacity,
-                visible,
-                generation,
-            });
-            // As above: the previous texture stays up as a placeholder until
-            // this generation's viewport render lands.
-            self.sat_layer_render_rx = None;
-            self.status = format!("Satellite map: {hhmm:04}Z");
-            return;
-        }
-        let (sender, receiver) = mpsc::channel();
-        self.sat_layer_build_rx = Some(receiver);
-        let generation = self.sat_layer_generation + 1;
+        let sat_worker::SatMapFrame {
+            key,
+            hhmm,
+            native,
+            remote,
+            preview,
+        } = frame;
         let initial_opacity = self
             .sat_layer
             .as_ref()
@@ -1540,27 +1877,142 @@ impl ViewerApp {
             .as_ref()
             .map(|layer| layer.visible)
             .unwrap_or(true);
+        let generation = self.sat_layer_generation + 1;
+
+        if let Some(native) = native {
+            self.sat_layer_generation = generation;
+            self.sat_layer = Some(SatMapLayer {
+                key,
+                hhmm,
+                native: Some(Arc::new(sat_native_map::NativeTileRenderer::new(native))),
+                preview: None,
+                opacity: initial_opacity,
+                visible: initial_visible,
+                generation,
+            });
+            self.cancel_sat_layer_render();
+            self.reset_sat_layer_render_backoff();
+            self.status = format!("Satellite map: {hhmm:04}Z · native source ready");
+            return;
+        }
+
+        if let Some(remote) = remote {
+            self.sat_layer_generation = generation;
+            self.sat_layer = Some(SatMapLayer {
+                key,
+                hhmm,
+                native: Some(Arc::new(sat_native_map::NativeTileRenderer::new_remote(
+                    remote,
+                ))),
+                preview: None,
+                opacity: initial_opacity,
+                visible: initial_visible,
+                generation,
+            });
+            self.cancel_sat_layer_render();
+            self.reset_sat_layer_render_backoff();
+            self.status = format!("Satellite map: {hhmm:04}Z · native server tiles ready");
+            return;
+        }
+
+        let Some(preview) = preview else {
+            self.status = format!("Satellite map {key} {hhmm:04}Z has no renderable source");
+            return;
+        };
+        let nx = preview.grid.nx;
+        let ny = preview.grid.ny;
+        if let Some(existing) = &self.sat_layer
+            && existing.key == key
+            && let Some(existing_preview) = &existing.preview
+            && existing_preview.nx == nx
+            && existing_preview.ny == ny
+            && existing_preview.flip_rows == preview.flip_rows
+        {
+            self.sat_layer_generation = generation;
+            self.sat_layer = Some(SatMapLayer {
+                key,
+                hhmm,
+                native: None,
+                preview: Some(SatMapPreviewLayer {
+                    image: Arc::new(preview.image),
+                    grid: Arc::clone(&existing_preview.grid),
+                    lut: Arc::clone(&existing_preview.lut),
+                    nx,
+                    ny,
+                    flip_rows: existing_preview.flip_rows,
+                }),
+                opacity: existing.opacity,
+                visible: existing.visible,
+                generation,
+            });
+            // Keep the previous map texture visible until the next frame's
+            // viewport render is ready. Clearing here makes playback blink
+            // blank between frames, especially now that sat overlays render
+            // at full viewport resolution.
+            self.cancel_sat_layer_render();
+            self.reset_sat_layer_render_backoff();
+            self.status = format!("Satellite map: {hhmm:04}Z");
+            return;
+        }
+        // Different run key, but a grid we have already indexed (successive
+        // runs of a product write bit-identical grids; spec toggles come
+        // back to the same grid): reuse the cached LUT synchronously
+        // instead of parking playback behind a multi-second rebuild.
+        if let Some(lut) = self.sat_lut_cache_get(&preview.grid.hash, nx, ny) {
+            self.sat_layer_generation = generation;
+            self.sat_layer = Some(SatMapLayer {
+                key,
+                hhmm,
+                native: None,
+                preview: Some(SatMapPreviewLayer {
+                    image: Arc::new(preview.image),
+                    grid: preview.grid,
+                    lut,
+                    nx,
+                    ny,
+                    flip_rows: preview.flip_rows,
+                }),
+                opacity: initial_opacity,
+                visible: initial_visible,
+                generation,
+            });
+            // As above: the previous texture stays up as a placeholder until
+            // this generation's viewport render lands.
+            self.cancel_sat_layer_render();
+            self.reset_sat_layer_render_backoff();
+            self.status = format!("Satellite map: {hhmm:04}Z");
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.sat_layer_build_rx = Some(receiver);
+        self.status = format!("Building satellite layer {key} {hhmm:04}Z");
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let layer =
-                model_layer::InverseLut::build_with_shape(&frame.grid.lat, &frame.grid.lon, nx, ny)
-                    .map(|lut| SatMapLayer {
-                        key: frame.key,
-                        hhmm: frame.hhmm,
-                        image: Arc::new(frame.image),
-                        grid: Arc::clone(&frame.grid),
-                        lut: Arc::new(lut),
-                        nx,
-                        ny,
-                        flip_rows: frame.flip_rows,
-                        opacity: initial_opacity,
-                        visible: initial_visible,
-                        generation,
-                    });
+            let layer = model_layer::InverseLut::build_with_shape(
+                &preview.grid.lat,
+                &preview.grid.lon,
+                nx,
+                ny,
+            )
+            .map(|lut| SatMapLayer {
+                key,
+                hhmm,
+                native: None,
+                preview: Some(SatMapPreviewLayer {
+                    image: Arc::new(preview.image),
+                    grid: Arc::clone(&preview.grid),
+                    lut: Arc::new(lut),
+                    nx,
+                    ny,
+                    flip_rows: preview.flip_rows,
+                }),
+                opacity: initial_opacity,
+                visible: initial_visible,
+                generation,
+            });
             let _ = sender.send(layer);
             ctx.request_repaint();
         });
-        self.status = format!("Building satellite layer {key} {hhmm:04}Z");
     }
 
     pub(crate) fn poll_sat_layer(&mut self, ctx: &egui::Context) {
@@ -1573,14 +2025,18 @@ impl ViewerApp {
                         // content hash: every later frame of this run — and
                         // of successive runs writing the identical grid —
                         // installs without another rebuild.
-                        self.sat_lut_cache_insert(
-                            layer.grid.hash.clone(),
-                            layer.nx,
-                            layer.ny,
-                            Arc::clone(&layer.lut),
-                        );
+                        if let Some(preview) = &layer.preview {
+                            self.sat_lut_cache_insert(
+                                preview.grid.hash.clone(),
+                                preview.nx,
+                                preview.ny,
+                                Arc::clone(&preview.lut),
+                            );
+                        }
                         self.sat_layer_generation = layer.generation;
                         self.sat_layer = Some(layer);
+                        self.cancel_sat_layer_render();
+                        self.reset_sat_layer_render_backoff();
                         // Keep the old texture as a placeholder while the
                         // new layer renders; draw_sat_layer detects the
                         // generation mismatch and refreshes it.
@@ -1602,32 +2058,109 @@ impl ViewerApp {
         }
         if let Some(receiver) = &self.sat_layer_render_rx {
             match receiver.try_recv() {
-                Ok((generation, key, image, _ms)) => {
-                    self.sat_layer_render_rx = None;
-                    if let Some(layer) = self
+                Ok(rendered) => {
+                    self.finish_sat_layer_render();
+                    if let Some((key, hhmm, outside_coverage, can_center, remote_native)) = self
                         .sat_layer
                         .as_ref()
-                        .filter(|layer| layer.generation == generation)
+                        .filter(|layer| layer.generation == rendered.generation)
+                        .map(|layer| {
+                            let outside_coverage = layer.preview.as_ref().is_some_and(|preview| {
+                                preview
+                                    .lut
+                                    .lookup(rendered.view.center_lat, rendered.view.center_lon)
+                                    .is_none()
+                            });
+                            let can_center = layer
+                                .native
+                                .as_ref()
+                                .is_some_and(|native| native.coverage_center().is_some());
+                            let remote_native = layer
+                                .native
+                                .as_ref()
+                                .is_some_and(|native| native.is_remote());
+                            (
+                                layer.key.clone(),
+                                layer.hhmm,
+                                outside_coverage,
+                                can_center,
+                                remote_native,
+                            )
+                        })
                     {
-                        let has_visible_pixels = satellite_render_has_visible_pixels(&image);
-                        let outside_coverage =
-                            layer.lut.lookup(key.center_lat, key.center_lon).is_none();
-                        let texture =
-                            ctx.load_texture("sat-layer", image, egui::TextureOptions::LINEAR);
-                        self.sat_layer_texture =
-                            Some((texture, generation, key, has_visible_pixels));
-                        self.status = if has_visible_pixels {
-                            format!("Satellite map: {:04}Z", layer.hhmm)
-                        } else if outside_coverage {
-                            "Satellite map: current view is outside this sector — use Center on satellite coverage".to_owned()
-                        } else {
-                            "Satellite map: frame is transparent in this view — try an IR layer at night".to_owned()
-                        };
+                        match rendered.image {
+                            Ok(image) => {
+                                self.reset_sat_layer_render_backoff();
+                                let has_visible_pixels =
+                                    satellite_render_has_visible_pixels(&image);
+                                let texture = ctx.load_texture(
+                                    "sat-layer",
+                                    image,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                self.sat_layer_texture = Some((
+                                    texture,
+                                    rendered.generation,
+                                    rendered.view,
+                                    has_visible_pixels,
+                                    key,
+                                    hhmm,
+                                ));
+                                self.status = if let Some(error) = rendered.native_error {
+                                    format!(
+                                        "Satellite native map unavailable; using bounded preview: {error}"
+                                    )
+                                } else if has_visible_pixels && rendered.native {
+                                    format!("Satellite map: {hhmm:04}Z · native resolution")
+                                } else if has_visible_pixels {
+                                    format!("Satellite map: {hhmm:04}Z · bounded preview")
+                                } else if outside_coverage {
+                                    "Satellite map: current view is outside this sector — use Center on satellite coverage".to_owned()
+                                } else if rendered.native && can_center {
+                                    "Satellite map: no native pixels in this view — use Center on satellite coverage or try IR at night".to_owned()
+                                } else if rendered.native && remote_native {
+                                    "Satellite map: no native pixels in this view — rw-server v3 has no per-frame coverage center; pan toward the sector or try IR at night".to_owned()
+                                } else if rendered.native {
+                                    "Satellite map: no native pixels in this view — this frame has no coverage-center metadata; pan toward the sector or try IR at night".to_owned()
+                                } else {
+                                    "Satellite map: frame is transparent in this view — try an IR layer at night".to_owned()
+                                };
+                            }
+                            Err(error) => {
+                                // A failed exact tile is not a transparent
+                                // frame. Keep the last known-good texture and
+                                // retry after bounded backoff.
+                                self.status = self
+                                    .sat_layer_texture
+                                    .as_ref()
+                                    .filter(|(_, generation, _, _, _, _)| {
+                                        *generation != rendered.generation
+                                    })
+                                    .map(|(_, _, _, _, stale_key, stale_hhmm)| {
+                                        format!(
+                                            "Satellite map {key} {hhmm:04}Z failed; showing {stale_key} {stale_hhmm:04}Z STALE: {error}"
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "Satellite native map failed; keeping the last valid map: {error}"
+                                        )
+                                    });
+                                self.defer_failed_sat_layer_render(ctx);
+                            }
+                        }
                     }
                     ctx.request_repaint();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.sat_layer_render_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.finish_sat_layer_render();
+                    if self.sat_layer.is_some() {
+                        self.status =
+                            "Satellite map renderer stopped; keeping the last valid map".to_owned();
+                        self.defer_failed_sat_layer_render(ctx);
+                    }
+                }
             }
         }
     }
@@ -1635,29 +2168,71 @@ impl ViewerApp {
     /// Draw the satellite layer (world-anchored; renders at viewport
     /// resolution on a background thread, exactly like the model layer).
     pub(crate) fn draw_sat_layer(&mut self, painter: &egui::Painter, rect: egui::Rect) {
-        let Some(layer) = &self.sat_layer else {
+        let Some((generation, visible)) = self
+            .sat_layer
+            .as_ref()
+            .map(|layer| (layer.generation, layer.visible))
+        else {
+            self.cancel_sat_layer_render();
             return;
         };
-        if !layer.visible {
+        if !visible {
+            self.cancel_sat_layer_render();
             return;
         }
         let view = self.model_layer_current_view();
+        let render_is_obsolete = self.sat_layer_render_rx.is_some()
+            && (self.sat_layer_render_generation != Some(generation)
+                || self
+                    .sat_layer_render_view
+                    .as_ref()
+                    .is_none_or(|requested| model_layer_view_needs_rerender(requested, &view)));
+        if render_is_obsolete {
+            // Latest viewport/frame wins. The detached worker observes the
+            // token between rows/tiles and stops before burning the whole old
+            // native render.
+            self.cancel_sat_layer_render();
+        }
         let current = self
             .sat_layer_texture
             .as_ref()
-            .filter(|(_, generation, _, _)| *generation == layer.generation);
+            .filter(|(_, rendered_generation, _, _, _, _)| *rendered_generation == generation);
         let needs_render = current
-            .map(|(_, _, have, _)| model_layer_view_needs_rerender(have, &view))
+            .map(|(_, _, have, _, _, _)| model_layer_view_needs_rerender(have, &view))
             .unwrap_or(true);
         let defer_render = map_layer_rerender_deferred(painter.ctx());
-        if needs_render && !defer_render && self.sat_layer_render_rx.is_none() {
+        let now = Instant::now();
+        let retry_ready = self
+            .sat_layer_render_retry_after
+            .is_none_or(|retry_after| now >= retry_after);
+        if !retry_ready && let Some(retry_after) = self.sat_layer_render_retry_after {
+            painter
+                .ctx()
+                .request_repaint_after(retry_after.saturating_duration_since(now));
+        }
+        if needs_render && !defer_render && retry_ready && self.sat_layer_render_rx.is_none() {
+            let Some((native, preview)) = self.sat_layer.as_ref().map(|layer| {
+                let native = layer.native.as_ref().map(Arc::clone);
+                let preview = layer.preview.as_ref().map(|preview| {
+                    (
+                        Arc::clone(&preview.image),
+                        Arc::clone(&preview.grid),
+                        Arc::clone(&preview.lut),
+                        preview.nx,
+                        preview.ny,
+                        preview.flip_rows,
+                    )
+                });
+                (native, preview)
+            }) else {
+                return;
+            };
             let (sender, receiver) = mpsc::channel();
             self.sat_layer_render_rx = Some(receiver);
-            let generation = layer.generation;
-            let image_src = Arc::clone(&layer.image);
-            let grid = Arc::clone(&layer.grid);
-            let lut = Arc::clone(&layer.lut);
-            let (nx, ny, flip) = (layer.nx, layer.ny, layer.flip_rows);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.sat_layer_render_cancel = Some(Arc::clone(&cancel));
+            self.sat_layer_render_generation = Some(generation);
+            self.sat_layer_render_view = Some(view);
             let render_view = view;
             let center_lat = view.center_lat as f64;
             let center_lon = view.center_lon as f64;
@@ -1665,46 +2240,93 @@ impl ViewerApp {
             let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
             let ctx = painter.ctx().clone();
             thread::spawn(move || {
-                let render_start = Instant::now();
-                let w = w_pts.max(8.0) as usize;
-                let h = h_pts.max(8.0) as usize;
-                let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
-                let sample_ctx = SatMapSampleCtx {
-                    image: image_src.as_ref(),
-                    grid: grid.as_ref(),
-                    nx,
-                    ny,
-                    flip_rows: flip,
-                };
-                for (i, px) in pixels.iter_mut().enumerate() {
-                    let x = (i % w) as f64;
-                    let y = (i / w) as f64;
-                    let east_km = (x - w as f64 / 2.0) * km_per_pt;
-                    let north_km = (h as f64 / 2.0 - y) * km_per_pt;
-                    let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
-                    let Some(index) = lut.lookup(lat as f32, lon as f32) else {
-                        continue;
-                    };
-                    let color = sample_sat_map_color(&sample_ctx, index, lat as f32, lon as f32);
-                    if color.a() > 0 {
-                        *px = color;
+                let (w, h) = model_layer_render_dimensions(w_pts, h_pts, render_view.map_scale);
+                let native_result = native.as_ref().map(|native| {
+                    native.render_aeqd_cancellable(
+                        center_lat,
+                        center_lon,
+                        render_view.map_scale,
+                        w_pts,
+                        h_pts,
+                        w,
+                        h,
+                        cancel.as_ref(),
+                    )
+                });
+                let (image, rendered_native, native_error) = match native_result {
+                    Some(Ok(image)) => (Ok(image), true, None),
+                    Some(Err(error)) => {
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Some(preview) = preview.as_ref() {
+                            (
+                                render_sat_preview_aeqd(
+                                    preview,
+                                    center_lat,
+                                    center_lon,
+                                    km_per_pt,
+                                    w_pts,
+                                    h_pts,
+                                    w,
+                                    h,
+                                    cancel.as_ref(),
+                                ),
+                                false,
+                                Some(error),
+                            )
+                        } else {
+                            (Err(error.clone()), true, Some(error))
+                        }
                     }
-                }
-                let image = egui::ColorImage {
-                    size: [w, h],
-                    source_size: egui::vec2(w as f32, h as f32),
-                    pixels,
+                    None => {
+                        let image = preview.as_ref().map_or_else(
+                            || Err("satellite frame has no renderable map source".to_owned()),
+                            |preview| {
+                                render_sat_preview_aeqd(
+                                    preview,
+                                    center_lat,
+                                    center_lon,
+                                    km_per_pt,
+                                    w_pts,
+                                    h_pts,
+                                    w,
+                                    h,
+                                    cancel.as_ref(),
+                                )
+                            },
+                        );
+                        (image, false, None)
+                    }
                 };
-                let _ = sender.send((
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let _ = sender.send(SatLayerRender {
                     generation,
-                    render_view,
+                    view: render_view,
                     image,
-                    render_start.elapsed().as_secs_f32() * 1000.0,
-                ));
+                    native: rendered_native,
+                    native_error,
+                });
                 ctx.request_repaint();
             });
         }
-        if let Some((texture, _, rendered, has_visible_pixels)) = &self.sat_layer_texture {
+        let Some(layer) = &self.sat_layer else {
+            return;
+        };
+        if let Some((
+            texture,
+            rendered_generation,
+            rendered,
+            has_visible_pixels,
+            rendered_key,
+            rendered_hhmm,
+        )) = &self.sat_layer_texture
+        {
+            let stale_identity = *rendered_generation != layer.generation
+                || rendered_key != &layer.key
+                || *rendered_hhmm != layer.hhmm;
             let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
             let tint = egui::Color32::from_white_alpha((layer.opacity * 255.0) as u8);
             if model_layer_view_needs_rerender(rendered, &view) {
@@ -1734,11 +2356,33 @@ impl ViewerApp {
             } else {
                 painter.image(texture.id(), rect, uv, tint);
             }
-            if !has_visible_pixels && !model_layer_view_needs_rerender(rendered, &view) {
+            if stale_identity {
+                draw_satellite_stale_notice(
+                    painter,
+                    rect,
+                    rendered_key,
+                    *rendered_hhmm,
+                    &layer.key,
+                    layer.hhmm,
+                );
+            } else if !has_visible_pixels && !model_layer_view_needs_rerender(rendered, &view) {
                 draw_satellite_no_visible_notice(
                     painter,
                     rect,
-                    layer.lut.lookup(view.center_lat, view.center_lon).is_none(),
+                    layer.preview.as_ref().is_some_and(|preview| {
+                        preview
+                            .lut
+                            .lookup(view.center_lat, view.center_lon)
+                            .is_none()
+                    }),
+                    layer
+                        .native
+                        .as_ref()
+                        .is_some_and(|native| native.coverage_center().is_some()),
+                    layer
+                        .native
+                        .as_ref()
+                        .is_some_and(|native| native.is_remote()),
                 );
             }
         }
@@ -1780,6 +2424,32 @@ impl ViewerApp {
 /// absurdly tall.
 fn satellite_player_panel_height(available_width: f32) -> f32 {
     112.0 + (available_width * 0.40).clamp(240.0, 420.0)
+}
+
+fn satellite_storage_usage_text(
+    usage: sat_worker::SatStorageUsage,
+    preview_cap_per_channel: Option<u64>,
+) -> String {
+    let lower_bound = if usage.inventory_complete {
+        ""
+    } else {
+        "at least "
+    };
+    let native_cap = usage
+        .native_cap_bytes
+        .map(|bytes| format!(" · {} combined native cap", rw_ui::format_bytes(bytes)))
+        .unwrap_or_else(|| " · native archive unbounded".to_owned());
+    let preview_cap = preview_cap_per_channel
+        .map(|bytes| format!(" · {} cap/channel", rw_ui::format_bytes(bytes)))
+        .unwrap_or_else(|| " · preview cache unbounded".to_owned());
+    format!(
+        "Exact native: {lower_bound}{} · {} source scan minute(s), partial allowed / {} channel source(s){native_cap}  |  Preview cache: {lower_bound}{} · {} channel frame(s){preview_cap}",
+        rw_ui::format_bytes(usage.native_bytes),
+        usage.native_unique_scans,
+        usage.native_channel_sources,
+        rw_ui::format_bytes(usage.preview_bytes),
+        usage.preview_channel_frames,
+    )
 }
 
 fn satellite_render_has_visible_pixels(image: &egui::ColorImage) -> bool {
@@ -1839,16 +2509,118 @@ fn satellite_visible_coverage_point(
     nearest(stride).or_else(|| (stride > 1).then(|| nearest(1)).flatten())
 }
 
+fn selected_goes_player_product(spec: &rw_ui::SatFollowSpec) -> Option<rw_sat::GoesAbiProduct> {
+    rw_sat::GoesAbiProduct::parse(&spec.layer)
+        .filter(|product| product.required_channels().len() > 1)
+}
+
+/// A named multi-channel product owns one timeline, not one timeline per
+/// component channel. Its base-channel run is the stable carrier because it
+/// has the product's native output grid (C02 for both GeoColor products).
+fn goes_player_run_filters(spec: &rw_ui::SatFollowSpec) -> Result<(String, Vec<String>), String> {
+    let (model, mut prefixes) = sat_worker::run_filters_for_spec(spec)?;
+    if let Some(product) = selected_goes_player_product(spec) {
+        let suffix = format!("_c{:02}", product.base_channel());
+        prefixes.retain(|prefix| prefix.ends_with(&suffix));
+        if prefixes.len() != 1 {
+            return Err(format!(
+                "{} has no unique base-channel timeline",
+                product.title()
+            ));
+        }
+    }
+    Ok((model, prefixes))
+}
+
+fn satellite_run_key_matches_goes_spec(
+    key: &rw_ui::SatRunKey,
+    spec: &rw_ui::SatFollowSpec,
+) -> bool {
+    let Ok((model, prefixes)) = goes_player_run_filters(spec) else {
+        return false;
+    };
+    if !satellite_run_key_matches_resolved_spec(key, &model, &prefixes) {
+        return false;
+    }
+    let Some(product) = selected_goes_player_product(spec) else {
+        return true;
+    };
+    let slug = product.slug();
+    key.run.contains(&format!("_rwproduct_{slug}_"))
+        || key.run.contains(&format!("_rwserver_{slug}_"))
+}
+
+fn local_goes_product_run_title(key: &rw_ui::SatRunKey, product: rw_sat::GoesAbiProduct) -> String {
+    let base_marker = format!("_c{:02}_", product.base_channel());
+    let sector = key
+        .run
+        .split_once(&base_marker)
+        .map(|(sector, _)| sector)
+        .unwrap_or("goes");
+    let sector = match sector {
+        "fulldisk" => "Full disk".to_owned(),
+        "conus" => "CONUS".to_owned(),
+        "meso1" => "Meso 1".to_owned(),
+        "meso2" => "Meso 2".to_owned(),
+        other => other.replace('_', " "),
+    };
+    let day = key
+        .run
+        .split('_')
+        .find(|token| token.len() == 8 && token.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|day| format!("{}-{}-{}", &day[..4], &day[4..6], &day[6..]))
+        .unwrap_or_else(|| "stored".to_owned());
+    format!("{} · {sector} {} · {day}", key.model, product.title())
+}
+
 fn satellite_frame_written_refresh_request(
     model: String,
     run: String,
     hhmm: u16,
     select_live_run: bool,
+    selected_product: Option<rw_sat::GoesAbiProduct>,
 ) -> sat_worker::SatRequest {
     if select_live_run && matches!(model.as_str(), "g16" | "g17" | "g18" | "g19") {
-        sat_worker::SatRequest::ScanAndSelect {
-            key: rw_ui::SatRunKey { model, run },
+        let key = rw_ui::SatRunKey { model, run };
+        if let Some(product) = selected_product {
+            sat_worker::SatRequest::ScanAndSelectNativeProduct {
+                key,
+                hhmm,
+                product: product.slug(),
+            }
+        } else {
+            sat_worker::SatRequest::ScanAndSelect { key, hhmm }
+        }
+    } else {
+        sat_worker::SatRequest::Scan
+    }
+}
+
+fn satellite_native_frame_refresh_request(
+    key: rw_ui::SatRunKey,
+    hhmm: u16,
+    source: SatelliteSource,
+    spec: &rw_ui::SatFollowSpec,
+) -> sat_worker::SatRequest {
+    let Some(product) = (source == SatelliteSource::Goes)
+        .then(|| selected_goes_player_product(spec))
+        .flatten()
+    else {
+        return sat_worker::SatRequest::Scan;
+    };
+    let Ok((model, prefixes)) = sat_worker::run_filters_for_spec(spec) else {
+        return sat_worker::SatRequest::Scan;
+    };
+    let committed_channel_matches = product
+        .required_channels()
+        .iter()
+        .any(|channel| run_has_band_token(&key.run, 'c', *channel));
+    if committed_channel_matches && satellite_run_key_matches_resolved_spec(&key, &model, &prefixes)
+    {
+        sat_worker::SatRequest::ScanAndSelectNativeProduct {
+            key,
             hhmm,
+            product: product.slug(),
         }
     } else {
         sat_worker::SatRequest::Scan
@@ -1859,9 +2631,13 @@ fn draw_satellite_no_visible_notice(
     painter: &egui::Painter,
     rect: egui::Rect,
     outside_coverage: bool,
+    can_center: bool,
+    remote_native: bool,
 ) {
     let text = if outside_coverage {
         "No visible satellite pixels in this map view\nCurrent map is outside this satellite sector\nUse Center on satellite coverage in the Satellite panel"
+    } else if remote_native && !can_center {
+        "No visible satellite pixels in this map view\nrw-server v3 has no per-frame coverage center\nPan toward the sector or try an IR layer at night"
     } else {
         "No visible satellite pixels in this map view\nThis frame is transparent here; try an IR layer at night"
     };
@@ -1877,6 +2653,41 @@ fn draw_satellite_no_visible_notice(
     let card = egui::Rect::from_center_size(rect.center(), size);
     painter.rect_filled(card, 5.0, visuals.window_fill());
     painter.rect_stroke(card, 5.0, visuals.window_stroke(), egui::StrokeKind::Inside);
+    painter.galley(
+        card.min + egui::vec2(10.0, 7.0),
+        galley,
+        visuals.text_color(),
+    );
+}
+
+fn draw_satellite_stale_notice(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    displayed_key: &rw_ui::SatRunKey,
+    displayed_hhmm: u16,
+    requested_key: &rw_ui::SatRunKey,
+    requested_hhmm: u16,
+) {
+    let text = format!(
+        "STALE SATELLITE FRAME\nShowing {displayed_key} {displayed_hhmm:04}Z\nLoading {requested_key} {requested_hhmm:04}Z"
+    );
+    let style = painter.ctx().global_style();
+    let visuals = &style.visuals;
+    let galley = painter.layout(
+        text,
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(255, 214, 92),
+        (rect.width() - 32.0).max(120.0),
+    );
+    let size = galley.size() + egui::vec2(20.0, 14.0);
+    let card = egui::Rect::from_min_size(rect.min + egui::vec2(12.0, 12.0), size);
+    painter.rect_filled(card, 5.0, visuals.window_fill());
+    painter.rect_stroke(
+        card,
+        5.0,
+        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 214, 92)),
+        egui::StrokeKind::Inside,
+    );
     painter.galley(
         card.min + egui::vec2(10.0, 7.0),
         galley,
@@ -1930,6 +2741,12 @@ pub(crate) fn sat_enhancement_refresh_frames(
     let Some(key) = selected_run.or_else(|| last_frame.map(|(key, _)| key)) else {
         return Vec::new();
     };
+    if satellite_run_key_is_remote(key) {
+        // Server tiles already carry their rendered product. Re-requesting a
+        // whole remote day cannot recolor it and can waste hundreds of tile
+        // requests/quota while filling the bounded preview lane.
+        return Vec::new();
+    }
     let playhead = match last_frame {
         Some((frame_key, hhmm)) if frame_key == key => Some(*hhmm),
         _ => None,
@@ -1950,6 +2767,10 @@ pub(crate) fn sat_enhancement_refresh_frames(
         frames.insert(0, hhmm);
     }
     frames.into_iter().map(|hhmm| (key.clone(), hhmm)).collect()
+}
+
+pub(crate) fn satellite_run_key_is_remote(key: &rw_ui::SatRunKey) -> bool {
+    key.run.contains("_rwserver_")
 }
 
 pub(crate) fn sat_map_request_matches(
@@ -2049,6 +2870,63 @@ fn sat_player_frame_within_texture_limit(mut frame: rw_ui::SatFrameImage) -> Sat
     ];
     frame.image = resize_color_image_linear(&frame.image, new_size);
     (frame, Some((old_size, new_size)))
+}
+
+type SatPreviewRenderInput = (
+    Arc<egui::ColorImage>,
+    Arc<rw_store::grid::GridFile>,
+    Arc<model_layer::InverseLut>,
+    usize,
+    usize,
+    bool,
+);
+
+#[allow(clippy::too_many_arguments)]
+fn render_sat_preview_aeqd(
+    source: &SatPreviewRenderInput,
+    center_lat: f64,
+    center_lon: f64,
+    km_per_point: f64,
+    logical_width: f64,
+    logical_height: f64,
+    raster_width: usize,
+    raster_height: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<egui::ColorImage, String> {
+    let (image, grid, lut, nx, ny, flip_rows) = source;
+    let mut pixels = vec![egui::Color32::TRANSPARENT; raster_width * raster_height];
+    let sample_ctx = SatMapSampleCtx {
+        image: image.as_ref(),
+        grid: grid.as_ref(),
+        nx: *nx,
+        ny: *ny,
+        flip_rows: *flip_rows,
+    };
+    for (row, pixel_row) in pixels.chunks_mut(raster_width).enumerate() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("satellite preview render cancelled".to_owned());
+        }
+        for (column, pixel) in pixel_row.iter_mut().enumerate() {
+            let logical_x = (column as f64 + 0.5) * logical_width / raster_width as f64;
+            let logical_y = (row as f64 + 0.5) * logical_height / raster_height as f64;
+            let east_km = (logical_x - logical_width * 0.5) * km_per_point;
+            let north_km = (logical_height * 0.5 - logical_y) * km_per_point;
+            let (latitude, longitude) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
+            let Some(nearest) = lut.lookup(latitude as f32, longitude as f32) else {
+                continue;
+            };
+            let color =
+                sample_sat_map_color(&sample_ctx, nearest, latitude as f32, longitude as f32);
+            if color.a() > 0 {
+                *pixel = color;
+            }
+        }
+    }
+    Ok(egui::ColorImage {
+        size: [raster_width, raster_height],
+        source_size: egui::vec2(logical_width as f32, logical_height as f32),
+        pixels,
+    })
 }
 
 fn sample_sat_map_color(
@@ -2272,6 +3150,84 @@ mod tests {
     fn satellite_source_tabs_split_the_row_three_ways() {
         assert_eq!(satellite_source_tab_width(520.0, 4.0), 170.0);
         assert_eq!(satellite_source_tab_width(320.0, 4.0), 104.0);
+    }
+
+    #[test]
+    fn goes_full_disk_geometry_uses_correct_g18_and_g19_slots_and_limbs() {
+        let east = goes_full_disk_geometry("g19", None).expect("G19 geometry");
+        assert!((east.center_lat_deg - 0.0).abs() < 1.0e-9);
+        assert!((east.center_lon_deg - (-75.2)).abs() < 1.0e-9);
+        assert!((east.east_limb_lon_deg - 6.099_516_7).abs() < 1.0e-5);
+        assert!((east.west_limb_lon_deg - (-156.499_516_7)).abs() < 1.0e-5);
+        assert!((east.north_limb_lat_deg - 81.328_243_6).abs() < 1.0e-5);
+        assert!((east.south_limb_lat_deg - (-81.328_243_6)).abs() < 1.0e-5);
+
+        let west = goes_full_disk_geometry("goes18", None).expect("G18 geometry");
+        assert!((west.center_lon_deg - (-137.0)).abs() < 1.0e-9);
+        assert!((west.east_limb_lon_deg - (-55.700_483_3)).abs() < 1.0e-5);
+        assert!((west.west_limb_lon_deg - 141.700_483_3).abs() < 1.0e-5);
+        assert!((west.max_limb_arc_deg - 81.328_243_6).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn goes_full_disk_fit_uses_actual_short_pane_axis_with_margin() {
+        for pane_size in [
+            egui::vec2(500.0, 400.0),
+            egui::vec2(800.0, 600.0),
+            egui::vec2(1_024.0, 768.0),
+        ] {
+            let fit = goes_full_disk_map_fit("g19", None, pane_size).expect("fit");
+            let occupied = fit.limb_radius_points * 2.0 + GOES_FULL_DISK_FIT_MARGIN_POINTS * 2.0;
+            assert!((occupied - pane_size.x.min(pane_size.y)).abs() < 0.01);
+            assert!(
+                fit.map_scale < MIN_MAP_SCALE,
+                "sub-1138-point panes need the explicit Full Disk scale path: {fit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn goes_full_disk_fit_prefers_sane_exact_center_and_rejects_bad_metadata() {
+        let exact = goes_full_disk_map_fit("g19", Some((0.125, -75.05)), egui::vec2(900.0, 700.0))
+            .expect("exact-center fit");
+        assert!((exact.center_lat_deg - 0.125).abs() < f32::EPSILON);
+        assert!((exact.center_lon_deg - (-75.05)).abs() < f32::EPSILON);
+
+        let fallback = goes_full_disk_map_fit("g18", Some((45.0, 10.0)), egui::vec2(900.0, 700.0))
+            .expect("nominal-center fallback");
+        assert_eq!(fallback.center_lat_deg, 0.0);
+        assert_eq!(fallback.center_lon_deg, -137.0);
+        assert!(goes_full_disk_map_fit("h9", None, egui::vec2(900.0, 700.0)).is_none());
+    }
+
+    #[test]
+    fn satellite_storage_text_never_calls_a_preview_the_native_source() {
+        let exact = satellite_storage_usage_text(
+            sat_worker::SatStorageUsage {
+                preview_bytes: 17 * 1024 * 1024,
+                preview_channel_frames: 1,
+                native_bytes: 414 * 1024 * 1024,
+                native_unique_scans: 1,
+                native_channel_sources: 1,
+                native_cap_bytes: Some(9 * 1024 * 1024 * 1024),
+                inventory_complete: true,
+            },
+            Some(3 * 1024 * 1024 * 1024),
+        );
+        assert!(exact.contains("Exact native: 414.0 MB"), "{exact}");
+        assert!(exact.contains("Preview cache: 17.0 MB"), "{exact}");
+        assert!(exact.contains("9.00 GB combined native cap"), "{exact}");
+        assert!(exact.contains("3.00 GB cap/channel"), "{exact}");
+        assert!(exact.contains("partial allowed"), "{exact}");
+
+        let bounded = satellite_storage_usage_text(
+            sat_worker::SatStorageUsage {
+                inventory_complete: false,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(bounded.matches("at least").count() >= 2, "{bounded}");
     }
 
     #[test]
@@ -2553,6 +3509,7 @@ mod tests {
             "conus_c01_20260713".to_owned(),
             1851,
             true,
+            None,
         ) {
             sat_worker::SatRequest::ScanAndSelect { key, hhmm } => {
                 assert_eq!(key.model, "g18");
@@ -2568,9 +3525,83 @@ mod tests {
                 "conus_rgb_natural_color_20260713".to_owned(),
                 1851,
                 false,
+                None,
             ),
             sat_worker::SatRequest::Scan
         ));
+    }
+
+    #[test]
+    fn live_multichannel_product_refreshes_from_native_commit_not_preview_write() {
+        let spec = rw_ui::SatFollowSpec {
+            satellite: "goes19".to_owned(),
+            sector: "fulldisk".to_owned(),
+            layer: "open_geocolor_v1".to_owned(),
+            ..rw_ui::SatFollowSpec::default()
+        };
+        match satellite_native_frame_refresh_request(
+            rw_ui::SatRunKey {
+                model: "g19".to_owned(),
+                run: "fulldisk_c03_20260826".to_owned(),
+            },
+            1640,
+            SatelliteSource::Goes,
+            &spec,
+        ) {
+            sat_worker::SatRequest::ScanAndSelectNativeProduct {
+                key,
+                hhmm,
+                product: selected,
+            } => {
+                assert_eq!(key.model, "g19");
+                assert_eq!(key.run, "fulldisk_c03_20260826");
+                assert_eq!(hhmm, 1640);
+                assert_eq!(selected, "open_geocolor_v1");
+            }
+            other => panic!("expected strict native-product selection, got {other:?}"),
+        }
+        assert!(matches!(
+            satellite_native_frame_refresh_request(
+                rw_ui::SatRunKey {
+                    model: "g18".to_owned(),
+                    run: "fulldisk_c03_20260826".to_owned(),
+                },
+                1640,
+                SatelliteSource::Goes,
+                &spec,
+            ),
+            sat_worker::SatRequest::Scan
+        ));
+    }
+
+    #[test]
+    fn multichannel_product_exposes_one_product_named_carrier_timeline() {
+        let spec = rw_ui::SatFollowSpec {
+            satellite: "goes19".to_owned(),
+            sector: "fulldisk".to_owned(),
+            layer: "open_geocolor_v1".to_owned(),
+            ..rw_ui::SatFollowSpec::default()
+        };
+        let (model, prefixes) = goes_player_run_filters(&spec).expect("player filter");
+        assert_eq!(model, "g19");
+        assert_eq!(prefixes, vec!["fulldisk_c02"]);
+
+        let raw_key = rw_ui::SatRunKey {
+            model: model.clone(),
+            run: "fulldisk_c02_20260826".to_owned(),
+        };
+        assert!(
+            !satellite_run_key_matches_goes_spec(&raw_key, &spec),
+            "a raw C02 timeline must never masquerade as the selected product"
+        );
+        let key = rw_ui::SatRunKey {
+            model,
+            run: "fulldisk_c02_rwproduct_open_geocolor_v1_20260826".to_owned(),
+        };
+        assert!(satellite_run_key_matches_goes_spec(&key, &spec));
+        let title = local_goes_product_run_title(&key, rw_sat::GoesAbiProduct::OpenGeoColorV1);
+        assert!(title.contains("Full disk Open GeoColor Day v1"), "{title}");
+        assert!(title.contains("2026-08-26"), "{title}");
     }
 
     #[test]

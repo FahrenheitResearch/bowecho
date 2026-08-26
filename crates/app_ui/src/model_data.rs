@@ -495,6 +495,22 @@ impl CommunitySoundingTask {
     }
 }
 
+/// BowEcho's explicit local-query admission policy. Rusty Weather's library
+/// defaults are now structural maxima, so desktop callsites must keep the
+/// bounded operational ceilings that BowEcho used before that upstream change.
+pub(crate) fn bowecho_query_limits() -> rw_query::QueryLimits {
+    rw_query::QueryLimits {
+        max_catalog_entries: 10_000,
+        max_time_points: 4_096,
+        max_selected_time_points: 4_096,
+        max_variables: 64,
+        max_reduction_cells: 4_000_000,
+        max_temporal_reduction_cells: 4_000_000,
+        max_temporal_output_values: 32_000_000,
+        max_point_values: 1_000_000,
+    }
+}
+
 fn fetch_community_sounding(
     client: &crate::community_cache::CommunityCacheClient,
     store_root: &Path,
@@ -503,12 +519,11 @@ fn fetch_community_sounding(
     fy: f64,
 ) -> Result<rw_ui::SoundingData, String> {
     use rw_community_protocol::{
-        DataOrigin, PublicationGrant, REQUEST_SCHEMA, RecipeIdentity, ShareQuery, ShareRequest,
-        SourceProvenance,
+        DataOrigin, PublicationGrant, RecipeIdentity, ShareQuery, ShareRequest, SourceProvenance,
     };
 
     let started = std::time::Instant::now();
-    let catalog = rw_query::StoreCatalog::new(store_root);
+    let catalog = rw_query::StoreCatalog::with_limits(store_root, bowecho_query_limits());
     let snapshot = catalog
         .snapshot(&hour.model, &hour.run)
         .map_err(|_| "Community Cache could not validate the selected model run".to_string())?;
@@ -593,17 +608,25 @@ fn fetch_community_sounding(
         .iter()
         .map(|source| SourceProvenance {
             provider: source.provider.clone(),
+            forecast_producer: source.forecast_producer.clone(),
+            licensing_publisher: source.licensing_publisher.clone(),
+            transport_provider: source.transport_provider.clone(),
+            transport_is_mirror: source.transport_is_mirror,
             roles: source.roles.clone(),
             products: source.products.clone(),
         })
         .collect::<Vec<_>>();
+    let schema = crate::community_cache::request_schema_for_source_provenance(&source_provenance)
+        .map_err(|_| {
+            "The selected run does not have a uniform all-legacy or all-structured source identity and cannot be shared".to_owned()
+        })?;
     let mut variables = pressure_variables.clone();
     variables.extend(surface_variables.iter().cloned());
     variables.sort();
     variables.dedup();
 
     let request = ShareRequest {
-        schema: REQUEST_SCHEMA.into(),
+        schema: schema.into(),
         model: descriptor.model.clone(),
         run: descriptor.run.clone(),
         snapshot_id: descriptor.snapshot_id.clone(),
@@ -3126,9 +3149,12 @@ impl ModelDataDock {
             .name("bowecho-model-local-ensemble-catalog".into())
             .spawn(move || {
                 let result = (|| {
-                    let snapshot = rw_query::StoreCatalog::new(&store_root)
-                        .snapshot(&worker_hour.model, &worker_hour.run)
-                        .map_err(|error| format!("Local run catalog is unavailable: {error}"))?;
+                    let snapshot =
+                        rw_query::StoreCatalog::with_limits(&store_root, bowecho_query_limits())
+                            .snapshot(&worker_hour.model, &worker_hour.run)
+                            .map_err(|error| {
+                                format!("Local run catalog is unavailable: {error}")
+                            })?;
                     let mut variables = snapshot.variable_capabilities().map_err(|error| {
                         format!("Local variable capabilities are unavailable: {error}")
                     })?;
@@ -10245,8 +10271,23 @@ impl ModelDataDock {
             });
             for source in &catalog.run.source_provenance {
                 ui.horizontal_wrapped(|ui| {
-                    ui.weak("Provenance");
+                    ui.weak("Acquisition lane");
                     ui.monospace(&source.provider);
+                    if let Some(producer) = source.forecast_producer.as_deref() {
+                        ui.weak("producer");
+                        ui.monospace(producer);
+                    }
+                    if let Some(publisher) = source.licensing_publisher.as_deref() {
+                        ui.weak("licensing publisher");
+                        ui.monospace(publisher);
+                    }
+                    if let Some(transport) = source.transport_provider.as_deref() {
+                        ui.weak("transport");
+                        ui.monospace(transport);
+                        if source.transport_is_mirror {
+                            ui.weak("mirror");
+                        }
+                    }
                     if !source.roles.is_empty() {
                         ui.weak(source.roles.join(", "));
                     }
@@ -13119,6 +13160,10 @@ fn remote_query_run_matches(
             .zip(&expected.source_provenance)
             .all(|(actual, expected)| {
                 actual.provider == expected.provider
+                    && actual.forecast_producer == expected.forecast_producer
+                    && actual.licensing_publisher == expected.licensing_publisher
+                    && actual.transport_provider == expected.transport_provider
+                    && actual.transport_is_mirror == expected.transport_is_mirror
                     && actual.roles == expected.roles
                     && actual.products == expected.products
             })
@@ -13732,6 +13777,20 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn bowecho_query_limits_preserve_bounded_desktop_policy() {
+        let limits = bowecho_query_limits();
+        assert_eq!(limits.max_catalog_entries, 10_000);
+        assert_eq!(limits.max_time_points, 4_096);
+        assert_eq!(limits.max_selected_time_points, 4_096);
+        assert_eq!(limits.max_variables, 64);
+        assert_eq!(limits.max_reduction_cells, 4_000_000);
+        assert_eq!(limits.max_temporal_reduction_cells, 4_000_000);
+        assert_eq!(limits.max_temporal_output_values, 32_000_000);
+        assert_eq!(limits.max_point_values, 1_000_000);
+        assert_ne!(limits, rw_query::QueryLimits::default());
+    }
+
+    #[test]
     fn bowecho_release_has_no_simulation_controller_launch_surface() {
         let manifest = include_str!("../Cargo.toml");
         let model_data_source = include_str!("model_data.rs");
@@ -13787,6 +13846,10 @@ mod tests {
             },
             source_provenance: vec![rw_community_protocol::SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["pressure".into()],
                 products: vec!["wrfprs".into()],
             }],
@@ -14366,6 +14429,10 @@ mod tests {
                 last_valid_unix: Some(1_786_500_000),
                 source_provenance: vec![crate::community_cache::RemoteSourceProvenance {
                     provider: "noaa-aws-public-data".to_owned(),
+                    forecast_producer: None,
+                    licensing_publisher: None,
+                    transport_provider: None,
+                    transport_is_mirror: false,
                     roles: vec!["surface".to_owned(), "pressure".to_owned()],
                     products: vec!["hrrr".to_owned()],
                 }],

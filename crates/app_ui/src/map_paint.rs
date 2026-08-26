@@ -927,12 +927,12 @@ impl ViewerApp {
         // Model values under the cursor: read EVERY visible layer,
         // topmost first to match the visual stack (each slot carries its
         // own field + LUT), so a base field and its OA/derived siblings
-        // read out together (field request). Falls back to the dock's
-        // field when no layer produced a value.
+        // read out together (field request). The dock's latest field is not
+        // a paint source and must never leak through when every layer is
+        // hidden or otherwise unsampleable.
         let _ = ob_owns_card;
         let mut model_value_shown = false;
         if self.model_enabled && self.inspector_show_model {
-            let mut shown = false;
             let mut shown_hours: Vec<rw_ui::HourKey> = Vec::new();
             // The topmost model layer contributes the color chip, but only
             // when no radar gate already owns the value line (then the chip
@@ -966,36 +966,11 @@ impl ViewerApp {
                         model_chip = Some((lines.len(), egui::Color32::from_rgb(c[0], c[1], c[2])));
                         lines.push(hex_rgb_line(c));
                     }
-                    shown = true;
                     model_value_shown = true;
                 }
             }
             if let Some(chip) = model_chip {
                 swatches.push(chip);
-            }
-            if !shown
-                && let Some((grid_hash, lut)) = &self.model_lut
-                && let Some(field) = self
-                    .model_dock
-                    .as_ref()
-                    .and_then(|dock| dock.latest_field())
-                && field
-                    .grid
-                    .as_ref()
-                    .is_some_and(|grid| &grid.hash == grid_hash)
-                && let Some(index) = lut.lookup(cursor_lat, cursor_lon)
-                && let Some(value) =
-                    model_layer::sample_field_value(field.as_ref(), index, cursor_lat, cursor_lon)
-            {
-                lines.push(format!(
-                    "{} {} {:.1} {}",
-                    field.key.hour.model.to_uppercase(),
-                    field.key.var,
-                    value,
-                    field.units
-                ));
-                shown_hours.push(field.key.hour.clone());
-                model_value_shown = true;
             }
             for hour in shown_hours {
                 lines.push(format_model_probe_context(&hour));
@@ -5548,10 +5523,13 @@ fn basemap_line_simplification_px(map_scale: f32) -> f32 {
 /// texture arrivals, hovers, animations — reuse entries instead of
 /// reprojecting / re-ear-clipping every frame; any pan/zoom/content change
 /// alters the key and falls through to a rebuild. Keys include the cell rect,
-/// so multi-pane grids cache one entry per pane. LRU, capacity-capped.
+/// so multi-pane grids cache one entry per pane. LRU and count-capped, with an
+/// opt-in total-weight bound for geometry-heavy consumers.
 pub(crate) struct ShapeCache<V> {
-    entries: Vec<(u64, V)>,
+    // Oldest to newest. Weight is zero for the original count-only API.
+    entries: Vec<(u64, V, usize)>,
     capacity: usize,
+    total_weight: usize,
 }
 
 impl<V> ShapeCache<V> {
@@ -5559,20 +5537,115 @@ impl<V> ShapeCache<V> {
         Self {
             entries: Vec::new(),
             capacity: capacity.max(1),
+            total_weight: 0,
         }
     }
 
     pub(crate) fn get_or_insert_with(&mut self, key: u64, build: impl FnOnce() -> V) -> &V {
-        if let Some(position) = self.entries.iter().position(|(k, _)| *k == key) {
+        if let Some(position) = self.entries.iter().position(|(k, _, _)| *k == key) {
             let entry = self.entries.remove(position);
             self.entries.push(entry);
         } else {
             if self.entries.len() >= self.capacity {
-                self.entries.remove(0);
+                self.remove_lru();
             }
-            self.entries.push((key, build()));
+            self.entries.push((key, build(), 0));
         }
         &self.entries.last().expect("just pushed").1
+    }
+
+    /// Count- and weight-bounded insertion for geometry-heavy consumers.
+    ///
+    /// `weight_of` runs only on a cache miss. Once the new/current entry is
+    /// installed, least-recently-used entries are removed until both limits
+    /// hold. If the current entry alone exceeds `max_total_weight`, it remains
+    /// usable; every older entry is still evicted.
+    pub(crate) fn get_or_insert_with_weight(
+        &mut self,
+        key: u64,
+        max_total_weight: usize,
+        build: impl FnOnce() -> V,
+        weight_of: impl FnOnce(&V) -> usize,
+    ) -> &V {
+        if let Some(position) = self.entries.iter().position(|(k, _, _)| *k == key) {
+            let entry = self.entries.remove(position);
+            self.entries.push(entry);
+        } else {
+            let value = build();
+            let weight = weight_of(&value);
+            self.total_weight = self.total_weight.saturating_add(weight);
+            self.entries.push((key, value, weight));
+        }
+
+        while self.entries.len() > self.capacity
+            || (self.total_weight > max_total_weight && self.entries.len() > 1)
+        {
+            self.remove_lru();
+        }
+
+        &self.entries.last().expect("current entry remains").1
+    }
+
+    fn remove_lru(&mut self) {
+        let (_, _, weight) = self.entries.remove(0);
+        self.total_weight = self.total_weight.saturating_sub(weight);
+    }
+}
+
+#[cfg(test)]
+mod shape_cache_tests {
+    use super::ShapeCache;
+
+    #[test]
+    fn count_only_cache_keeps_original_lru_behavior() {
+        let mut cache = ShapeCache::new(2);
+        cache.get_or_insert_with(1, || "one");
+        cache.get_or_insert_with(2, || "two");
+        cache.get_or_insert_with(1, || panic!("cache hit rebuilt"));
+        cache.get_or_insert_with(3, || "three");
+
+        let keys = cache
+            .entries
+            .iter()
+            .map(|(key, _, _)| *key)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![1, 3]);
+        assert_eq!(cache.total_weight, 0);
+    }
+
+    #[test]
+    fn weighted_cache_evicts_the_least_recent_entries_by_weight_and_count() {
+        let mut cache = ShapeCache::new(2);
+        cache.get_or_insert_with_weight(1, 10, || "one", |_| 4);
+        cache.get_or_insert_with_weight(2, 10, || "two", |_| 4);
+        cache.get_or_insert_with_weight(1, 10, || panic!("cache hit rebuilt"), |_| 99);
+        cache.get_or_insert_with_weight(3, 10, || "three", |_| 4);
+
+        let keys = cache
+            .entries
+            .iter()
+            .map(|(key, _, _)| *key)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![1, 3], "key 2 was least recently used");
+        assert_eq!(cache.total_weight, 8);
+
+        cache.get_or_insert_with_weight(4, 7, || "four", |_| 4);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].0, 4);
+        assert_eq!(cache.total_weight, 4);
+    }
+
+    #[test]
+    fn weighted_cache_keeps_one_oversized_current_entry_only() {
+        let mut cache = ShapeCache::new(8);
+        cache.get_or_insert_with_weight(1, 10, || "old-one", |_| 4);
+        cache.get_or_insert_with_weight(2, 10, || "old-two", |_| 4);
+        let current = cache.get_or_insert_with_weight(3, 10, || "oversized", |_| 20);
+
+        assert_eq!(*current, "oversized");
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].0, 3);
+        assert_eq!(cache.total_weight, 20);
     }
 }
 

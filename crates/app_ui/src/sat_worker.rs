@@ -13,27 +13,27 @@
 //! shared `AtomicBool` the follow engine observes at poll/frame
 //! boundaries.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Timelike, Utc};
 use eframe::egui::{Color32, ColorImage};
-use rustwx_core::{GridShape, LatLonGrid, MAX_GRID_CELLS};
+use rustwx_core::{GridShape, LatLonGrid};
 use rw_sat::abi::{
-    AbiFixedGrid, AbiSector, GoesAbiField, GoesAbiScene, read_goes_abi_field,
-    read_goes_abi_field_window, read_goes_abi_scene,
+    AbiFixedGrid, AbiSector, GoesAbiField, GoesAbiScene, read_goes_abi_field_strided_from_scene,
+    read_goes_abi_field_window, read_goes_abi_scene, read_goes_abi_scene_with_identity,
 };
 use rw_sat::composite::{
     GoesAbiRgbCompositeStyle, bilinear_f32, bracket_axis, compose_rgb_pixels, values_on_base_grid,
 };
 use rw_sat::events::{SatError, SatEvent};
 use rw_sat::follow::FollowConfig;
-use rw_sat::geostationary::{SweepAngleAxis, lat_lon_to_scan_angles_fast};
+use rw_sat::geostationary::{SweepAngleAxis, lat_lon_to_scan_angles_fast, scan_angles_to_lat_lon};
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
 use rw_sat::himawari::{
     HIMAWARI_DOWNLOAD_MANIFEST_SCHEMA, HimawariCalibrationInfo, HimawariDownloadManifest,
@@ -48,10 +48,14 @@ use rw_sat::s3::{
     build_agent, download_object, goes_hour_prefix, list_s3_objects, object_filename, object_url,
 };
 use rw_sat::store::{
-    SatelliteGridField, SatelliteGridScene, SatelliteProjection, WrittenFrame, downsample_field,
-    frame_file_name, frame_time, run_day, sector_slug, selector_band, write_band_frame,
+    SatelliteGridField, SatelliteGridScene, SatelliteProjection, WrittenFrame, frame_file_name,
+    frame_time, run_day, sector_slug, selector_band, write_band_frame,
 };
 use rw_sat::window::WindowConfig;
+use rw_sat::{
+    GoesAbiProduct, NativeSatelliteFrame, archive_goes_source, automatic_preview_stride,
+    list_native_frames, resolve_native_frame_with_revision,
+};
 use rw_store::format::RwsWriterInfo;
 use rw_store::grid::{GridFile, write_grid};
 use rw_store::lock::RunLock;
@@ -59,17 +63,39 @@ use rw_store::reader::HourReader;
 use rw_store::run::{RwsHourEntry, RwsRunManifest};
 use rw_store::writer::HourWriter;
 use rw_ui::{
-    SatDiskUsage, SatFollowSpec, SatFrameImage, SatLayerOption, SatRunKey, SatRunListing,
-    SatSatelliteOption, SatSectorOption, StoreView, format_bytes,
+    SatFollowSpec, SatFrameImage, SatLayerOption, SatRunKey, SatRunListing, SatSatelliteOption,
+    SatSectorOption, StoreView, format_bytes,
 };
+use sha2::{Digest, Sha256};
 
 use crate::sat_plot::{SatellitePlotPalette, SatellitePlotSource};
+use crate::sat_remote::{
+    MAX_FRAME_RESULTS, RemoteSatelliteCatalog, RemoteSatelliteClient, RemoteSatelliteFrames,
+    RemoteSatelliteTileSource,
+};
 use crate::sat_window::{
     AHI_NOMINAL_HEIGHT_M, AHI_NOMINAL_SEMI_MAJOR_M, AHI_NOMINAL_SEMI_MINOR_M,
     AHI_NOMINAL_SUB_LON_DEG, SatNativeWindow, ScanAngleRect, ahi_fldk_segment_range,
     ahi_lat_lon_to_scan_angles, ahi_window_crop, axis_crop_range, window_scan_angle_rect,
 };
 use crate::simsat_store::field_from_variable as simsat_derived_field_from_variable;
+
+/// BowEcho's operational ceiling for any whole-grid satellite preview.
+///
+/// This is deliberately an application policy, not rustwx-core's structural
+/// allocation limit. Native GOES NetCDF sources are retained byte-for-byte and
+/// rendered through bounded windows/tiles, so this value can only reduce a
+/// desktop `.rws` fallback preview; it must never cap source resolution.
+pub(crate) const SAT_PREVIEW_MAX_CELLS: usize = 25_000_000;
+
+fn bounded_bowecho_preview_stride(nx: usize, ny: usize, requested: usize) -> usize {
+    let automatic = automatic_preview_stride(nx, ny, SAT_PREVIEW_MAX_CELLS);
+    if requested == 0 {
+        automatic
+    } else {
+        requested.max(automatic)
+    }
+}
 
 /// Requests from the UI thread.
 #[derive(Debug, Clone)]
@@ -85,6 +111,16 @@ pub enum SatRequest {
         key: SatRunKey,
         hhmm: u16,
     },
+    /// Re-scan after one component channel lands and select the product's
+    /// base-channel carrier only once the retained native frame contains
+    /// every channel the named product requires. This keeps a multi-channel
+    /// product (GeoColor, RGBs, and so on) from ever falling through to a
+    /// grayscale component while the remaining channels are still landing.
+    ScanAndSelectNativeProduct {
+        key: SatRunKey,
+        hhmm: u16,
+        product: String,
+    },
     /// Start a live follow session (one at a time).
     Follow(SatFollowSpec),
     /// One-shot current-hour ingest for quickly creating a playable loop.
@@ -93,11 +129,18 @@ pub enum SatRequest {
     LoadFrame {
         key: SatRunKey,
         hhmm: u16,
+        /// Named rw-sat product selected by the GOES panel. Multi-channel
+        /// products render an exact bounded overview from retained native
+        /// sources; `None` preserves the scalar/baked-RGB store path.
+        native_product: Option<String>,
     },
     /// Read a frame PLUS its run grid for the radar-map layer.
     LoadFrameForMap {
         key: SatRunKey,
         hhmm: u16,
+        /// Named rw-sat product selected in the follow panel. Composite run
+        /// identities can override this with their more specific baked recipe.
+        native_product: Option<String>,
     },
     /// Read one stored frame as raw grid-order science data for the native
     /// plotter. This never recovers values from the player's colored image.
@@ -462,25 +505,98 @@ pub struct CardOutcome {
     pub result: Result<String, String>,
 }
 
-/// A frame prepared for the map layer: the palette-colored image, the
-/// run's per-pixel lat/lon grid, and whether image rows were flipped
-/// relative to grid storage order (sample image_row = ny-1-grid_row when
-/// set).
+/// A bounded `.rws` map fallback. Native GOES frames deliberately omit this
+/// payload so showing one on the map does not reopen/color the preview or read
+/// and hash its potentially hundreds-of-megabytes `grid.rwg`.
+pub struct SatMapPreview {
+    pub image: ColorImage,
+    pub grid: std::sync::Arc<GridFile>,
+    /// Sample `image_row = ny - 1 - grid_row` when set.
+    pub flip_rows: bool,
+}
+
+/// A frame prepared for the map layer. Retained GOES data takes the native
+/// path; old frames and other providers carry a bounded `.rws` fallback.
 #[allow(dead_code)] // key/hhmm identify the frame for future multi-layer use
 pub struct SatMapFrame {
     pub key: SatRunKey,
     pub hhmm: u16,
-    pub image: ColorImage,
-    pub grid: std::sync::Arc<GridFile>,
-    pub flip_rows: bool,
+    /// Exact native GOES source for zoom-dependent map tiles. `image`/`grid`
+    /// are intentionally not loaded when this resolves successfully.
+    pub native: Option<NativeSatMapSource>,
+    /// Exact immutable rw-server TileJSON source. Local retained native data
+    /// always wins when both exist; this is populated only when the selected
+    /// player run came from the configured Rusty Weather server.
+    pub remote: Option<RemoteSatMapSource>,
+    pub preview: Option<SatMapPreview>,
+}
+
+/// Immutable identity needed to render one GOES map frame without consulting
+/// the decimated `.rws` preview. The source revision binds the exact archived
+/// bytes and lets the renderer reject a republished minute instead of mixing
+/// revisions in one viewport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeSatMapSource {
+    pub store_root: PathBuf,
+    pub platform: String,
+    pub sector: String,
+    pub product: GoesAbiProduct,
+    pub frame_id: String,
+    pub source_revision: String,
+    /// Native fixed-grid center in millionths of a degree. Integer storage
+    /// keeps the exact source identity Eq/hash-friendly while avoiding any
+    /// dependency on the `.rws` geolocation grid for "Center on coverage".
+    pub coverage_center_e6: Option<[i32; 2]>,
+}
+
+/// An exact, revision-bound rw-server map frame. Tile fetches pass through a
+/// worker-lifetime byte cache shared by every frame reinstall and map render,
+/// so scrubbing back to a frame cannot redownload its viewport. The cache key
+/// includes the trusted origin, exact frame, renderer recipe, source revision,
+/// and XYZ coordinate; bearer credentials never enter the identity.
+#[derive(Clone)]
+pub(crate) struct RemoteSatMapSource {
+    pub(crate) tile_source: RemoteSatelliteTileSource,
+    preview_product: Option<GoesAbiProduct>,
+    scan_start_unix: i64,
+    tile_fetcher: RemoteTileFetcher,
+}
+
+impl std::fmt::Debug for RemoteSatMapSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteSatMapSource")
+            .field("identity", &self.tile_source.cache_identity)
+            .field(
+                "zoom",
+                &(self.tile_source.min_zoom..=self.tile_source.max_zoom),
+            )
+            .field("tile_size", &self.tile_source.tile_size)
+            .field("preview_product", &self.preview_product)
+            .field("scan_start_unix", &self.scan_start_unix)
+            .finish()
+    }
+}
+
+impl RemoteSatMapSource {
+    pub(crate) fn fetch_tile_png(&self, zoom: u8, x: u32, y: u32) -> Result<Arc<Vec<u8>>, String> {
+        self.tile_fetcher.fetch(&self.tile_source, zoom, x, y)
+    }
 }
 
 impl std::fmt::Debug for SatMapFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let preview = self
+            .preview
+            .as_ref()
+            .map(|preview| format!("{}x{}", preview.image.size[0], preview.image.size[1]))
+            .unwrap_or_else(|| "not loaded".to_owned());
         write!(
             f,
-            "SatMapFrame({} t{:04}, {}x{})",
-            self.key, self.hhmm, self.image.size[0], self.image.size[1]
+            "SatMapFrame({} t{:04}, preview={preview}, native={})",
+            self.key,
+            self.hhmm,
+            self.native.is_some() || self.remote.is_some()
         )
     }
 }
@@ -504,6 +620,14 @@ pub enum SatResponse {
     /// remain Debug without exposing the recovered values.
     EumetsatCredentialsLoaded(Result<Option<EumetsatAuthSpec>, String>),
     EumetsatCredentialsSaved(Result<String, String>),
+    /// Strict platform/sector/product options from the configured rw-server
+    /// satellite v3 catalog. The shell may replace its built-in picker data
+    /// with these while retaining local fallback when the server is absent.
+    RemoteCatalogOptions {
+        satellites: Vec<SatSatelliteOption>,
+        sectors: Vec<SatSectorOption>,
+        layers: Vec<SatLayerOption>,
+    },
     Runs(Vec<SatRunListing>),
     /// A completed one-shot RGB/IR history ingest. The refreshed catalog and
     /// exact newest selection travel together so the UI can intentionally
@@ -527,6 +651,11 @@ pub enum SatResponse {
         label: String,
         bytes: u64,
     },
+    DownloadProgress {
+        id: String,
+        received_bytes: u64,
+        total_bytes: Option<u64>,
+    },
     DownloadDone {
         id: String,
         ms: u128,
@@ -543,6 +672,15 @@ pub enum SatResponse {
         /// product ingests already publish their own final selection.
         select_live_run: bool,
     },
+    /// Exact native channel commit, emitted before the optional compact
+    /// preview decode/write. Multi-channel product timelines refresh from
+    /// this durable boundary so a failed `.rws` derivative cannot hide a
+    /// complete native frame.
+    NativeFrameUpdated {
+        key: SatRunKey,
+        hhmm: u16,
+        committed_channel: u8,
+    },
     Evicted {
         frames: usize,
         bytes: u64,
@@ -551,7 +689,9 @@ pub enum SatResponse {
         ms: u64,
     },
     Note(String),
-    DiskUsage(SatDiskUsage),
+    /// Truthful split of the current follow scope's compact preview footprint
+    /// and exact retained native sources.
+    StorageUsage(SatStorageUsage),
     SelectFrame {
         key: SatRunKey,
         hhmm: u16,
@@ -567,6 +707,30 @@ pub enum SatResponse {
     },
 }
 
+/// Bounded on-disk inventory for one resolved GOES follow scope.
+///
+/// Preview frames are per-channel `.rws` derivatives. Native frames are
+/// unique scan minutes with at least one requested channel present, including
+/// partial multi-channel products while their remaining channels are still
+/// arriving. `native_channel_sources` counts physical content-addressed
+/// NetCDF objects, so an immutable republished revision contributes its real
+/// disk bytes without double-counting the scan identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SatStorageUsage {
+    pub(crate) preview_bytes: u64,
+    pub(crate) preview_channel_frames: usize,
+    pub(crate) native_bytes: u64,
+    pub(crate) native_unique_scans: usize,
+    pub(crate) native_channel_sources: usize,
+    /// Same policy rw-sat follow enforces: per-band maximum multiplied by the
+    /// number of followed bands (with one as the defensive minimum).
+    pub(crate) native_cap_bytes: Option<u64>,
+    /// False means a traversal bound, malformed relevant path, I/O error, or
+    /// arithmetic overflow made this a safe lower bound rather than an exact
+    /// inventory. Callers should render an inequality, never a false total.
+    pub(crate) inventory_complete: bool,
+}
+
 /// Handle to the satellite worker.
 pub struct SatWorker {
     tx: Sender<SatRequest>,
@@ -576,10 +740,31 @@ pub struct SatWorker {
     _thread: JoinHandle<()>,
 }
 
+/// Non-secret inputs needed to initialize the configured rw-server transport.
+/// Construction is deferred to `rw-sat-worker` because it may inspect the OS
+/// credential vault and transfer ledger; neither belongs on egui's thread.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteSatelliteBootstrap {
+    pub(crate) settings: settings::CommunityCacheSettings,
+    pub(crate) cache_root: PathBuf,
+}
+
 impl SatWorker {
     /// Spawn the worker. `store_root` is the sat store root (frames land
     /// and are read from here); `notify` wakes the UI after every response.
+    #[allow(dead_code)] // production injects an optional remote; local-only tests retain this API
     pub fn spawn(store_root: PathBuf, notify: impl Fn() + Send + Sync + 'static) -> Self {
+        Self::spawn_with_remote(store_root, None, notify)
+    }
+
+    /// Spawn with an optional configured rw-server satellite v3 client.
+    /// Kept crate-visible because the transport owns application settings and
+    /// credentials; tests and local-only installs continue using [`Self::spawn`].
+    pub(crate) fn spawn_with_remote(
+        store_root: PathBuf,
+        remote_bootstrap: Option<RemoteSatelliteBootstrap>,
+        notify: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         let (req_tx, req_rx) = channel::<SatRequest>();
         let (resp_tx, resp_rx) = channel::<SatResponse>();
         let (card_tx, card_rx) = channel::<CardOutcome>();
@@ -590,8 +775,25 @@ impl SatWorker {
             .name("rw-sat-worker".to_string())
             .spawn(move || {
                 rw_ingest::throttle::set_current_thread_background_priority();
+                let (remote, remote_init_note) = match remote_bootstrap {
+                    Some(bootstrap) => match crate::community_cache::CommunityCacheClient::from_settings(
+                        &bootstrap.settings,
+                        bootstrap.cache_root,
+                    ) {
+                        Ok(transport) => (Some(RemoteSatelliteClient::new(transport)), None),
+                        Err(error) => (
+                            None,
+                            Some(format!(
+                                "rw-server satellite disabled; local frames remain usable: client initialization failed: {error}"
+                            )),
+                        ),
+                    },
+                    None => (None, None),
+                };
                 worker_loop(
                     store_root,
+                    remote,
+                    remote_init_note,
                     &req_rx,
                     &resp_tx,
                     &card_tx,
@@ -672,37 +874,29 @@ pub fn sector_options() -> Vec<SatSectorOption> {
     .collect()
 }
 
-/// ABI band display names (UI copy; the science lives in rw-sat).
-const BAND_NAMES: [&str; 16] = [
-    "Blue 0.47 µm",
-    "Red 0.64 µm",
-    "Veggie 0.86 µm",
-    "Cirrus 1.37 µm",
-    "Snow/Ice 1.6 µm",
-    "Cloud Particle Size 2.2 µm",
-    "Shortwave Window 3.9 µm",
-    "Upper-Level Water Vapor 6.2 µm",
-    "Mid-Level Water Vapor 6.9 µm",
-    "Lower-Level Water Vapor 7.3 µm",
-    "Cloud-Top Phase 8.4 µm",
-    "Ozone 9.6 µm",
-    "Clean IR Window 10.3 µm",
-    "IR Longwave 11.2 µm",
-    "Dirty IR Window 12.3 µm",
-    "CO2 Longwave 13.3 µm",
-];
-
-/// Products the live-follow player can render directly: the 16 scalar ABI
-/// bands. RGB recipes use the adjacent `Load RGB` control, which fetches,
-/// co-registers, and stores one baked composite frame. Offering those recipes
-/// here was misleading because Follow downloaded their component bands and
-/// then played the raw bands rather than the named RGB product.
+/// The exact rw-sat product catalog exposed by rw-server. Follow retains every
+/// required native channel and writes compact per-band previews for the player;
+/// the radar map renders the selected named product from the retained native
+/// sources. Keeping this list catalog-derived prevents the panel default and
+/// the server/product renderer from drifting apart again.
 pub fn layer_options() -> Vec<SatLayerOption> {
-    (1u8..=16)
-        .map(|band| SatLayerOption {
-            slug: format!("c{band:02}"),
-            label: format!("C{band:02} · {}", BAND_NAMES[usize::from(band - 1)]),
-            note: String::new(),
+    rw_sat::product_catalog(true)
+        .into_iter()
+        .map(|product| {
+            let channels = product
+                .required_channels
+                .iter()
+                .map(|channel| format!("C{channel:02}"))
+                .collect::<Vec<_>>()
+                .join("+");
+            SatLayerOption {
+                slug: product.id,
+                label: product.title,
+                note: format!(
+                    "native {:.1} km · follows {channels}",
+                    product.native_resolution_km
+                ),
+            }
         })
         .collect()
 }
@@ -739,24 +933,14 @@ pub fn goes_composite_style_options() -> Vec<(String, String)> {
 /// Layer slug -> the ABI bands it follows, plus a description for the
 /// summary line. Bands: "c13"; composites by slug ("geocolor").
 fn resolve_layer(layer: &str) -> Result<(Vec<u8>, String), String> {
-    let normalized = layer.trim().to_ascii_lowercase();
-    if let Some(band) = normalized
-        .strip_prefix('c')
-        .and_then(|raw| raw.parse::<u8>().ok())
-    {
-        if (1..=16).contains(&band) {
-            return Ok((vec![band], format!("C{band:02}")));
-        }
-        return Err(format!("ABI band out of range: C{band:02} (1-16)"));
-    }
-    if let Some(style) = GoesAbiRgbCompositeStyle::parse(&normalized) {
-        let bands = style.required_channels().to_vec();
+    if let Some(product) = GoesAbiProduct::parse(layer) {
+        let bands = product.required_channels().to_vec();
         let list = bands
             .iter()
             .map(|band| format!("C{band:02}"))
             .collect::<Vec<_>>()
             .join("+");
-        return Ok((bands, format!("{} [{list}]", style.title())));
+        return Ok((bands, format!("{} [{list}]", product.title())));
     }
     Err(format!("unknown layer '{layer}'"))
 }
@@ -775,7 +959,7 @@ fn resolve_spec(spec: &SatFollowSpec) -> Result<ResolvedSpec, String> {
     let sector =
         Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
     let (bands, layer_desc) = resolve_layer(&spec.layer)?;
-    if ![1usize, 2, 4].contains(&spec.downsample) {
+    if ![0usize, 1, 2, 4].contains(&spec.downsample) {
         return Err(format!("unsupported detail stride {}", spec.downsample));
     }
     Ok(ResolvedSpec {
@@ -805,6 +989,7 @@ fn spec_summary(spec: &SatFollowSpec) -> Result<String, String> {
         (None, None) => "unbounded window".to_string(),
     };
     let detail = match spec.downsample {
+        0 => " · automatic bounded preview".to_owned(),
         1 => String::new(),
         step => format!(" · 1/{step} res"),
     };
@@ -859,42 +1044,441 @@ pub fn run_filters_for_spec(spec: &SatFollowSpec) -> Result<(String, Vec<String>
     run_prefixes(spec)
 }
 
-/// Live on-disk footprint of the followed band(s): frame files only (the
-/// same accounting the rolling window budgets).
-fn disk_usage(store_root: &Path, model: &str, prefixes: &[String]) -> SatDiskUsage {
-    let mut usage = SatDiskUsage {
-        bytes: 0,
-        frames: 0,
+/// Hard traversal limits for a storage-status refresh. A normal six-hour
+/// full-disk follow is several orders of magnitude smaller; these bounds keep
+/// a corrupt or attacker-controlled cache tree from stalling the worker.
+#[derive(Debug, Clone, Copy)]
+struct SatStorageScanLimits {
+    preview_runs: usize,
+    preview_entries: usize,
+    native_day_entries: usize,
+    native_scan_entries: usize,
+    native_file_entries: usize,
+}
+
+const SAT_STORAGE_SCAN_LIMITS: SatStorageScanLimits = SatStorageScanLimits {
+    preview_runs: 8_192,
+    preview_entries: 200_000,
+    native_day_entries: 4_096,
+    native_scan_entries: 100_000,
+    native_file_entries: 250_000,
+};
+
+/// Live on-disk footprint of the current resolved follow scope. The native
+/// maximum deliberately mirrors rw-sat follow's
+/// `per_band_max.saturating_mul(bands.len().max(1))` policy.
+pub(crate) fn satellite_storage_usage(
+    store_root: &Path,
+    model: &str,
+    sector: &str,
+    bands: &[u8],
+    prefixes: &[String],
+    per_band_max_bytes: Option<u64>,
+) -> SatStorageUsage {
+    satellite_storage_usage_with_limits(
+        store_root,
+        model,
+        sector,
+        bands,
+        prefixes,
+        per_band_max_bytes,
+        SAT_STORAGE_SCAN_LIMITS,
+    )
+}
+
+fn satellite_storage_usage_with_limits(
+    store_root: &Path,
+    model: &str,
+    sector: &str,
+    bands: &[u8],
+    prefixes: &[String],
+    per_band_max_bytes: Option<u64>,
+    limits: SatStorageScanLimits,
+) -> SatStorageUsage {
+    let mut usage = SatStorageUsage {
+        native_cap_bytes: per_band_max_bytes
+            .map(|bytes| bytes.saturating_mul(bands.len().max(1) as u64)),
+        inventory_complete: true,
+        ..SatStorageUsage::default()
     };
-    let model_dir = store_root.join(model);
-    let Ok(runs) = std::fs::read_dir(&model_dir) else {
+    if !valid_storage_component(model) || !valid_storage_component(sector) {
+        usage.inventory_complete = false;
         return usage;
+    }
+    let mut requested = [false; 17];
+    for &band in bands {
+        if let Some(slot) = requested.get_mut(usize::from(band)).filter(|_| band > 0) {
+            *slot = true;
+        } else {
+            usage.inventory_complete = false;
+        }
+    }
+    if prefixes.iter().any(|prefix| !valid_storage_prefix(prefix)) {
+        usage.inventory_complete = false;
+        return usage;
+    }
+
+    scan_preview_storage(store_root, model, prefixes, limits, &mut usage);
+    scan_native_storage(store_root, model, sector, &requested, limits, &mut usage);
+    usage
+}
+
+fn scan_preview_storage(
+    store_root: &Path,
+    model: &str,
+    prefixes: &[String],
+    limits: SatStorageScanLimits,
+    usage: &mut SatStorageUsage,
+) {
+    let model_dir = store_root.join(model);
+    if !bounded_directory_exists(&model_dir, &mut usage.inventory_complete) {
+        return;
+    }
+    let Ok(runs) = std::fs::read_dir(&model_dir) else {
+        usage.inventory_complete = false;
+        return;
     };
-    for run in runs.flatten() {
-        let name = run.file_name().to_string_lossy().to_string();
+    let mut matching_runs = 0usize;
+    let mut entries_seen = 0usize;
+    for result in runs {
+        let Ok(run) = result else {
+            usage.inventory_complete = false;
+            continue;
+        };
+        let Some(name) = run.file_name().to_str().map(str::to_owned) else {
+            usage.inventory_complete = false;
+            continue;
+        };
         if !prefixes
             .iter()
-            .any(|prefix| name.starts_with(prefix.as_str()))
+            .any(|prefix| storage_run_matches_prefix(&name, prefix))
         {
             continue;
         }
-        let Ok(files) = std::fs::read_dir(run.path()) else {
+        let Ok(file_type) = run.file_type() else {
+            usage.inventory_complete = false;
             continue;
         };
-        for file in files.flatten() {
-            let file_name = file.file_name().to_string_lossy().to_string();
-            if file_name.starts_with('t')
-                && file_name.ends_with(".rws")
-                && let Ok(meta) = file.metadata()
+        if !file_type.is_dir() || file_type.is_symlink() {
+            usage.inventory_complete = false;
+            continue;
+        }
+        matching_runs = matching_runs.saturating_add(1);
+        if matching_runs > limits.preview_runs {
+            usage.inventory_complete = false;
+            break;
+        }
+        let Ok(files) = std::fs::read_dir(run.path()) else {
+            usage.inventory_complete = false;
+            continue;
+        };
+        for result in files {
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > limits.preview_entries {
+                usage.inventory_complete = false;
+                return;
+            }
+            let Ok(file) = result else {
+                usage.inventory_complete = false;
+                continue;
+            };
+            let Some(file_name) = file.file_name().to_str().map(str::to_owned) else {
+                usage.inventory_complete = false;
+                continue;
+            };
+            if !valid_preview_frame_name(&file_name) {
+                continue;
+            }
+            let Ok(file_type) = file.file_type() else {
+                usage.inventory_complete = false;
+                continue;
+            };
+            if !file_type.is_file() || file_type.is_symlink() {
+                usage.inventory_complete = false;
+                continue;
+            }
+            let Ok(metadata) = file.metadata() else {
+                usage.inventory_complete = false;
+                continue;
+            };
+            checked_add_bytes(
+                &mut usage.preview_bytes,
+                metadata.len(),
+                &mut usage.inventory_complete,
+            );
+            checked_add_count(
+                &mut usage.preview_channel_frames,
+                &mut usage.inventory_complete,
+            );
+        }
+    }
+}
+
+fn scan_native_storage(
+    store_root: &Path,
+    model: &str,
+    sector: &str,
+    requested: &[bool; 17],
+    limits: SatStorageScanLimits,
+    usage: &mut SatStorageUsage,
+) {
+    if !requested.iter().any(|requested| *requested) {
+        return;
+    }
+    let root = store_root
+        .join(rw_sat::NATIVE_SOURCE_ARCHIVE_DIR)
+        .join(model)
+        .join(sector);
+    if !bounded_directory_exists(&root, &mut usage.inventory_complete) {
+        return;
+    }
+    let Ok(days) = std::fs::read_dir(&root) else {
+        usage.inventory_complete = false;
+        return;
+    };
+    let mut day_entries = 0usize;
+    let mut scan_entries = 0usize;
+    let mut file_entries = 0usize;
+    for result in days {
+        day_entries = day_entries.saturating_add(1);
+        if day_entries > limits.native_day_entries {
+            usage.inventory_complete = false;
+            return;
+        }
+        let Ok(day) = result else {
+            usage.inventory_complete = false;
+            continue;
+        };
+        let Some(day_name) = day.file_name().to_str().map(str::to_owned) else {
+            usage.inventory_complete = false;
+            continue;
+        };
+        let Ok(file_type) = day.file_type() else {
+            usage.inventory_complete = false;
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() || !valid_native_day(&day_name) {
+            usage.inventory_complete = false;
+            continue;
+        }
+        let Ok(scans) = std::fs::read_dir(day.path()) else {
+            usage.inventory_complete = false;
+            continue;
+        };
+        for result in scans {
+            scan_entries = scan_entries.saturating_add(1);
+            if scan_entries > limits.native_scan_entries {
+                usage.inventory_complete = false;
+                return;
+            }
+            let Ok(scan) = result else {
+                usage.inventory_complete = false;
+                continue;
+            };
+            let Some(scan_name) = scan.file_name().to_str().map(str::to_owned) else {
+                usage.inventory_complete = false;
+                continue;
+            };
+            let Ok(file_type) = scan.file_type() else {
+                usage.inventory_complete = false;
+                continue;
+            };
+            if !file_type.is_dir()
+                || file_type.is_symlink()
+                || !valid_native_scan(&day_name, &scan_name)
             {
-                {
-                    usage.bytes += meta.len();
-                    usage.frames += 1;
+                usage.inventory_complete = false;
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(scan.path()) else {
+                usage.inventory_complete = false;
+                continue;
+            };
+            let mut has_requested_source = false;
+            for result in files {
+                file_entries = file_entries.saturating_add(1);
+                if file_entries > limits.native_file_entries {
+                    usage.inventory_complete = false;
+                    return;
                 }
+                let Ok(file) = result else {
+                    usage.inventory_complete = false;
+                    continue;
+                };
+                let Some(file_name) = file.file_name().to_str().map(str::to_owned) else {
+                    usage.inventory_complete = false;
+                    continue;
+                };
+                let Some(channel) = native_channel_source_name(&file_name) else {
+                    if looks_like_native_channel_source(&file_name) {
+                        usage.inventory_complete = false;
+                    }
+                    continue;
+                };
+                if !requested[usize::from(channel)] {
+                    continue;
+                }
+                let Ok(file_type) = file.file_type() else {
+                    usage.inventory_complete = false;
+                    continue;
+                };
+                if !file_type.is_file() || file_type.is_symlink() {
+                    usage.inventory_complete = false;
+                    continue;
+                }
+                let Ok(metadata) = file.metadata() else {
+                    usage.inventory_complete = false;
+                    continue;
+                };
+                has_requested_source = true;
+                checked_add_bytes(
+                    &mut usage.native_bytes,
+                    metadata.len(),
+                    &mut usage.inventory_complete,
+                );
+                checked_add_count(
+                    &mut usage.native_channel_sources,
+                    &mut usage.inventory_complete,
+                );
+            }
+            if has_requested_source {
+                checked_add_count(
+                    &mut usage.native_unique_scans,
+                    &mut usage.inventory_complete,
+                );
             }
         }
     }
-    usage
+}
+
+fn bounded_directory_exists(path: &Path, complete: &mut bool) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+        Ok(_) => {
+            *complete = false;
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            *complete = false;
+            false
+        }
+    }
+}
+
+fn checked_add_bytes(total: &mut u64, bytes: u64, complete: &mut bool) {
+    match total.checked_add(bytes) {
+        Some(next) => *total = next,
+        None => {
+            *total = u64::MAX;
+            *complete = false;
+        }
+    }
+}
+
+fn checked_add_count(total: &mut usize, complete: &mut bool) {
+    match total.checked_add(1) {
+        Some(next) => *total = next,
+        None => {
+            *total = usize::MAX;
+            *complete = false;
+        }
+    }
+}
+
+fn valid_storage_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn valid_storage_prefix(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn storage_run_matches_prefix(run: &str, prefix: &str) -> bool {
+    run == prefix
+        || run
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('_'))
+}
+
+fn valid_preview_frame_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 9
+        && bytes[0] == b't'
+        && bytes[5..] == *b".rws"
+        && valid_hhmm_digits(&bytes[1..5])
+}
+
+fn valid_native_day(value: &str) -> bool {
+    value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn valid_native_scan(day: &str, value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 13
+        && value.starts_with(day)
+        && bytes[8] == b'T'
+        && valid_hhmm_digits(&bytes[9..13])
+}
+
+fn valid_hhmm_digits(value: &[u8]) -> bool {
+    if value.len() != 4 || !value.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let hour = (value[0] - b'0') * 10 + (value[1] - b'0');
+    let minute = (value[2] - b'0') * 10 + (value[3] - b'0');
+    hour <= 23 && minute <= 59
+}
+
+fn looks_like_native_channel_source(value: &str) -> bool {
+    value.len() >= 6 && value.starts_with('c') && value.ends_with(".nc")
+}
+
+fn native_channel_source_name(value: &str) -> Option<u8> {
+    if value.len() > 80 || !looks_like_native_channel_source(value) {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    if !bytes[1].is_ascii_digit() || !bytes[2].is_ascii_digit() {
+        return None;
+    }
+    let channel = (bytes[1] - b'0') * 10 + (bytes[2] - b'0');
+    if !(1..=16).contains(&channel) {
+        return None;
+    }
+    let suffix = &value[3..];
+    if suffix == ".nc" {
+        return Some(channel);
+    }
+    let digest = suffix.strip_prefix('-')?.strip_suffix(".nc")?;
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(channel)
+}
+
+fn storage_usage_responses(
+    store_root: &Path,
+    model: &str,
+    sector: &str,
+    bands: &[u8],
+    prefixes: &[String],
+    per_band_max_bytes: Option<u64>,
+) -> [SatResponse; 1] {
+    let usage = satellite_storage_usage(
+        store_root,
+        model,
+        sector,
+        bands,
+        prefixes,
+        per_band_max_bytes,
+    );
+    [SatResponse::StorageUsage(usage)]
 }
 
 /// Title for one sat run: `g19 · conus C13 · 2026-06-10` (with the
@@ -1149,6 +1733,166 @@ fn scan_runs(store_root: &Path) -> Vec<SatRunListing> {
     listings
 }
 
+/// Convert retained native manifests into the product timeline promised by the
+/// active GOES picker. A compact `.rws` preview is optional and cannot be the
+/// carrier: native archival is the durable ingest boundary, and a preview
+/// decode/write may legitimately fail after all product channels landed.
+fn local_runs_for_active_product(
+    store_root: &Path,
+    runs: Vec<SatRunListing>,
+    spec: Option<&SatFollowSpec>,
+) -> Vec<SatRunListing> {
+    let Some(spec) = spec else {
+        return runs;
+    };
+    let Some(product) =
+        GoesAbiProduct::parse(&spec.layer).filter(|product| product.required_channels().len() > 1)
+    else {
+        return runs;
+    };
+    let Ok(resolved) = resolve_spec(spec) else {
+        return Vec::new();
+    };
+    let sector = resolved.sector.slug();
+    let mut by_day = BTreeMap::<String, (Vec<u16>, Option<(usize, usize)>)>::new();
+    let manifests = list_native_frames(store_root, &resolved.model, sector, product, usize::MAX)
+        .unwrap_or_default();
+    for manifest in manifests {
+        let Some((day, hhmm)) = native_frame_day_hhmm(&manifest.frame_id) else {
+            continue;
+        };
+        let Ok(exact) = resolve_native_frame_with_revision(
+            store_root,
+            &resolved.model,
+            sector,
+            product,
+            &manifest.frame_id,
+        ) else {
+            continue;
+        };
+        if synchronized_native_product_scan(&exact.frame, product).is_none() {
+            continue;
+        }
+        let entry = by_day.entry(day).or_default();
+        entry.0.push(hhmm);
+        if entry.1.is_none() {
+            entry.1 = native_product_overview_dimensions(store_root, &exact.frame, product);
+        }
+    }
+
+    let mut listings = by_day
+        .into_iter()
+        .filter_map(|(day, (mut frames, dimensions))| {
+            frames.sort_unstable();
+            frames.dedup();
+            let raw = SatRunKey {
+                model: resolved.model.clone(),
+                run: format!("{sector}_c{:02}_{day}", product.base_channel()),
+            };
+            let key = native_product_carrier_key(&raw, product)?;
+            let (nx, ny) = dimensions.unwrap_or((0, 0));
+            Some(SatRunListing {
+                key,
+                title: format!(
+                    "{} · {} {} · {}-{}-{}",
+                    resolved.model,
+                    resolved.sector.slug(),
+                    product.title(),
+                    &day[0..4],
+                    &day[4..6],
+                    &day[6..8]
+                ),
+                nx,
+                ny,
+                frames,
+            })
+        })
+        .collect::<Vec<_>>();
+    // Keep explicitly baked one-shot RGB runs available to the host's exact
+    // selected/admitted identity filter; ordinary scalar carrier runs remain
+    // hidden while a named multi-channel product is selected.
+    listings.extend(runs.into_iter().filter(|run| run.key.run.contains("_rgb_")));
+    sort_run_listings_newest_first(&mut listings);
+    listings
+}
+
+fn native_frame_day_hhmm(frame_id: &str) -> Option<(String, u16)> {
+    let bytes = frame_id.as_bytes();
+    if bytes.len() != 13
+        || bytes[8] != b'T'
+        || !bytes[..8].iter().all(u8::is_ascii_digit)
+        || !bytes[9..].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let hhmm = frame_id[9..].parse::<u16>().ok()?;
+    let hour = hhmm / 100;
+    let minute = hhmm % 100;
+    (hour < 24 && minute < 60).then(|| (frame_id[..8].to_owned(), hhmm))
+}
+
+fn native_product_overview_dimensions(
+    store_root: &Path,
+    frame: &NativeSatelliteFrame,
+    product: GoesAbiProduct,
+) -> Option<(usize, usize)> {
+    const OVERVIEW_MAX_CELLS: usize = 1_048_576;
+    let channel = product.base_channel();
+    let source = frame.channels.get(&channel)?;
+    let path = frame.channel_path(store_root, channel).ok()?;
+    let scene = read_goes_abi_scene_with_identity(&path, &source.object_key).ok()?;
+    let stride =
+        automatic_preview_stride(scene.fixed_grid.nx, scene.fixed_grid.ny, OVERVIEW_MAX_CELLS)
+            .max(1);
+    Some((
+        scene.fixed_grid.nx.div_ceil(stride),
+        scene.fixed_grid.ny.div_ceil(stride),
+    ))
+}
+
+fn scan_runs_for_player(store_root: &Path, spec: Option<&SatFollowSpec>) -> Vec<SatRunListing> {
+    local_runs_for_active_product(store_root, scan_runs(store_root), spec)
+}
+
+/// A repaired component can complete an older product minute after a newer
+/// minute is already selectable. Publishing the refreshed listing is useful,
+/// but auto-selecting that repaired minute would yank a live player backward.
+/// Only the newest exact frame in the same model/product/sector family may be
+/// selected by the background completion path; users can still scrub to every
+/// older complete frame manually.
+fn native_product_frame_is_newest(runs: &[SatRunListing], carrier: &SatRunKey, hhmm: u16) -> bool {
+    let Some(target_time) = frame_time(&carrier.run, hhmm) else {
+        return false;
+    };
+    let family = native_product_timeline_family(&carrier.run);
+    runs.iter()
+        .filter(|run| {
+            run.key.model == carrier.model && native_product_timeline_family(&run.key.run) == family
+        })
+        .flat_map(|run| {
+            run.frames
+                .iter()
+                .filter_map(|&frame| frame_time(&run.key.run, frame))
+        })
+        .max()
+        .is_some_and(|newest| newest == target_time)
+}
+
+fn native_product_timeline_family(run: &str) -> String {
+    let mut saw_day = false;
+    run.split('_')
+        .filter(|token| {
+            let is_day = token.len() == 8 && token.bytes().all(|byte| byte.is_ascii_digit());
+            if is_day {
+                saw_day = true;
+                return false;
+            }
+            !(saw_day && token.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 /// Per-run grid facts the frame loader caches (one `grid.rwg` read per
 /// run instead of per frame).
 struct GridInfo {
@@ -1159,9 +1903,899 @@ struct GridInfo {
     flip_rows: bool,
 }
 
+const REMOTE_TILE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const REMOTE_SCAN_FRESH_FOR: Duration = Duration::from_secs(15);
+const REMOTE_PREVIEW_QUEUE_CAPACITY: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RemoteTileKey {
+    namespace: String,
+    zoom: u8,
+    x: u32,
+    y: u32,
+}
+
+struct CachedRemoteTile {
+    bytes: Arc<Vec<u8>>,
+    used_at: u64,
+}
+
+struct RemoteTileCache {
+    entries: HashMap<RemoteTileKey, CachedRemoteTile>,
+    bytes: usize,
+    tick: u64,
+    max_bytes: usize,
+}
+
+impl Default for RemoteTileCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            tick: 0,
+            max_bytes: REMOTE_TILE_CACHE_BYTES,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemoteTileFetcher {
+    client: RemoteSatelliteClient,
+    cache: Arc<Mutex<RemoteTileCache>>,
+}
+
+impl RemoteTileFetcher {
+    fn new(client: RemoteSatelliteClient) -> Self {
+        Self {
+            client,
+            cache: Arc::new(Mutex::new(RemoteTileCache::default())),
+        }
+    }
+
+    fn fetch(
+        &self,
+        source: &RemoteSatelliteTileSource,
+        zoom: u8,
+        x: u32,
+        y: u32,
+    ) -> Result<Arc<Vec<u8>>, String> {
+        let key = RemoteTileKey {
+            namespace: source.cache_identity.namespace_sha256(),
+            zoom,
+            x,
+            y,
+        };
+        {
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| "rw-server satellite tile cache lock poisoned".to_owned())?;
+            cache.tick = cache.tick.wrapping_add(1);
+            let tick = cache.tick;
+            if let Some(cached) = cache.entries.get_mut(&key) {
+                cached.used_at = tick;
+                return Ok(Arc::clone(&cached.bytes));
+            }
+        }
+
+        let fetched_bytes = self
+            .client
+            .fetch_tile(source, zoom, x, y)
+            .map_err(|error| format!("rw-server satellite tile failed: {error}"))?;
+        // The transport verifies content type, identity headers, signature,
+        // and IHDR dimensions. Fully decode before admitting bytes to the
+        // long-lived immutable cache as well: a truncated/CRC-bad PNG must be
+        // retryable, not a poison entry replayed for the rest of the session.
+        let decoded = image::load_from_memory_with_format(&fetched_bytes, image::ImageFormat::Png)
+            .map_err(|error| format!("rw-server satellite tile PNG is corrupt: {error}"))?;
+        if decoded.width() != source.tile_size || decoded.height() != source.tile_size {
+            return Err("rw-server satellite tile PNG dimensions changed".to_owned());
+        }
+        let fetched = Arc::new(fetched_bytes);
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| "rw-server satellite tile cache lock poisoned".to_owned())?;
+        cache.tick = cache.tick.wrapping_add(1);
+        let tick = cache.tick;
+        if let Some(cached) = cache.entries.get_mut(&key) {
+            cached.used_at = tick;
+            return Ok(Arc::clone(&cached.bytes));
+        }
+        cache.bytes = cache.bytes.saturating_add(fetched.len());
+        cache.entries.insert(
+            key,
+            CachedRemoteTile {
+                bytes: Arc::clone(&fetched),
+                used_at: tick,
+            },
+        );
+        while cache.bytes > cache.max_bytes && cache.entries.len() > 1 {
+            let Some(oldest) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, tile)| tile.used_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = cache.entries.remove(&oldest) {
+                cache.bytes = cache.bytes.saturating_sub(removed.bytes.len());
+            }
+        }
+        Ok(fetched)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteExactFrame {
+    frame_id: String,
+    source_revision: String,
+}
+
+#[derive(Clone)]
+struct RemoteRunBinding {
+    /// Stable platform/sector/product/day identity without a republish suffix.
+    identity_base: String,
+    catalog: Arc<RemoteSatelliteCatalog>,
+    frames: Arc<RemoteSatelliteFrames>,
+    exact_by_hhmm: HashMap<u16, RemoteExactFrame>,
+}
+
+#[derive(Default)]
+struct RemoteWorkerShared {
+    spec: Option<SatFollowSpec>,
+    generation: u64,
+    inflight_generation: Option<u64>,
+    catalog: Option<Arc<RemoteSatelliteCatalog>>,
+    catalog_fetched_at: Option<Instant>,
+    runs: HashMap<(String, String), RemoteRunBinding>,
+    listings: Vec<SatRunListing>,
+    /// Newest local-store snapshot observed by any Scan/ScanAndSelect while a
+    /// remote catalog request may be in flight.
+    latest_local: Vec<SatRunListing>,
+    tile_sources: HashMap<(String, String, u16), RemoteSatelliteTileSource>,
+    preview_inflight: HashSet<(String, String, u16, String)>,
+    last_scan_at: Option<Instant>,
+}
+
+struct RemotePreviewTask {
+    key: SatRunKey,
+    hhmm: u16,
+    generation: u64,
+    source_revision: String,
+    responses: Sender<SatResponse>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[derive(Clone)]
+struct RemoteWorker {
+    client: RemoteSatelliteClient,
+    shared: Arc<Mutex<RemoteWorkerShared>>,
+    tile_fetcher: RemoteTileFetcher,
+    preview_tx: SyncSender<RemotePreviewTask>,
+}
+
+impl RemoteWorker {
+    fn new(client: RemoteSatelliteClient) -> Self {
+        let shared = Arc::new(Mutex::new(RemoteWorkerShared::default()));
+        let tile_fetcher = RemoteTileFetcher::new(client.clone());
+        let (preview_tx, preview_rx) =
+            sync_channel::<RemotePreviewTask>(REMOTE_PREVIEW_QUEUE_CAPACITY);
+        let preview_client = client.clone();
+        let preview_shared = Arc::clone(&shared);
+        let preview_fetcher = tile_fetcher.clone();
+        let _ = std::thread::Builder::new()
+            .name("rw-sat-remote-preview".to_owned())
+            .spawn(move || {
+                rw_ingest::throttle::set_current_thread_background_priority();
+                while let Ok(task) = preview_rx.recv() {
+                    let identity = (
+                        task.key.model.clone(),
+                        task.key.run.clone(),
+                        task.hhmm,
+                        task.source_revision.clone(),
+                    );
+                    let result = resolve_remote_map_source(
+                        &preview_client,
+                        &preview_shared,
+                        &preview_fetcher,
+                        &task.key,
+                        task.hhmm,
+                    )
+                    .and_then(|source| {
+                        source
+                            .ok_or_else(|| {
+                                format!("{} is not an rw-server satellite run", task.key)
+                            })
+                            .and_then(|source| {
+                                load_remote_source_frame(source, &task.key, task.hhmm)
+                            })
+                    });
+                    let still_current = if let Ok(mut state) = preview_shared.lock() {
+                        state.preview_inflight.remove(&identity);
+                        state.generation == task.generation
+                            && state
+                                .runs
+                                .get(&(task.key.model.clone(), task.key.run.clone()))
+                                .and_then(|run| run.exact_by_hhmm.get(&task.hhmm))
+                                .is_some_and(|exact| exact.source_revision == task.source_revision)
+                    } else {
+                        false
+                    };
+                    if !still_current {
+                        continue;
+                    }
+                    let legacy = false;
+                    send_remote_response(
+                        &task.responses,
+                        &task.notify,
+                        SatResponse::Frame {
+                            key: task.key,
+                            hhmm: task.hhmm,
+                            legacy,
+                            result: Box::new(result.map(|colored| colored.frame)),
+                        },
+                    );
+                }
+            });
+        Self {
+            tile_fetcher,
+            client,
+            shared,
+            preview_tx,
+        }
+    }
+
+    fn set_spec(&self, spec: SatFollowSpec) {
+        let Ok(mut shared) = self.shared.lock() else {
+            return;
+        };
+        if shared.spec.as_ref() == Some(&spec) {
+            return;
+        }
+        shared.spec = Some(spec);
+        shared.generation = shared.generation.wrapping_add(1);
+        shared.inflight_generation = None;
+        shared.runs.clear();
+        shared.listings.clear();
+        shared.tile_sources.clear();
+        shared.last_scan_at = None;
+    }
+
+    /// Remember the local disk snapshot and publish it with the last-good
+    /// remote timeline under the same lock used by remote-scan installation.
+    /// This keeps both the local and remote halves from being overwritten by
+    /// an older response when a Scan races an in-flight HTTP completion.
+    fn publish_local_and_last_good(
+        &self,
+        local: Vec<SatRunListing>,
+        responses: &Sender<SatResponse>,
+        notify: &Arc<dyn Fn() + Send + Sync>,
+    ) -> bool {
+        publish_local_and_last_good_response(&self.shared, local, responses, notify)
+    }
+
+    fn contains(&self, key: &SatRunKey, hhmm: u16) -> bool {
+        self.shared.lock().is_ok_and(|shared| {
+            shared
+                .runs
+                .get(&(key.model.clone(), key.run.clone()))
+                .is_some_and(|run| run.exact_by_hhmm.contains_key(&hhmm))
+        })
+    }
+
+    fn exact_revision(&self, key: &SatRunKey, hhmm: u16) -> Option<String> {
+        self.shared.lock().ok().and_then(|shared| {
+            shared
+                .runs
+                .get(&(key.model.clone(), key.run.clone()))
+                .and_then(|run| run.exact_by_hhmm.get(&hhmm))
+                .map(|exact| exact.source_revision.clone())
+        })
+    }
+
+    fn request_preview(
+        &self,
+        key: SatRunKey,
+        hhmm: u16,
+        responses: Sender<SatResponse>,
+        notify: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        let admitted = match self.shared.lock() {
+            Ok(mut shared) => {
+                let Some(source_revision) = shared
+                    .runs
+                    .get(&(key.model.clone(), key.run.clone()))
+                    .and_then(|run| run.exact_by_hhmm.get(&hhmm))
+                    .map(|exact| exact.source_revision.clone())
+                else {
+                    return;
+                };
+                let identity = (
+                    key.model.clone(),
+                    key.run.clone(),
+                    hhmm,
+                    source_revision.clone(),
+                );
+                if shared.preview_inflight.contains(&identity) {
+                    return;
+                }
+                let generation = shared.generation;
+                {
+                    shared.preview_inflight.insert(identity.clone());
+                }
+                Some((generation, source_revision, identity))
+            }
+            Err(_) => None,
+        };
+        let Some((generation, source_revision, identity)) = admitted else {
+            send_remote_response(
+                &responses,
+                &notify,
+                SatResponse::Frame {
+                    key,
+                    hhmm,
+                    legacy: false,
+                    result: Box::new(Err(
+                        "rw-server satellite preview state is unavailable".to_owned()
+                    )),
+                },
+            );
+            return;
+        };
+        if let Err(error) = self.preview_tx.try_send(RemotePreviewTask {
+            key: key.clone(),
+            hhmm,
+            generation,
+            source_revision,
+            responses: responses.clone(),
+            notify: Arc::clone(&notify),
+        }) {
+            if let Ok(mut shared) = self.shared.lock() {
+                shared.preview_inflight.remove(&identity);
+            }
+            send_remote_response(
+                &responses,
+                &notify,
+                SatResponse::Frame {
+                    key,
+                    hhmm,
+                    legacy: false,
+                    result: Box::new(Err(format!(
+                        "rw-server satellite preview worker unavailable: {error}"
+                    ))),
+                },
+            );
+        }
+    }
+
+    fn map_source(&self, key: &SatRunKey, hhmm: u16) -> Result<Option<RemoteSatMapSource>, String> {
+        resolve_remote_map_source(&self.client, &self.shared, &self.tile_fetcher, key, hhmm)
+    }
+
+    fn request_scan(
+        &self,
+        local: Vec<SatRunListing>,
+        responses: Sender<SatResponse>,
+        notify: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        let (spec, generation, cached_catalog) = {
+            let Ok(mut shared) = self.shared.lock() else {
+                send_remote_response(
+                    &responses,
+                    &notify,
+                    SatResponse::Note("rw-server satellite state lock poisoned".to_owned()),
+                );
+                return;
+            };
+            // This assignment must precede every freshness/inflight early
+            // return. A second Scan can observe a newly written local frame
+            // while the first remote HTTP request is still in flight.
+            shared.latest_local = local;
+            let Some(spec) = shared.spec.clone() else {
+                return;
+            };
+            if shared
+                .last_scan_at
+                .is_some_and(|at| at.elapsed() < REMOTE_SCAN_FRESH_FOR)
+                || shared.inflight_generation == Some(shared.generation)
+            {
+                return;
+            }
+            let generation = shared.generation;
+            shared.inflight_generation = Some(generation);
+            let cached_catalog = shared.catalog.as_ref().and_then(|catalog| {
+                shared
+                    .catalog_fetched_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(30 * 60))
+                    .then(|| Arc::clone(catalog))
+            });
+            (spec, generation, cached_catalog)
+        };
+
+        let client = self.client.clone();
+        let shared = Arc::clone(&self.shared);
+        let thread_responses = responses.clone();
+        let thread_notify = Arc::clone(&notify);
+        let spawn_result = std::thread::Builder::new()
+            .name("rw-sat-remote-scan".to_owned())
+            .spawn(move || {
+                rw_ingest::throttle::set_current_thread_background_priority();
+                let result = fetch_remote_scan(&client, cached_catalog, &spec);
+                match result {
+                    Ok(mut scan) => {
+                        let options = remote_catalog_options(&scan.catalog);
+                        {
+                            let Ok(mut state) = shared.lock() else {
+                                send_remote_response(
+                                    &thread_responses,
+                                    &thread_notify,
+                                    SatResponse::Note(
+                                        "rw-server satellite state lock poisoned".to_owned(),
+                                    ),
+                                );
+                                return;
+                            };
+                            if state.generation != generation || state.spec.as_ref() != Some(&spec) {
+                                return;
+                            }
+                            state.inflight_generation = None;
+                            state.catalog = Some(Arc::clone(&scan.catalog));
+                            if scan.catalog_refreshed {
+                                state.catalog_fetched_at = Some(Instant::now());
+                            }
+                            stabilize_remote_run_identities(
+                                &state.runs,
+                                &mut scan.runs,
+                                &mut scan.listings,
+                            );
+                            state.runs = scan.runs;
+                            state.listings = scan.listings.clone();
+                            state.tile_sources.clear();
+                            state.last_scan_at = Some(Instant::now());
+                            let merged = merge_local_and_remote_runs(
+                                state.latest_local.clone(),
+                                &scan.listings,
+                            );
+                            // Keep the snapshot lock through both sends. A
+                            // concurrent Scan either updated latest_local
+                            // before this merge, or waits and publishes its
+                            // fresher local+last-good result afterward; the
+                            // remote completion can never overwrite it with
+                            // stale local state.
+                            send_remote_response(
+                                &thread_responses,
+                                &thread_notify,
+                                SatResponse::RemoteCatalogOptions {
+                                    satellites: options.0,
+                                    sectors: options.1,
+                                    layers: options.2,
+                                },
+                            );
+                            send_remote_response(
+                                &thread_responses,
+                                &thread_notify,
+                                SatResponse::Runs(merged),
+                            );
+                        }
+                    }
+                    Err(message) => {
+                        let still_current = if let Ok(mut state) = shared.lock()
+                            && state.generation == generation
+                            && state.spec.as_ref() == Some(&spec)
+                        {
+                            state.inflight_generation = None;
+                            // Bound retries after an unreachable/bad server;
+                            // frequent local FrameWritten refreshes must not
+                            // create a remote request storm.
+                            state.last_scan_at = Some(Instant::now());
+                            true
+                        } else {
+                            false
+                        };
+                        if !still_current {
+                            return;
+                        }
+                        send_remote_response(
+                            &thread_responses,
+                            &thread_notify,
+                            SatResponse::Note(format!(
+                                "rw-server satellite unavailable; local frames remain usable: {message}"
+                            )),
+                        );
+                    }
+                }
+            });
+        if let Err(error) = spawn_result {
+            if let Ok(mut shared) = self.shared.lock()
+                && shared.generation == generation
+            {
+                shared.inflight_generation = None;
+            }
+            send_remote_response(
+                &responses,
+                &notify,
+                SatResponse::Note(format!(
+                    "could not start rw-server satellite discovery: {error}"
+                )),
+            );
+        }
+    }
+}
+
+fn resolve_remote_map_source(
+    client: &RemoteSatelliteClient,
+    shared: &Arc<Mutex<RemoteWorkerShared>>,
+    tile_fetcher: &RemoteTileFetcher,
+    key: &SatRunKey,
+    hhmm: u16,
+) -> Result<Option<RemoteSatMapSource>, String> {
+    let cache_key = (key.model.clone(), key.run.clone(), hhmm);
+    let (catalog, frames, exact, cached) = {
+        let shared = shared
+            .lock()
+            .map_err(|_| "rw-server satellite state lock poisoned".to_owned())?;
+        let Some(run) = shared.runs.get(&(key.model.clone(), key.run.clone())) else {
+            return Ok(None);
+        };
+        let Some(exact) = run.exact_by_hhmm.get(&hhmm) else {
+            return Err(format!("{key} has no exact rw-server frame at {hhmm:04}Z"));
+        };
+        (
+            Arc::clone(&run.catalog),
+            Arc::clone(&run.frames),
+            exact.clone(),
+            shared.tile_sources.get(&cache_key).cloned(),
+        )
+    };
+    let was_cached = cached.is_some();
+    let tile_source = match cached {
+        Some(source) => source,
+        None => client
+            .tile_source(&catalog, &frames, &exact.frame_id)
+            .map_err(|error| format!("rw-server satellite TileJSON failed: {error}"))?,
+    };
+    if tile_source.cache_identity.frame != exact.frame_id
+        || tile_source.cache_identity.source_revision != exact.source_revision
+    {
+        return Err("rw-server satellite TileJSON changed exact frame identity".to_owned());
+    }
+    let exact_frame = frames
+        .frames
+        .iter()
+        .find(|frame| frame.id == exact.frame_id)
+        .ok_or_else(|| "rw-server satellite exact frame vanished from its catalog".to_owned())?;
+    let preview_product = GoesAbiProduct::parse(&frames.product.id);
+    let scan_start_unix = exact_frame.scan_start_unix;
+    {
+        let mut current = shared
+            .lock()
+            .map_err(|_| "rw-server satellite state lock poisoned".to_owned())?;
+        if current
+            .runs
+            .get(&(key.model.clone(), key.run.clone()))
+            .and_then(|run| run.exact_by_hhmm.get(&hhmm))
+            != Some(&exact)
+        {
+            return Err(format!(
+                "rw-server satellite frame {key} {hhmm:04}Z changed revision while TileJSON was resolving; retrying is required"
+            ));
+        }
+        if !was_cached {
+            current.tile_sources.insert(cache_key, tile_source.clone());
+        }
+    }
+    Ok(Some(RemoteSatMapSource {
+        tile_source,
+        preview_product,
+        scan_start_unix,
+        tile_fetcher: tile_fetcher.clone(),
+    }))
+}
+
+struct RemoteScanInstall {
+    catalog: Arc<RemoteSatelliteCatalog>,
+    catalog_refreshed: bool,
+    runs: HashMap<(String, String), RemoteRunBinding>,
+    listings: Vec<SatRunListing>,
+}
+
+fn send_remote_response(
+    responses: &Sender<SatResponse>,
+    notify: &Arc<dyn Fn() + Send + Sync>,
+    response: SatResponse,
+) {
+    let _ = responses.send(response);
+    notify();
+}
+
+fn merge_local_and_remote_runs(
+    mut local: Vec<SatRunListing>,
+    remote: &[SatRunListing],
+) -> Vec<SatRunListing> {
+    local.extend(remote.iter().cloned());
+    sort_run_listings_newest_first(&mut local);
+    local
+}
+
+fn publish_local_and_last_good_response(
+    shared: &Arc<Mutex<RemoteWorkerShared>>,
+    mut local: Vec<SatRunListing>,
+    responses: &Sender<SatResponse>,
+    notify: &Arc<dyn Fn() + Send + Sync>,
+) -> bool {
+    // Keep the mutex through the channel send. Remote scan completion uses the
+    // same ordering discipline, so whichever snapshot wins the lock last is
+    // also the final Runs response observed by the UI.
+    let sent = if let Ok(mut shared) = shared.lock() {
+        shared.latest_local = local.clone();
+        let merged = merge_local_and_remote_runs(local, &shared.listings);
+        responses.send(SatResponse::Runs(merged)).is_ok()
+    } else {
+        sort_run_listings_newest_first(&mut local);
+        responses.send(SatResponse::Runs(local)).is_ok()
+    };
+    notify();
+    sent
+}
+
+fn fetch_remote_scan(
+    client: &RemoteSatelliteClient,
+    cached_catalog: Option<Arc<RemoteSatelliteCatalog>>,
+    spec: &SatFollowSpec,
+) -> Result<RemoteScanInstall, String> {
+    let resolved = resolve_spec(spec)?;
+    let product = GoesAbiProduct::parse(&spec.layer)
+        .ok_or_else(|| format!("unknown rw-server satellite product '{}'", spec.layer))?
+        .slug();
+    let (catalog, catalog_refreshed) = match cached_catalog {
+        Some(catalog) => (catalog, false),
+        None => (
+            Arc::new(
+                client
+                    .catalog(true)
+                    .map_err(|error| format!("catalog request failed: {error}"))?,
+            ),
+            true,
+        ),
+    };
+    let frames = Arc::new(
+        client
+            .frames(
+                &catalog,
+                &resolved.model,
+                resolved.sector.slug(),
+                &product,
+                MAX_FRAME_RESULTS,
+            )
+            .map_err(|error| format!("frame request failed: {error}"))?,
+    );
+    let (runs, listings) = build_remote_run_bindings(Arc::clone(&catalog), frames)?;
+    Ok(RemoteScanInstall {
+        catalog,
+        catalog_refreshed,
+        runs,
+        listings,
+    })
+}
+
+fn build_remote_run_bindings(
+    catalog: Arc<RemoteSatelliteCatalog>,
+    frames: Arc<RemoteSatelliteFrames>,
+) -> Result<
+    (
+        HashMap<(String, String), RemoteRunBinding>,
+        Vec<SatRunListing>,
+    ),
+    String,
+> {
+    let platform_title = catalog
+        .platforms
+        .iter()
+        .find(|platform| platform.id == frames.platform)
+        .map(|platform| platform.title.as_str())
+        .unwrap_or(frames.platform.as_str());
+    let sector_title = catalog
+        .sectors
+        .iter()
+        .find(|sector| sector.id == frames.sector)
+        .map(|sector| sector.title.as_str())
+        .unwrap_or(frames.sector.as_str());
+    let mut runs = HashMap::new();
+    let mut listings = Vec::new();
+    for (day, day_frames) in frames.by_utc_day() {
+        let run_name = format!(
+            "{}_c{:02}_rwserver_{}_{}",
+            frames.sector, frames.product.base_channel, frames.product.id, day
+        );
+        let key = SatRunKey {
+            model: frames.platform.clone(),
+            run: run_name.clone(),
+        };
+        let mut exact_by_hhmm = HashMap::new();
+        for frame in day_frames {
+            let hhmm = remote_frame_hhmm(&frame.id)
+                .ok_or_else(|| format!("invalid exact rw-server frame id '{}'", frame.id))?;
+            let exact = RemoteExactFrame {
+                frame_id: frame.id.clone(),
+                source_revision: frame.source_revision.clone(),
+            };
+            if exact_by_hhmm.insert(hhmm, exact).is_some() {
+                return Err(format!(
+                    "rw-server returned two {} frames at {hhmm:04}Z on {day}",
+                    frames.product.id
+                ));
+            }
+        }
+        let mut timeline = exact_by_hhmm.keys().copied().collect::<Vec<_>>();
+        timeline.sort_unstable();
+        let display_day = format!("{}-{}-{}", &day[..4], &day[4..6], &day[6..8]);
+        listings.push(SatRunListing {
+            key: key.clone(),
+            title: format!(
+                "{platform_title} · {sector_title} · {} · RW server · {display_day}",
+                frames.product.title
+            ),
+            nx: catalog.tile_size as usize * 2,
+            ny: catalog.tile_size as usize * 2,
+            frames: timeline,
+        });
+        runs.insert(
+            (key.model, key.run),
+            RemoteRunBinding {
+                identity_base: run_name,
+                catalog: Arc::clone(&catalog),
+                frames: Arc::clone(&frames),
+                exact_by_hhmm,
+            },
+        );
+    }
+    sort_run_listings_newest_first(&mut listings);
+    Ok((runs, listings))
+}
+
+/// Preserve a logical day run key across ordinary frame append/drop updates,
+/// but rotate it when an already-known HHMM is republished with different
+/// source bytes. rw-ui's texture identity is `(run, HHMM)`, so that rotation
+/// is what prevents an old preview/map renderer from surviving a server-side
+/// same-minute correction. On process restart the unsuffixed base is safe
+/// because the UI caches begin empty.
+fn stabilize_remote_run_identities(
+    previous: &HashMap<(String, String), RemoteRunBinding>,
+    next: &mut HashMap<(String, String), RemoteRunBinding>,
+    listings: &mut [SatRunListing],
+) {
+    let mut stabilized = HashMap::with_capacity(next.len());
+    for ((model, candidate_run), binding) in std::mem::take(next) {
+        let previous_match = previous.iter().find(|((old_model, _), old_binding)| {
+            old_model == &model && old_binding.identity_base == binding.identity_base
+        });
+        let chosen_run = match previous_match {
+            Some((_, old_binding))
+                if overlapping_remote_revision_changed(old_binding, &binding) =>
+            {
+                republished_remote_run_name(&binding)
+            }
+            Some(((_, old_run), _)) => old_run.clone(),
+            None => candidate_run.clone(),
+        };
+        if chosen_run != candidate_run
+            && let Some(listing) = listings
+                .iter_mut()
+                .find(|listing| listing.key.model == model && listing.key.run == candidate_run)
+        {
+            listing.key.run = chosen_run.clone();
+        }
+        stabilized.insert((model, chosen_run), binding);
+    }
+    *next = stabilized;
+    sort_run_listings_newest_first(listings);
+}
+
+fn overlapping_remote_revision_changed(
+    previous: &RemoteRunBinding,
+    next: &RemoteRunBinding,
+) -> bool {
+    next.exact_by_hhmm.iter().any(|(hhmm, exact)| {
+        previous
+            .exact_by_hhmm
+            .get(hhmm)
+            .is_some_and(|old| old != exact)
+    })
+}
+
+fn republished_remote_run_name(binding: &RemoteRunBinding) -> String {
+    let mut exact = binding.exact_by_hhmm.values().collect::<Vec<_>>();
+    exact.sort_by(|a, b| a.frame_id.cmp(&b.frame_id));
+    let mut digest = Sha256::new();
+    digest.update(b"bowecho-rw-satellite-day-republish-v1\0");
+    for frame in exact {
+        digest.update((frame.frame_id.len() as u64).to_be_bytes());
+        digest.update(frame.frame_id.as_bytes());
+        digest.update((frame.source_revision.len() as u64).to_be_bytes());
+        digest.update(frame.source_revision.as_bytes());
+    }
+    let revision = format!("{:x}", digest.finalize());
+    let base = &binding.identity_base;
+    let (prefix, day) = base
+        .len()
+        .checked_sub(9)
+        .map(|split| (&base[..split], &base[split + 1..]))
+        .unwrap_or((base.as_str(), "unknown"));
+    format!("{prefix}_rwrev{}_{}", &revision[..12], day)
+}
+
+fn remote_frame_hhmm(frame_id: &str) -> Option<u16> {
+    let bytes = frame_id.as_bytes();
+    if bytes.len() != 13 || bytes.get(8) != Some(&b'T') {
+        return None;
+    }
+    let hour = frame_id.get(9..11)?.parse::<u16>().ok()?;
+    let minute = frame_id.get(11..13)?.parse::<u16>().ok()?;
+    (hour < 24 && minute < 60).then_some(hour * 100 + minute)
+}
+
+fn remote_catalog_options(
+    catalog: &RemoteSatelliteCatalog,
+) -> (
+    Vec<SatSatelliteOption>,
+    Vec<SatSectorOption>,
+    Vec<SatLayerOption>,
+) {
+    let satellites = catalog
+        .platforms
+        .iter()
+        .map(|platform| SatSatelliteOption {
+            slug: platform
+                .id
+                .strip_prefix('g')
+                .filter(|number| {
+                    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .map(|number| format!("goes{number}"))
+                .unwrap_or_else(|| platform.id.clone()),
+            label: platform.title.clone(),
+        })
+        .collect();
+    let sectors = catalog
+        .sectors
+        .iter()
+        .map(|sector| SatSectorOption {
+            slug: sector.id.clone(),
+            label: sector.title.clone(),
+            default_poll_secs: sector.default_poll_seconds,
+            cadence_secs: sector.cadence_seconds,
+        })
+        .collect();
+    let layers = catalog
+        .products
+        .iter()
+        .map(|product| SatLayerOption {
+            slug: product.id.clone(),
+            label: product.title.clone(),
+            note: format!(
+                "rw-server native · {} · {} km",
+                product
+                    .required_channels
+                    .iter()
+                    .map(|channel| format!("C{channel:02}"))
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                product.native_resolution_km
+            ),
+        })
+        .collect();
+    (satellites, sectors, layers)
+}
+
 #[derive(Default)]
 struct WorkerState {
     grids: HashMap<(String, String), GridInfo>,
+    /// Last validated GOES control spec. Local scans use it to publish a
+    /// logical multi-channel product timeline containing only exact-complete
+    /// HHMMs, rather than exposing each component band's preview timeline.
+    active_spec: Option<SatFollowSpec>,
     /// User-selected IR enhancement, applied at frame-coloring time.
     ir_enhancement: IrEnhancement,
     /// The most recently served MAP/native-plot grid, content-addressed by
@@ -1173,6 +2807,7 @@ struct WorkerState {
     /// steady-state memory is unchanged). Player-only sessions never pay for
     /// it.
     map_grid: Option<Arc<GridFile>>,
+    remote: Option<RemoteWorker>,
 }
 
 struct ColoredSatFrame {
@@ -1184,17 +2819,517 @@ struct ColoredSatFrame {
     legacy: bool,
 }
 
-/// Frame + run grid for the radar-map layer. Map playback re-requests a
-/// frame per step, so the run grid is served from the content-addressed
-/// `WorkerState::map_grid` cache — the per-frame ~240 MB full-disk
-/// `grid.rwg` read + sha256 only happens when the grid identity actually
-/// changes (a different product/sector), never between frames of a run.
+/// Resolve retained native GOES data before touching the `.rws` preview.
+/// This ordering is important: a full-disk preview grid can be hundreds of
+/// megabytes, while the native map renderer only needs the small exact-source
+/// manifest here and windowed source reads later.
 fn load_frame_for_map(
     state: &mut WorkerState,
     store_root: &Path,
     key: &SatRunKey,
     hhmm: u16,
+    requested_native_product: Option<&str>,
 ) -> Result<SatMapFrame, String> {
+    let remote_revision = state
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.exact_revision(key, hhmm));
+    if let Some(native) = resolve_native_map_source(store_root, key, hhmm, requested_native_product)
+    {
+        // A remote run may have the same platform/minute as a locally
+        // retained source. Prefer the zero-network local path only when it is
+        // the exact same source revision; never swap different bytes under a
+        // server timeline identity.
+        if remote_revision
+            .as_ref()
+            .is_none_or(|revision| revision == &native.source_revision)
+        {
+            if remote_revision.is_some()
+                && state
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.exact_revision(key, hhmm))
+                    != remote_revision
+            {
+                return Err(format!(
+                    "rw-server satellite frame {key} {hhmm:04}Z changed revision while the local native source was resolving; retrying is required"
+                ));
+            }
+            return Ok(SatMapFrame {
+                key: key.clone(),
+                hhmm,
+                native: Some(native),
+                remote: None,
+                preview: None,
+            });
+        }
+    }
+
+    if let Some(remote) = state.remote.as_ref() {
+        if let Some(source) = remote.map_source(key, hhmm)? {
+            return Ok(SatMapFrame {
+                key: key.clone(),
+                hhmm,
+                native: None,
+                remote: Some(source),
+                preview: None,
+            });
+        }
+    }
+
+    if strict_native_product_requested(key, requested_native_product) {
+        return Err(format!(
+            "selected satellite product '{}' is not complete for {key} {hhmm:04}Z; refusing to display a scalar component as the product",
+            requested_native_product.unwrap_or_default()
+        ));
+    }
+
+    let preview = load_preview_frame_for_map(state, store_root, key, hhmm)?;
+    Ok(SatMapFrame {
+        key: key.clone(),
+        hhmm,
+        native: None,
+        remote: None,
+        preview: Some(preview),
+    })
+}
+
+/// Visible quicklook color used for an on-Earth pixel where a daylight-only
+/// product is transparent. This is deliberately applied only to the bounded
+/// Full disk player preview: exact map tiles retain the selected product's
+/// source alpha. Keeping space transparent while making night nearly black
+/// lets the player show the complete circular Earth rather than an apparently
+/// clipped daylight half-disk.
+const FULL_DISK_NIGHT_QUICKLOOK: [u8; 4] = [3, 5, 8, 255];
+
+fn full_disk_quicklook_pixel(
+    rgba: [u8; 4],
+    on_earth: bool,
+    product: Option<GoesAbiProduct>,
+    scan_start_unix: Option<i64>,
+    latitude_deg: f64,
+    longitude_deg: f64,
+) -> [u8; 4] {
+    let known_daylight_product_night = product.is_some_and(GoesAbiProduct::daylight_only)
+        && scan_start_unix
+            .and_then(|time| rw_sat::solar::solar_elevation_deg(time, latitude_deg, longitude_deg))
+            .is_some_and(|elevation| elevation <= 0.0);
+    if on_earth && rgba[3] == 0 && known_daylight_product_night {
+        FULL_DISK_NIGHT_QUICKLOOK
+    } else {
+        rgba
+    }
+}
+
+/// Render the complete selected GOES product as a bounded fixed-grid overview
+/// for the saved-loop player. The radar map keeps streaming higher XYZ zooms
+/// from the same retained native sources; this preview is deliberately small
+/// enough to animate without baking another giant full-disk raster.
+fn load_native_product_overview(
+    store_root: &Path,
+    key: &SatRunKey,
+    hhmm: u16,
+    product: GoesAbiProduct,
+) -> Result<ColoredSatFrame, String> {
+    let started = Instant::now();
+    let product_slug = product.slug();
+    let source = resolve_native_map_source(store_root, key, hhmm, Some(&product_slug)).ok_or_else(
+        || {
+            format!(
+                "selected satellite product '{}' is not complete for {key} {hhmm:04}Z; refusing to display a scalar component as the product",
+                product.title()
+            )
+        },
+    )?;
+    if source.product != product {
+        return Err(format!(
+            "selected satellite product '{}' resolved as '{}' for {key} {hhmm:04}Z",
+            product.slug(),
+            source.product.slug()
+        ));
+    }
+    let resolved = resolve_native_frame_with_revision(
+        store_root,
+        &source.platform,
+        &source.sector,
+        product,
+        &source.frame_id,
+    )
+    .map_err(|error| format!("resolve native satellite overview: {error}"))?;
+    if resolved.source_revision != source.source_revision {
+        return Err(format!(
+            "native satellite frame {key} {hhmm:04}Z changed revision before its product overview rendered; retrying is required"
+        ));
+    }
+    let (product_scan_start_unix, _) = synchronized_native_product_scan(&resolved.frame, product)
+        .ok_or_else(|| {
+            format!(
+                "selected satellite product '{}' has channels from different ABI scan intervals for {key} {hhmm:04}Z; refusing to mix them",
+                product.title()
+            )
+        })?;
+
+    // Render on the ABI fixed grid itself so Full disk remains the familiar
+    // square image containing a complete circular earth limb. Web-Mercator
+    // z1 tiles are correct for the map but stretch the disk into a tall strip
+    // in a standalone viewer. One shared stride keeps this bounded while all
+    // zoomed map detail still comes from the unmodified native NetCDF.
+    const OVERVIEW_MAX_CELLS: usize = 1_048_576;
+    let mut scenes = HashMap::<u8, GoesAbiScene>::new();
+    for &channel in product.required_channels() {
+        let channel_source = resolved
+            .frame
+            .channels
+            .get(&channel)
+            .ok_or_else(|| format!("native product is missing ABI C{channel:02}"))?;
+        let path = resolved
+            .frame
+            .channel_path(store_root, channel)
+            .map_err(|error| error.to_string())?;
+        let scene = read_goes_abi_scene_with_identity(&path, &channel_source.object_key)
+            .map_err(|error| error.to_string())?;
+        if scene.channel != Some(channel) {
+            return Err(format!(
+                "native product maps ABI C{channel:02} to {}",
+                channel_source.object_key
+            ));
+        }
+        scenes.insert(channel, scene);
+    }
+    let base_channel = product.base_channel();
+    let native_base = scenes
+        .get(&base_channel)
+        .ok_or_else(|| format!("native product has no base ABI C{base_channel:02}"))?;
+    let stride = automatic_preview_stride(
+        native_base.fixed_grid.nx,
+        native_base.fixed_grid.ny,
+        OVERVIEW_MAX_CELLS,
+    )
+    .max(1);
+    let mut fields = HashMap::<u8, GoesAbiField>::new();
+    for (&channel, scene) in &scenes {
+        fields.insert(
+            channel,
+            read_goes_abi_field_strided_from_scene(scene, "CMI", stride)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let base_scene = fields
+        .get(&base_channel)
+        .ok_or_else(|| format!("native product has no decoded base ABI C{base_channel:02}"))?
+        .scene
+        .clone();
+    let (nx, ny) = (base_scene.fixed_grid.nx, base_scene.fixed_grid.ny);
+    let len = nx.saturating_mul(ny);
+    let mut planes = HashMap::<u8, Vec<f32>>::new();
+    for (&channel, field) in &fields {
+        planes.insert(
+            channel,
+            values_on_base_grid(field, &base_scene).map_err(|error| error.to_string())?,
+        );
+    }
+    let (latitudes, longitudes) = base_scene.lat_lon_mesh();
+    if latitudes.len() != len || longitudes.len() != len {
+        return Err(format!(
+            "native product geolocation length mismatch for {nx}x{ny} overview"
+        ));
+    }
+    let mut grid_pixels = Vec::with_capacity(len);
+    for index in 0..len {
+        let latitude = latitudes[index];
+        let longitude = longitudes[index];
+        let on_earth = latitude.is_finite() && longitude.is_finite();
+        let rgba = if !on_earth {
+            [0, 0, 0, 0]
+        } else {
+            rw_sat::product_render::render_product_pixel(
+                product,
+                product_scan_start_unix,
+                f64::from(latitude),
+                f64::from(longitude),
+                |channel| {
+                    planes
+                        .get(&channel)
+                        .and_then(|values| values.get(index))
+                        .copied()
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("native overview has no ABI C{channel:02} value"),
+                            )
+                            .into()
+                        })
+                },
+            )
+            .map_err(|error| error.to_string())?
+        };
+        let rgba = full_disk_quicklook_pixel(
+            rgba,
+            on_earth && source.sector == "fulldisk",
+            Some(product),
+            Some(product_scan_start_unix),
+            f64::from(latitude),
+            f64::from(longitude),
+        );
+        grid_pixels.push(Color32::from_rgba_unmultiplied(
+            rgba[0], rgba[1], rgba[2], rgba[3],
+        ));
+    }
+    let top_lat = latitudes
+        .iter()
+        .take(nx)
+        .copied()
+        .find(|lat| lat.is_finite());
+    let bottom_lat = latitudes
+        .iter()
+        .skip(len.saturating_sub(nx))
+        .copied()
+        .find(|lat| lat.is_finite());
+    let flip_rows = top_lat
+        .zip(bottom_lat)
+        .is_some_and(|(top, bottom)| top < bottom);
+    let image = fixed_grid_overview_image(nx, ny, grid_pixels, flip_rows)?;
+
+    let revision_after = resolve_native_frame_with_revision(
+        store_root,
+        &source.platform,
+        &source.sector,
+        product,
+        &source.frame_id,
+    )
+    .map_err(|error| format!("revalidate native satellite overview: {error}"))?
+    .source_revision;
+    if revision_after != source.source_revision {
+        return Err(format!(
+            "native satellite frame {key} {hhmm:04}Z changed revision while its product overview was rendering; retrying is required"
+        ));
+    }
+    Ok(ColoredSatFrame {
+        frame: SatFrameImage {
+            key: key.clone(),
+            hhmm,
+            image,
+            read_ms: started.elapsed().as_secs_f32() * 1_000.0,
+        },
+        legacy: false,
+    })
+}
+
+fn fixed_grid_overview_image(
+    nx: usize,
+    ny: usize,
+    grid_pixels: Vec<Color32>,
+    flip_rows: bool,
+) -> Result<ColorImage, String> {
+    if grid_pixels.len() != nx.saturating_mul(ny) {
+        return Err(format!(
+            "native overview pixel length {} does not match {nx}x{ny}",
+            grid_pixels.len()
+        ));
+    }
+    if !flip_rows {
+        return Ok(ColorImage::new([nx, ny], grid_pixels));
+    }
+    let mut pixels = Vec::with_capacity(grid_pixels.len());
+    for row in (0..ny).rev() {
+        pixels.extend_from_slice(&grid_pixels[row * nx..(row + 1) * nx]);
+    }
+    Ok(ColorImage::new([nx, ny], pixels))
+}
+
+/// Build the player texture from four exact, revisioned z1 server tiles. This
+/// is a bounded 512x512-style world overview, never a fake substitute for map
+/// resolution: the map itself keeps the exact TileJSON source and streams the
+/// appropriate zoom tiles on demand.
+fn load_remote_source_frame(
+    source: RemoteSatMapSource,
+    key: &SatRunKey,
+    hhmm: u16,
+) -> Result<ColoredSatFrame, String> {
+    let started = Instant::now();
+    const PREVIEW_ZOOM: u8 = 1;
+    if PREVIEW_ZOOM < source.tile_source.min_zoom || PREVIEW_ZOOM > source.tile_source.max_zoom {
+        return Err(format!(
+            "rw-server frame does not expose bounded z{PREVIEW_ZOOM} preview tiles"
+        ));
+    }
+
+    // The transport's shared TransferGate defaults to two concurrent
+    // downloads and rejects excess work instead of queueing it. Fetch these
+    // four bounded preview tiles serially; map rendering can still schedule
+    // viewport work through its own bounded pipeline, and every result lands
+    // in the shared immutable tile cache below.
+    let mut fetched = Vec::with_capacity(4);
+    for y in 0..2_u32 {
+        for x in 0..2_u32 {
+            fetched.push((x, y, source.fetch_tile_png(PREVIEW_ZOOM, x, y)?));
+        }
+    }
+    let world = stitch_remote_preview_tiles(source.tile_source.tile_size, &fetched)?;
+    let image = if source
+        .tile_source
+        .cache_identity
+        .sector
+        .eq_ignore_ascii_case("fulldisk")
+    {
+        remote_goes_full_disk_quicklook(
+            &world,
+            &source.tile_source.cache_identity.platform,
+            source.preview_product,
+            source.scan_start_unix,
+        )?
+    } else {
+        world
+    };
+    Ok(ColoredSatFrame {
+        frame: SatFrameImage {
+            key: key.clone(),
+            hhmm,
+            image,
+            read_ms: started.elapsed().as_secs_f32() * 1_000.0,
+        },
+        legacy: false,
+    })
+}
+
+fn stitch_remote_preview_tiles(
+    tile_size: u32,
+    tiles: &[(u32, u32, Arc<Vec<u8>>)],
+) -> Result<ColorImage, String> {
+    if tiles.len() != 4 || tile_size == 0 {
+        return Err("rw-server satellite preview tile set is incomplete".to_owned());
+    }
+    let edge = tile_size
+        .checked_mul(2)
+        .ok_or_else(|| "rw-server satellite preview dimensions overflow".to_owned())?;
+    let mut mosaic = image::RgbaImage::new(edge, edge);
+    let mut seen = [[false; 2]; 2];
+    for (x, y, png) in tiles {
+        if *x >= 2 || *y >= 2 || seen[*y as usize][*x as usize] {
+            return Err("rw-server satellite preview tile coordinate is invalid".to_owned());
+        }
+        let tile = image::load_from_memory_with_format(png.as_slice(), image::ImageFormat::Png)
+            .map_err(|error| format!("decode rw-server satellite preview PNG: {error}"))?
+            .to_rgba8();
+        if tile.width() != tile_size || tile.height() != tile_size {
+            return Err("rw-server satellite preview PNG dimensions changed".to_owned());
+        }
+        image::imageops::replace(
+            &mut mosaic,
+            &tile,
+            i64::from(*x * tile_size),
+            i64::from(*y * tile_size),
+        );
+        seen[*y as usize][*x as usize] = true;
+    }
+    Ok(ColorImage::from_rgba_unmultiplied(
+        [edge as usize, edge as usize],
+        mosaic.as_raw(),
+    ))
+}
+
+/// Reproject the bounded Web-Mercator tile mosaic into the GOES ABI fixed-grid
+/// view expected by a Full disk player. The source remains the exact,
+/// revision-bound rw-server tile product; this changes only the quicklook
+/// geometry. Map display continues to stream the original XYZ tiles.
+fn remote_goes_full_disk_quicklook(
+    world: &ColorImage,
+    platform: &str,
+    product: Option<GoesAbiProduct>,
+    scan_start_unix: i64,
+) -> Result<ColorImage, String> {
+    let sub_lon_deg = nominal_goes_subsatellite_longitude(platform)
+        .ok_or_else(|| format!("unknown GOES full-disk platform '{platform}'"))?;
+    if world.size[0] == 0 || world.size[0] != world.size[1] {
+        return Err("rw-server full-disk preview mosaic is not square".to_owned());
+    }
+
+    // NOAA ABI fixed grids span approximately +/-0.151844 rad. A tiny margin
+    // prevents the circular limb from being clipped by output pixel centers.
+    const ABI_FULL_DISK_SCAN_LIMIT_RAD: f64 = 0.151_872;
+    const ABI_HEIGHT_M: f64 = 35_786_023.0;
+    const GRS80_SEMI_MAJOR_M: f64 = 6_378_137.0;
+    const GRS80_SEMI_MINOR_M: f64 = 6_356_752.314_14;
+
+    let edge = world.size[0];
+    let mut pixels = Vec::with_capacity(edge.saturating_mul(edge));
+    for row in 0..edge {
+        let y_fraction = (row as f64 + 0.5) / edge as f64;
+        let y_rad = ABI_FULL_DISK_SCAN_LIMIT_RAD * (1.0 - 2.0 * y_fraction);
+        for column in 0..edge {
+            let x_fraction = (column as f64 + 0.5) / edge as f64;
+            let x_rad = ABI_FULL_DISK_SCAN_LIMIT_RAD * (2.0 * x_fraction - 1.0);
+            let Some((latitude, longitude)) = scan_angles_to_lat_lon(
+                ABI_HEIGHT_M,
+                GRS80_SEMI_MAJOR_M,
+                GRS80_SEMI_MINOR_M,
+                sub_lon_deg,
+                SweepAngleAxis::X,
+                x_rad,
+                y_rad,
+            ) else {
+                pixels.push(Color32::TRANSPARENT);
+                continue;
+            };
+            let sampled =
+                sample_web_mercator_quicklook(world, f64::from(latitude), f64::from(longitude));
+            let rgba = sampled.to_array();
+            let rgba = full_disk_quicklook_pixel(
+                rgba,
+                true,
+                product,
+                Some(scan_start_unix),
+                f64::from(latitude),
+                f64::from(longitude),
+            );
+            pixels.push(Color32::from_rgba_unmultiplied(
+                rgba[0], rgba[1], rgba[2], rgba[3],
+            ));
+        }
+    }
+    Ok(ColorImage::new([edge, edge], pixels))
+}
+
+fn nominal_goes_subsatellite_longitude(platform: &str) -> Option<f64> {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "g16" | "goes16" | "goes-16" | "g19" | "goes19" | "goes-19" => {
+            Some(crate::sat_window::GOES_EAST_SUB_LON_DEG)
+        }
+        "g17" | "goes17" | "goes-17" | "g18" | "goes18" | "goes-18" => {
+            Some(crate::sat_window::GOES_WEST_SUB_LON_DEG)
+        }
+        _ => None,
+    }
+}
+
+fn sample_web_mercator_quicklook(
+    world: &ColorImage,
+    latitude_deg: f64,
+    longitude_deg: f64,
+) -> Color32 {
+    const WEB_MERCATOR_MAX_LAT: f64 = 85.051_128_779_806_6;
+    let width = world.size[0];
+    let height = world.size[1];
+    let longitude = ((longitude_deg + 180.0).rem_euclid(360.0)) - 180.0;
+    let latitude = latitude_deg.clamp(-WEB_MERCATOR_MAX_LAT, WEB_MERCATOR_MAX_LAT);
+    let x_fraction = (longitude + 180.0) / 360.0;
+    let y_fraction = (1.0 - latitude.to_radians().tan().asinh() / std::f64::consts::PI) * 0.5;
+    let x = ((x_fraction * width as f64).floor() as usize).min(width.saturating_sub(1));
+    let y = ((y_fraction * height as f64).floor() as usize).min(height.saturating_sub(1));
+    world[(x, y)]
+}
+
+/// Load the bounded `.rws` fallback. Kept separate from native resolution so
+/// tests and explicit preview tools can exercise this representation without
+/// weakening the native-first production map path.
+fn load_preview_frame_for_map(
+    state: &mut WorkerState,
+    store_root: &Path,
+    key: &SatRunKey,
+    hhmm: u16,
+) -> Result<SatMapPreview, String> {
+    // Map playback re-requests a frame per step, so the run grid is served
+    // from the content-addressed WorkerState cache.
     let colored = load_colored_frame(state, store_root, key, hhmm, true)?;
     let run_dir = store_root.join(&key.model).join(&key.run);
     // Present after any successful load (the frame/run hash agreement check
@@ -1212,13 +3347,215 @@ fn load_frame_for_map(
         colored.frame.image.size[0],
         colored.frame.image.size[1],
     )?;
-    Ok(SatMapFrame {
-        key: key.clone(),
-        hhmm,
+    Ok(SatMapPreview {
         image: colored.frame.image,
         grid,
         flip_rows,
     })
+}
+
+fn strict_native_product_requested(key: &SatRunKey, requested_product: Option<&str>) -> bool {
+    !key.run.contains("_rgb_")
+        && requested_product
+            .and_then(GoesAbiProduct::parse)
+            .is_some_and(|product| product.required_channels().len() > 1)
+}
+
+/// A minute-granular archive directory may contain channels from distinct ABI
+/// scans (or a republished Meso granule) whose start seconds differ. Presence
+/// alone is therefore not product completeness. A named product is renderable
+/// only when every required channel has the exact same scan interval.
+fn synchronized_native_product_scan(
+    frame: &NativeSatelliteFrame,
+    product: GoesAbiProduct,
+) -> Option<(i64, i64)> {
+    let mut required = product.required_channels().iter();
+    let first = frame.channels.get(required.next()?)?;
+    let interval = (first.scan_start_unix, first.scan_end_unix);
+    required
+        .all(|channel| {
+            frame
+                .channels
+                .get(channel)
+                .is_some_and(|source| (source.scan_start_unix, source.scan_end_unix) == interval)
+        })
+        .then_some(interval)
+}
+
+/// Turn any component run written by a named multi-channel product into the
+/// one stable run key the player uses as its timeline carrier. The base
+/// channel is already the product's output grid (C02 for GeoColor), so this
+/// also gives the listing honest dimensions without exposing three separate
+/// grayscale runs under one product selection.
+fn native_product_carrier_key(key: &SatRunKey, product: GoesAbiProduct) -> Option<SatRunKey> {
+    let required = product.required_channels();
+    if required.len() <= 1 || key.run.contains("_rgb_") {
+        return None;
+    }
+    let base = format!("c{:02}", product.base_channel());
+    let mut replaced = false;
+    let mut tokens = key
+        .run
+        .split('_')
+        .map(|token| {
+            let component = token
+                .strip_prefix('c')
+                .filter(|raw| raw.len() == 2)
+                .and_then(|raw| raw.parse::<u8>().ok());
+            if !replaced && component.is_some_and(|channel| required.contains(&channel)) {
+                replaced = true;
+                base.clone()
+            } else {
+                token.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    if !replaced {
+        return None;
+    }
+    let day_index = tokens
+        .iter()
+        .position(|token| token.len() == 8 && token.bytes().all(|byte| byte.is_ascii_digit()))?;
+    tokens.insert(day_index, "rwproduct".to_owned());
+    tokens.insert(day_index + 1, product.slug());
+    Some(SatRunKey {
+        model: key.model.clone(),
+        run: tokens.join("_"),
+    })
+}
+
+/// Resolve the best exact native product for a stored GOES preview. Named
+/// product requests win for ordinary per-band follow runs; baked `_rgb_` runs
+/// carry their own recipe identity and therefore win over an unrelated panel
+/// selection. A requested multi-channel product is strict: if even one exact
+/// component is missing, returning the scalar carrier would silently turn
+/// GeoColor into grayscale under a GeoColor label.
+fn resolve_native_map_source(
+    store_root: &Path,
+    key: &SatRunKey,
+    hhmm: u16,
+    requested_product: Option<&str>,
+) -> Option<NativeSatMapSource> {
+    let platform = GoesSatellite::parse(&key.model)
+        .as_str()
+        .to_ascii_lowercase();
+    if !matches!(platform.as_str(), "g16" | "g18" | "g19") {
+        return None;
+    }
+    let sector = native_sector_for_run(&key.run)?;
+    let day = run_day(&key.run)?;
+    let frame_id = format!("{}T{hhmm:04}", day.format("%Y%m%d"));
+
+    let mut candidates = Vec::new();
+    let baked = native_products_for_baked_run(&key.run);
+    let strict_named_product = baked.is_empty()
+        && requested_product
+            .and_then(GoesAbiProduct::parse)
+            .is_some_and(|product| product.required_channels().len() > 1);
+    if !baked.is_empty() {
+        candidates.extend(baked);
+    } else if let Some(product) = requested_product.and_then(GoesAbiProduct::parse) {
+        candidates.push(product);
+    }
+    if !strict_named_product && let Some(raw) = raw_product_for_run(&key.run) {
+        candidates.push(raw);
+    }
+    candidates.dedup();
+
+    for product in candidates {
+        if let Ok(resolved) =
+            resolve_native_frame_with_revision(store_root, &platform, &sector, product, &frame_id)
+        {
+            if synchronized_native_product_scan(&resolved.frame, product).is_none() {
+                continue;
+            }
+            let coverage_center_e6 = product.required_channels().first().and_then(|channel| {
+                let source = resolved.frame.channels.get(channel)?;
+                let path = resolved.frame.channel_path(store_root, *channel).ok()?;
+                let scene = read_goes_abi_scene_with_identity(&path, &source.object_key).ok()?;
+                let x = *scene.fixed_grid.x_scan_rad.get(scene.fixed_grid.nx / 2)?;
+                let y = *scene.fixed_grid.y_scan_rad.get(scene.fixed_grid.ny / 2)?;
+                let (latitude, longitude) = scene.projection.scan_angles_to_lat_lon(x, y)?;
+                Some([
+                    (latitude * 1_000_000.0).round() as i32,
+                    (longitude * 1_000_000.0).round() as i32,
+                ])
+            });
+            return Some(NativeSatMapSource {
+                store_root: store_root.to_path_buf(),
+                platform,
+                sector,
+                product,
+                frame_id: resolved.frame.frame_id,
+                source_revision: resolved.source_revision,
+                coverage_center_e6,
+            });
+        }
+    }
+    None
+}
+
+fn native_sector_for_run(run: &str) -> Option<String> {
+    [
+        Sector::FullDisk,
+        Sector::Conus,
+        Sector::Meso1,
+        Sector::Meso2,
+    ]
+    .into_iter()
+    .find_map(|sector| {
+        let slug = sector.slug();
+        (run == slug || run.starts_with(&format!("{slug}_"))).then(|| slug.to_owned())
+    })
+}
+
+fn raw_product_for_run(run: &str) -> Option<GoesAbiProduct> {
+    run.split('_').find_map(|token| {
+        let channel = token
+            .strip_prefix('c')
+            .filter(|raw| raw.len() == 2)
+            .and_then(|raw| raw.parse::<u8>().ok())?;
+        (1..=16)
+            .contains(&channel)
+            .then_some(GoesAbiProduct::RawChannel(channel))
+    })
+}
+
+fn native_products_for_baked_run(run: &str) -> Vec<GoesAbiProduct> {
+    if let Some(marker) = run.find("_rgb_ir") {
+        let band = run[marker + "_rgb_ir".len()..]
+            .split('_')
+            .next()
+            .and_then(|raw| raw.parse::<u8>().ok());
+        return band
+            .filter(|band| (1..=16).contains(band))
+            .map(|band| {
+                vec![
+                    GoesAbiProduct::EnhancedInfrared,
+                    GoesAbiProduct::RawChannel(band),
+                ]
+            })
+            .unwrap_or_default();
+    }
+    for style in GoesAbiRgbCompositeStyle::ALL {
+        let marker = format!("_rgb_{}_", style.slug());
+        if !run.contains(&marker) {
+            continue;
+        }
+        return match style {
+            GoesAbiRgbCompositeStyle::GeoColor => vec![
+                GoesAbiProduct::GeoColor,
+                GoesAbiProduct::SharpenedTrueColor,
+                GoesAbiProduct::TrueColor,
+            ],
+            GoesAbiRgbCompositeStyle::NaturalColor => vec![
+                GoesAbiProduct::SharpenedTrueColor,
+                GoesAbiProduct::TrueColor,
+            ],
+            _ => GoesAbiProduct::parse(style.slug()).into_iter().collect(),
+        };
+    }
+    Vec::new()
 }
 
 /// Open/reuse the full geolocation grid for a map or native-plot frame.
@@ -2140,6 +4477,15 @@ fn map_event(event: SatEvent, current_key: &mut Option<String>) -> Vec<SatRespon
                 bytes,
             }]
         }
+        SatEvent::DownloadProgress {
+            key,
+            received_bytes,
+            total_bytes,
+        } => vec![SatResponse::DownloadProgress {
+            id: key,
+            received_bytes,
+            total_bytes,
+        }],
         SatEvent::DownloadDone {
             key, ms, cache_hit, ..
         } => vec![SatResponse::DownloadDone {
@@ -2147,6 +4493,23 @@ fn map_event(event: SatEvent, current_key: &mut Option<String>) -> Vec<SatRespon
             ms,
             cache_hit,
         }],
+        SatEvent::NativeFrameUpdated {
+            frame,
+            committed_channel,
+        } => match native_frame_day_hhmm(&frame.frame_id) {
+            Some((day, hhmm)) => vec![SatResponse::NativeFrameUpdated {
+                key: SatRunKey {
+                    model: frame.platform,
+                    run: format!("{}_c{committed_channel:02}_{day}", frame.sector),
+                },
+                hhmm,
+                committed_channel,
+            }],
+            None => vec![SatResponse::Note(format!(
+                "native {}/{}/{} committed C{committed_channel:02}, but its exact frame id is invalid",
+                frame.platform, frame.sector, frame.frame_id
+            ))],
+        },
         SatEvent::FrameWritten {
             model,
             run,
@@ -4422,7 +6785,7 @@ fn ingest_one_himawari_composite(
     let (r, g, b) = compose_ahi_true_color(style, &planes, len)?;
     drop(planes);
     let source_dims = (nx, ny);
-    let target_dims = grid_dims_within_cell_limit(nx, ny, MAX_GRID_CELLS)?;
+    let target_dims = grid_dims_within_cell_limit(nx, ny, SAT_PREVIEW_MAX_CELLS)?;
     if target_dims != source_dims {
         send(SatResponse::Note(format!(
             "Himawari composite: fitting {}x{} source to {}x{} store-safe high-resolution grid",
@@ -4430,7 +6793,7 @@ fn ingest_one_himawari_composite(
         )));
     }
     let (base_scene, (r, g, b)) =
-        fit_himawari_composite_to_cell_limit(base_scene, (r, g, b), MAX_GRID_CELLS)?;
+        fit_himawari_composite_to_cell_limit(base_scene, (r, g, b), SAT_PREVIEW_MAX_CELLS)?;
     let (nx, ny) = (base_scene.fixed_grid.nx, base_scene.fixed_grid.ny);
     let len = nx.saturating_mul(ny);
     debug_assert_eq!((nx, ny), target_dims);
@@ -4894,12 +7257,33 @@ fn ingest_one_goes_composite(
             ms: started.elapsed().as_millis(),
             cache_hit: downloaded.cache_hit,
         });
+        // Native archival is the durable ingest boundary. The `.rws`
+        // composite below is only a bounded player preview and must never be
+        // the highest-resolution copy BowEcho retains.
+        let source_scene = read_goes_abi_scene_with_identity(&downloaded.path, &object.key)
+            .map_err(|error| error.to_string())?;
+        let native_frame =
+            archive_goes_source(store_root, &downloaded.path, &source_scene, &object.key)
+                .map_err(|error| error.to_string())?;
+        send(SatResponse::Note(format!(
+            "native {}/{}/{} retained C{band:02} at full source resolution",
+            native_frame.platform, native_frame.sector, native_frame.frame_id
+        )));
         let field = match window {
             Some(window) => read_goes_abi_window(&downloaded.path, window)?,
-            None => downsample_field(
-                read_goes_abi_field(&downloaded.path, "CMI").map_err(|err| err.to_string())?,
-                downsample,
-            ),
+            None => {
+                let stride = bounded_bowecho_preview_stride(
+                    source_scene.fixed_grid.nx,
+                    source_scene.fixed_grid.ny,
+                    downsample,
+                );
+                let mut archived_scene = source_scene;
+                archived_scene.path = native_frame
+                    .channel_path(store_root, band)
+                    .map_err(|error| error.to_string())?;
+                read_goes_abi_field_strided_from_scene(&archived_scene, "CMI", stride)
+                    .map_err(|error| error.to_string())?
+            }
         };
         fields.insert(band, field);
     }
@@ -5106,6 +7490,15 @@ fn ingest_one_goes_ir_window(
         ms: started.elapsed().as_millis(),
         cache_hit: downloaded.cache_hit,
     });
+    let source_scene = read_goes_abi_scene_with_identity(&downloaded.path, &object.key)
+        .map_err(|error| error.to_string())?;
+    let native_frame =
+        archive_goes_source(store_root, &downloaded.path, &source_scene, &object.key)
+            .map_err(|error| error.to_string())?;
+    send(SatResponse::Note(format!(
+        "native {}/{}/{} retained C{band:02} at full source resolution",
+        native_frame.platform, native_frame.sector, native_frame.frame_id
+    )));
     let field = read_goes_abi_window(&downloaded.path, window)?;
 
     let len = field.values.len();
@@ -6172,11 +8565,21 @@ pub(crate) fn fetch_native_satellite_archive_frame(
                     true,
                 )
                 .map_err(|error| error.to_string())?;
-                let field = downsample_field(
-                    read_goes_abi_field(&downloaded.path, "CMI")
-                        .map_err(|error| error.to_string())?,
-                    4,
-                );
+                let mut scene = read_goes_abi_scene_with_identity(&downloaded.path, &object.key)
+                    .map_err(|error| error.to_string())?;
+                let native = archive_goes_source(store_root, &downloaded.path, &scene, &object.key)
+                    .map_err(|error| error.to_string())?;
+                note(format!(
+                    "Retained native {}/{}/{} C{band:02} at full source resolution",
+                    native.platform, native.sector, native.frame_id
+                ));
+                scene.path = native
+                    .channel_path(store_root, band)
+                    .map_err(|error| error.to_string())?;
+                let stride =
+                    bounded_bowecho_preview_stride(scene.fixed_grid.nx, scene.fixed_grid.ny, 4);
+                let field = read_goes_abi_field_strided_from_scene(&scene, "CMI", stride)
+                    .map_err(|error| error.to_string())?;
                 native_stored(
                     write_band_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)
                         .map_err(|error| error.to_string())?,
@@ -6352,19 +8755,29 @@ fn stored_from_recent(
 
 fn worker_loop(
     store_root: PathBuf,
+    remote: Option<RemoteSatelliteClient>,
+    remote_init_note: Option<String>,
     requests: &Receiver<SatRequest>,
     responses: &Sender<SatResponse>,
     card_outcomes: &Sender<CardOutcome>,
     notify: &Arc<dyn Fn() + Send + Sync>,
     cancel: &Arc<AtomicBool>,
 ) {
-    let mut state = WorkerState::default();
+    let mut state = WorkerState {
+        remote: remote.map(RemoteWorker::new),
+        ..WorkerState::default()
+    };
     let follow_active = Arc::new(AtomicBool::new(false));
     let send = |response: SatResponse| {
         let ok = responses.send(response).is_ok();
         notify();
         ok
     };
+    if let Some(note) = remote_init_note {
+        if !send(SatResponse::Note(note)) {
+            return;
+        }
+    }
     // Report a card-ticketed one-shot ingest's outcome on the side channel
     // (no-op for unticketed requests — the regular panel buttons).
     let send_card = |ticket: Option<u64>, result: &Result<String, String>| {
@@ -6379,25 +8792,94 @@ fn worker_loop(
     while let Ok(request) = requests.recv() {
         match request {
             SatRequest::Validate(spec) => {
+                state.active_spec = Some(spec.clone());
+                if let Some(remote) = state.remote.as_ref() {
+                    remote.set_spec(spec.clone());
+                }
                 if !send(SatResponse::SpecStatus(spec_summary(&spec))) {
                     return;
                 }
             }
             SatRequest::Scan => {
-                if !send(SatResponse::Runs(scan_runs(&store_root))) {
+                let local = scan_runs_for_player(&store_root, state.active_spec.as_ref());
+                let initial_sent = state.remote.as_ref().map_or_else(
+                    || send(SatResponse::Runs(local.clone())),
+                    |remote| remote.publish_local_and_last_good(local.clone(), responses, notify),
+                );
+                if !initial_sent {
                     return;
+                }
+                if let Some(remote) = state.remote.as_ref() {
+                    remote.request_scan(local, responses.clone(), Arc::clone(notify));
                 }
             }
             SatRequest::ScanAndSelect { key, hhmm } => {
-                if !send(SatResponse::Runs(scan_runs(&store_root))) {
+                let local = scan_runs_for_player(&store_root, state.active_spec.as_ref());
+                let runs_sent = state.remote.as_ref().map_or_else(
+                    || send(SatResponse::Runs(local.clone())),
+                    |remote| remote.publish_local_and_last_good(local.clone(), responses, notify),
+                );
+                if !runs_sent {
                     return;
                 }
                 if !send(SatResponse::SelectFrame { key, hhmm }) {
                     return;
                 }
             }
-            SatRequest::LoadFrame { key, hhmm } => {
-                let result = load_frame(&mut state, &store_root, &key, hhmm);
+            SatRequest::ScanAndSelectNativeProduct { key, hhmm, product } => {
+                let local = scan_runs_for_player(&store_root, state.active_spec.as_ref());
+                let runs_sent = state.remote.as_ref().map_or_else(
+                    || send(SatResponse::Runs(local.clone())),
+                    |remote| remote.publish_local_and_last_good(local.clone(), responses, notify),
+                );
+                if !runs_sent {
+                    return;
+                }
+                let Some(product) = GoesAbiProduct::parse(&product) else {
+                    send(SatResponse::Note(format!(
+                        "unknown retained satellite product '{product}'"
+                    )));
+                    continue;
+                };
+                let Some(carrier) = native_product_carrier_key(&key, product) else {
+                    continue;
+                };
+                // `resolve_native_map_source` is strict for a multi-channel
+                // requested product. Until every exact channel is committed,
+                // publish the refreshed run list but do not select a scalar
+                // component under the product label.
+                if local
+                    .iter()
+                    .any(|run| run.key == carrier && run.frames.iter().any(|frame| *frame == hhmm))
+                    && native_product_frame_is_newest(&local, &carrier, hhmm)
+                    && resolve_native_map_source(&store_root, &carrier, hhmm, Some(&product.slug()))
+                        .is_some()
+                    && !send(SatResponse::SelectFrame { key: carrier, hhmm })
+                {
+                    return;
+                }
+            }
+            SatRequest::LoadFrame {
+                key,
+                hhmm,
+                native_product,
+            } => {
+                if let Some(remote) = state
+                    .remote
+                    .as_ref()
+                    .filter(|remote| remote.contains(&key, hhmm))
+                {
+                    remote.request_preview(key, hhmm, responses.clone(), Arc::clone(notify));
+                    continue;
+                }
+                let result = match native_product
+                    .as_deref()
+                    .and_then(GoesAbiProduct::parse)
+                    .filter(|product| product.required_channels().len() > 1)
+                {
+                    Some(product) => load_native_product_overview(&store_root, &key, hhmm, product),
+                    None => load_frame(&mut state, &store_root, &key, hhmm),
+                };
                 let legacy = result
                     .as_ref()
                     .map(|colored| colored.legacy)
@@ -6411,14 +8893,29 @@ fn worker_loop(
                     return;
                 }
             }
-            SatRequest::LoadFrameForMap { key, hhmm } => {
-                let result = load_frame_for_map(&mut state, &store_root, &key, hhmm);
+            SatRequest::LoadFrameForMap {
+                key,
+                hhmm,
+                native_product,
+            } => {
+                let result = load_frame_for_map(
+                    &mut state,
+                    &store_root,
+                    &key,
+                    hhmm,
+                    native_product.as_deref(),
+                );
                 if !send(SatResponse::MapFrame(Box::new(result))) {
                     return;
                 }
             }
             SatRequest::LoadFrameForPlot { key, hhmm } => {
-                let result = load_frame_for_plot(&mut state, &store_root, &key, hhmm);
+                let result = match state.remote.as_ref() {
+                    Some(remote) if remote.contains(&key, hhmm) => Err(format!(
+                        "{key} {hhmm:04}Z is an rw-server display-only satellite frame; native science values are not exposed by the satellite tile API"
+                    )),
+                    _ => load_frame_for_plot(&mut state, &store_root, &key, hhmm),
+                };
                 if !send(SatResponse::PlotFrame {
                     key,
                     hhmm,
@@ -6617,6 +9114,7 @@ fn worker_loop(
                 }
             }
             SatRequest::LoadLoop(spec) => {
+                state.active_spec = Some(spec.clone());
                 if follow_active.swap(true, Ordering::SeqCst) {
                     send(SatResponse::Note(
                         "a satellite ingest session is already running".to_string(),
@@ -6637,6 +9135,9 @@ fn worker_loop(
                 config.jitter_frac = 0.0;
                 let (model, prefixes) =
                     run_prefixes(&spec).expect("spec validated by follow_config");
+                let usage_sector = config.sector.slug().to_owned();
+                let usage_bands = config.bands.clone();
+                let usage_per_band_max = config.window.max_bytes;
                 cancel.store(false, Ordering::Relaxed);
                 if !send(SatResponse::FollowStarted) {
                     return;
@@ -6644,17 +9145,23 @@ fn worker_loop(
                 send(SatResponse::Note(
                     "GOES loop: loading current-hour frames".to_string(),
                 ));
-                send(SatResponse::DiskUsage(disk_usage(
+                for response in storage_usage_responses(
                     &store_root,
                     &model,
+                    &usage_sector,
+                    &usage_bands,
                     &prefixes,
-                )));
+                    usage_per_band_max,
+                ) {
+                    send(response);
+                }
 
                 let tx = responses.clone();
                 let thread_notify = Arc::clone(notify);
                 let thread_cancel = Arc::clone(cancel);
                 let active = Arc::clone(&follow_active);
                 let root = store_root.clone();
+                let player_spec = spec.clone();
                 let spawned = std::thread::Builder::new()
                     .name("rw-sat-loop-load".to_string())
                     .spawn(move || {
@@ -6662,17 +9169,29 @@ fn worker_loop(
                         let result = {
                             let mut current_key: Option<String> = None;
                             let mut sink = |event: SatEvent| {
+                                // Inventory is a bounded but still O(files)
+                                // traversal. Refresh once after a band's poll
+                                // (plus explicit eviction), not once for both
+                                // the native commit and preview derivative of
+                                // every source.
                                 let usage_due = matches!(
                                     event,
-                                    SatEvent::FrameWritten { .. } | SatEvent::Evicted { .. }
+                                    SatEvent::Evicted { .. } | SatEvent::PollDone { .. }
                                 );
                                 for response in map_event(event, &mut current_key) {
                                     let _ = tx.send(response);
                                 }
                                 if usage_due {
-                                    let _ = tx.send(SatResponse::DiskUsage(disk_usage(
-                                        &root, &model, &prefixes,
-                                    )));
+                                    for response in storage_usage_responses(
+                                        &root,
+                                        &model,
+                                        &usage_sector,
+                                        &usage_bands,
+                                        &prefixes,
+                                        usage_per_band_max,
+                                    ) {
+                                        let _ = tx.send(response);
+                                    }
                                 }
                                 thread_notify();
                             };
@@ -6691,9 +9210,20 @@ fn worker_loop(
                             Err(err) => SatResponse::FollowFinished(Err(err.to_string())),
                         };
                         let _ = tx.send(response);
-                        let _ = tx.send(SatResponse::Runs(scan_runs(&root)));
-                        let _ =
-                            tx.send(SatResponse::DiskUsage(disk_usage(&root, &model, &prefixes)));
+                        let _ = tx.send(SatResponse::Runs(scan_runs_for_player(
+                            &root,
+                            Some(&player_spec),
+                        )));
+                        for response in storage_usage_responses(
+                            &root,
+                            &model,
+                            &usage_sector,
+                            &usage_bands,
+                            &prefixes,
+                            usage_per_band_max,
+                        ) {
+                            let _ = tx.send(response);
+                        }
                         thread_notify();
                     });
                 if let Err(err) = spawned {
@@ -6704,6 +9234,7 @@ fn worker_loop(
                 }
             }
             SatRequest::Follow(spec) => {
+                state.active_spec = Some(spec.clone());
                 if follow_active.swap(true, Ordering::SeqCst) {
                     send(SatResponse::Note(
                         "a follow session is already running".to_string(),
@@ -6720,15 +9251,23 @@ fn worker_loop(
                 };
                 let (model, prefixes) =
                     run_prefixes(&spec).expect("spec validated by follow_config");
+                let usage_sector = config.sector.slug().to_owned();
+                let usage_bands = config.bands.clone();
+                let usage_per_band_max = config.window.max_bytes;
                 cancel.store(false, Ordering::Relaxed);
                 if !send(SatResponse::FollowStarted) {
                     return;
                 }
-                send(SatResponse::DiskUsage(disk_usage(
+                for response in storage_usage_responses(
                     &store_root,
                     &model,
+                    &usage_sector,
+                    &usage_bands,
                     &prefixes,
-                )));
+                    usage_per_band_max,
+                ) {
+                    send(response);
+                }
 
                 let tx = responses.clone();
                 let thread_notify = Arc::clone(notify);
@@ -6743,15 +9282,22 @@ fn worker_loop(
                         let mut sink = |event: SatEvent| {
                             let usage_due = matches!(
                                 event,
-                                SatEvent::FrameWritten { .. } | SatEvent::Evicted { .. }
+                                SatEvent::Evicted { .. } | SatEvent::PollDone { .. }
                             );
                             for response in map_event(event, &mut current_key) {
                                 let _ = tx.send(response);
                             }
                             if usage_due {
-                                let _ = tx.send(SatResponse::DiskUsage(disk_usage(
-                                    &root, &model, &prefixes,
-                                )));
+                                for response in storage_usage_responses(
+                                    &root,
+                                    &model,
+                                    &usage_sector,
+                                    &usage_bands,
+                                    &prefixes,
+                                    usage_per_band_max,
+                                ) {
+                                    let _ = tx.send(response);
+                                }
                             }
                             thread_notify();
                         };
@@ -6769,6 +9315,16 @@ fn worker_loop(
                             Err(err) => SatResponse::FollowFinished(Err(err.to_string())),
                         };
                         let _ = tx.send(response);
+                        for response in storage_usage_responses(
+                            &root,
+                            &model,
+                            &usage_sector,
+                            &usage_bands,
+                            &prefixes,
+                            usage_per_band_max,
+                        ) {
+                            let _ = tx.send(response);
+                        }
                         thread_notify();
                     });
                 if let Err(err) = spawned {
@@ -6869,12 +9425,12 @@ mod tests {
     fn layer_resolution_handles_bands_and_composites() {
         let (bands, desc) = resolve_layer("c13").expect("band layer");
         assert_eq!(bands, vec![13]);
-        assert_eq!(desc, "C13");
+        assert!(desc.contains("C13"), "got: {desc}");
 
         let (bands, desc) = resolve_layer("geocolor").expect("composite layer");
-        assert_eq!(bands, vec![1, 2, 3]);
+        assert_eq!(bands, vec![1, 2, 3, 13]);
         assert!(
-            desc.contains("GeoColor") && desc.contains("C01+C02+C03"),
+            desc.contains("GeoColor") && desc.contains("C01+C02+C03+C13"),
             "got: {desc}"
         );
 
@@ -6888,7 +9444,11 @@ mod tests {
         let summary = spec_summary(&spec()).expect("default spec is valid");
         assert!(summary.contains("g19"), "got: {summary}");
         assert!(summary.contains("conus"), "got: {summary}");
-        assert!(summary.contains("C13"), "got: {summary}");
+        assert!(summary.contains("C01+C02+C03+C13"), "got: {summary}");
+        assert!(
+            summary.contains("automatic bounded preview"),
+            "got: {summary}"
+        );
         assert!(summary.contains("poll ~30 s"), "got: {summary}");
         assert!(summary.contains("keep 6.0 h"), "got: {summary}");
 
@@ -6908,7 +9468,7 @@ mod tests {
         spec.layer = "geocolor".to_string();
         spec.downsample = 2;
         let config = follow_config(&spec, Path::new("sat-root")).expect("valid spec");
-        assert_eq!(config.bands, vec![1, 2, 3]);
+        assert_eq!(config.bands, vec![1, 2, 3, 13]);
         assert_eq!(config.sector, Sector::Conus);
         assert_eq!(
             config.poll_interval,
@@ -6922,22 +9482,27 @@ mod tests {
 
         let (model, prefixes) = run_prefixes(&spec).unwrap();
         assert_eq!(model, "g19");
-        assert_eq!(prefixes, vec!["conus_c01", "conus_c02", "conus_c03"]);
+        assert_eq!(
+            prefixes,
+            vec!["conus_c01", "conus_c02", "conus_c03", "conus_c13"]
+        );
     }
 
     #[test]
-    fn feedback_v03412_live_satellite_picker_only_offers_directly_rendered_bands() {
+    fn live_satellite_picker_matches_rw_sat_server_catalog() {
         let options = layer_options();
-        assert_eq!(options.len(), 16);
+        assert_eq!(options.len(), rw_sat::product_catalog(true).len());
         for option in &options {
             resolve_layer(&option.slug).expect("every picker entry resolves");
-            assert!(
-                option.slug.starts_with('c'),
-                "RGB recipes belong to the separate Load RGB action: {}",
-                option.slug
-            );
         }
-        assert!(options[12].label.contains("Clean IR"), "C13 label");
+        assert_eq!(
+            options.first().map(|option| option.slug.as_str()),
+            Some("geocolor")
+        );
+        assert!(
+            options.iter().any(|option| option.slug == "c13"),
+            "advanced raw channel remains available"
+        );
     }
 
     /// Small synthetic CONUS-ish scene near the sub-satellite point (same
@@ -6982,6 +9547,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_map_resolution_skips_missing_preview_and_grid() {
+        let store = test_dir("native-map-skips-preview");
+        let source = store.join("source-c13.nc");
+        std::fs::write(&source, b"exact retained source fixture").unwrap();
+        let scene = synthetic_field(8, 6, 18, 51, 13).scene;
+        archive_goes_source(
+            &store,
+            &source,
+            &scene,
+            "ABI-L2-CMIPC/2026/161/18/fixture-c13.nc",
+        )
+        .expect("native source archives");
+
+        // There is deliberately no g19/.../t1851.rws or grid.rwg. Success
+        // proves the native manifest resolves before either preview file is
+        // opened.
+        let frame = load_frame_for_map(
+            &mut WorkerState::default(),
+            &store,
+            &SatRunKey {
+                model: "g19".to_owned(),
+                run: "conus_c13_20260610".to_owned(),
+            },
+            1851,
+            Some("enhanced_ir"),
+        )
+        .expect("native-only map frame resolves without a preview store");
+        assert!(frame.native.is_some());
+        assert!(frame.preview.is_none());
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn bowecho_preview_budget_never_becomes_native_resolution() {
+        let stride = bounded_bowecho_preview_stride(21_696, 21_696, 0);
+        assert_eq!(stride, 5, "automatic Full Disk C02 preview is bounded");
+        let preview_cells = 21_696_usize.div_ceil(stride).pow(2);
+        assert!(preview_cells <= SAT_PREVIEW_MAX_CELLS);
+        assert_eq!(
+            bounded_bowecho_preview_stride(21_696, 21_696, 8),
+            8,
+            "an explicitly coarser preview remains allowed"
+        );
+    }
+
+    #[test]
+    fn baked_run_identity_selects_the_matching_native_product() {
+        assert_eq!(
+            native_products_for_baked_run("fulldisk_rgb_geocolor_20260610").first(),
+            Some(&GoesAbiProduct::GeoColor)
+        );
+        assert_eq!(
+            native_products_for_baked_run("conus_win35n097w_rgb_ir13_20260610").first(),
+            Some(&GoesAbiProduct::EnhancedInfrared)
+        );
+        assert_eq!(
+            raw_product_for_run("conus_c02_20260610"),
+            Some(GoesAbiProduct::RawChannel(2))
+        );
+        assert_eq!(
+            native_sector_for_run("meso1_c13_20260610").as_deref(),
+            Some("meso1")
+        );
+    }
+
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rw-sat-worker-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6994,6 +9625,7 @@ mod tests {
             key: key.to_owned(),
             size_bytes: 1,
             last_modified: String::new(),
+            etag: None,
         }
     }
 
@@ -7090,6 +9722,210 @@ mod tests {
         assert_eq!((runs[0].nx, runs[0].ny), (8, 6));
         assert_eq!(runs[1].key.run, "conus_c08_20260610");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incomplete_multichannel_carrier_has_no_selectable_player_frame() {
+        let dir = test_dir("incomplete-native-product-timeline");
+        let spec = SatFollowSpec {
+            satellite: "goes19".to_owned(),
+            sector: "fulldisk".to_owned(),
+            layer: "open_geocolor_v1".to_owned(),
+            ..SatFollowSpec::default()
+        };
+        let runs = vec![SatRunListing {
+            key: SatRunKey {
+                model: "g19".to_owned(),
+                run: "fulldisk_c02_20260826".to_owned(),
+            },
+            title: "C02 only".to_owned(),
+            nx: 8,
+            ny: 8,
+            frames: vec![1600, 1610],
+        }];
+
+        let filtered = local_runs_for_active_product(&dir, runs, Some(&spec));
+        assert!(
+            filtered.is_empty(),
+            "C02 without exact C01/C03 must not create a selectable GeoColor HHMM"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_only_complete_product_creates_timeline_and_commit_refresh() {
+        let dir = test_dir("native-only-product-timeline");
+        let mut completed = None;
+        for channel in [1_u8, 2, 3] {
+            let mut scene = synthetic_field(8, 8, 18, 51, channel).scene;
+            scene.product = "ABI-L2-CMIPF".to_owned();
+            scene.sector = AbiSector::FullDisk;
+            let source = dir.join(format!("source-c{channel:02}.nc"));
+            std::fs::write(&source, [channel; 16]).expect("source fixture");
+            completed = Some(
+                archive_goes_source(&dir, &source, &scene, &format!("fixture/c{channel:02}.nc"))
+                    .expect("archive channel fixture"),
+            );
+        }
+        assert!(
+            !dir.join("g19").exists(),
+            "fixture intentionally has no preview run/grid/.rws carrier"
+        );
+        let spec = SatFollowSpec {
+            satellite: "goes19".to_owned(),
+            sector: "fulldisk".to_owned(),
+            layer: "open_geocolor_v1".to_owned(),
+            ..SatFollowSpec::default()
+        };
+        let listings = local_runs_for_active_product(&dir, Vec::new(), Some(&spec));
+        assert_eq!(listings.len(), 1);
+        assert_eq!(
+            listings[0].key.run,
+            "fulldisk_c02_rwproduct_open_geocolor_v1_20260610"
+        );
+        assert_eq!(listings[0].frames, vec![1851]);
+
+        let responses = map_event(
+            SatEvent::NativeFrameUpdated {
+                frame: completed.expect("completed native frame"),
+                committed_channel: 3,
+            },
+            &mut None,
+        );
+        assert!(matches!(
+            responses.as_slice(),
+            [SatResponse::NativeFrameUpdated {
+                key,
+                hhmm: 1851,
+                committed_channel: 3,
+            }] if key.model == "g19" && key.run == "fulldisk_c03_20260610"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mismatched_channel_scan_intervals_are_not_a_complete_native_product() {
+        let dir = test_dir("mismatched-native-product-scan");
+        for channel in [1_u8, 2, 3] {
+            let mut scene = synthetic_field(8, 8, 18, 51, channel).scene;
+            scene.product = "ABI-L2-CMIPF".to_owned();
+            scene.sector = AbiSector::FullDisk;
+            if channel == 3 {
+                // Same YYYYMMDDTHHMM archive identity, different exact ABI
+                // granule. Channel presence must not make this GeoColor.
+                scene.start_time_utc += chrono::Duration::seconds(7);
+                scene.end_time_utc += chrono::Duration::seconds(7);
+            }
+            let source = dir.join(format!("source-c{channel:02}.nc"));
+            std::fs::write(&source, [channel; 16]).expect("source fixture");
+            archive_goes_source(&dir, &source, &scene, &format!("fixture/c{channel:02}.nc"))
+                .expect("archive channel fixture");
+        }
+
+        let product = GoesAbiProduct::OpenGeoColorV1;
+        let manifest_path = dir
+            .join(".rw-satellite-sources")
+            .join("g19")
+            .join("fulldisk")
+            .join("20260610")
+            .join("20260610T1851")
+            .join("frame.json");
+        let upstream_presence: NativeSatelliteFrame = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("mixed-scan manifest exists"),
+        )
+        .expect("mixed-scan manifest decodes");
+        assert!(
+            synchronized_native_product_scan(&upstream_presence, product).is_none(),
+            "BowEcho must reject a minute bucket made from distinct exact scans"
+        );
+        assert!(
+            resolve_native_frame_with_revision(&dir, "g19", "fulldisk", product, "20260610T1851")
+                .is_err(),
+            "the pinned rw-sat resolver must also reject mixed exact scans"
+        );
+
+        let raw_carrier = SatRunKey {
+            model: "g19".to_owned(),
+            run: "fulldisk_c02_20260610".to_owned(),
+        };
+        assert!(
+            resolve_native_map_source(&dir, &raw_carrier, 1851, Some("open_geocolor_v1")).is_none(),
+            "map/player resolution must not expose a mixed-scan product"
+        );
+        let spec = SatFollowSpec {
+            satellite: "goes19".to_owned(),
+            sector: "fulldisk".to_owned(),
+            layer: "open_geocolor_v1".to_owned(),
+            ..SatFollowSpec::default()
+        };
+        let filtered = local_runs_for_active_product(
+            &dir,
+            vec![SatRunListing {
+                key: raw_carrier,
+                title: "mixed scan carrier".to_owned(),
+                nx: 8,
+                ny: 8,
+                frames: vec![1851],
+            }],
+            Some(&spec),
+        );
+        assert!(
+            filtered.is_empty(),
+            "mixed-scan HHMM must produce no selectable product frame"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_product_carrier_uses_the_base_channel_without_changing_the_day() {
+        let key = SatRunKey {
+            model: "g19".to_owned(),
+            run: "fulldisk_c03_20260826_2".to_owned(),
+        };
+        let carrier = native_product_carrier_key(&key, GoesAbiProduct::OpenGeoColorV1)
+            .expect("component carrier");
+        assert_eq!(carrier.model, "g19");
+        assert_eq!(
+            carrier.run,
+            "fulldisk_c02_rwproduct_open_geocolor_v1_20260826_2"
+        );
+        assert!(strict_native_product_requested(
+            &carrier,
+            Some("open_geocolor_v1")
+        ));
+        assert!(!strict_native_product_requested(&carrier, Some("c02")));
+    }
+
+    #[test]
+    fn repaired_older_native_product_frame_cannot_pull_live_player_backward() {
+        let newest_key = SatRunKey {
+            model: "g19".to_owned(),
+            run: "fulldisk_c02_rwproduct_open_geocolor_v1_20260826".to_owned(),
+        };
+        let older_day_key = SatRunKey {
+            model: "g19".to_owned(),
+            run: "fulldisk_c02_rwproduct_open_geocolor_v1_20260825".to_owned(),
+        };
+        let runs = vec![
+            SatRunListing {
+                key: newest_key.clone(),
+                title: "newest day".to_owned(),
+                nx: 8,
+                ny: 8,
+                frames: vec![1600, 1640],
+            },
+            SatRunListing {
+                key: older_day_key.clone(),
+                title: "older day".to_owned(),
+                nx: 8,
+                ny: 8,
+                frames: vec![2350],
+            },
+        ];
+
+        assert!(native_product_frame_is_newest(&runs, &newest_key, 1640));
+        assert!(!native_product_frame_is_newest(&runs, &newest_key, 1600));
+        assert!(!native_product_frame_is_newest(&runs, &older_day_key, 2350));
     }
 
     #[test]
@@ -7428,8 +10264,10 @@ mod tests {
         write_band_frame(&dir, &synthetic_field(8, 6, 18, 56, 13), 2).unwrap();
 
         let mut state = WorkerState::default();
-        let first = load_frame_for_map(&mut state, &dir, &key, 1851).expect("first map frame");
-        let second = load_frame_for_map(&mut state, &dir, &key, 1856).expect("second map frame");
+        let first =
+            load_preview_frame_for_map(&mut state, &dir, &key, 1851).expect("first map frame");
+        let second =
+            load_preview_frame_for_map(&mut state, &dir, &key, 1856).expect("second map frame");
         assert!(
             Arc::ptr_eq(&first.grid, &second.grid),
             "frames of one run must share ONE opened grid, not re-read ~240 MB per step"
@@ -7447,7 +10285,8 @@ mod tests {
         };
         assert_ne!(key.run, key_b.run, "distinct runs");
         std::fs::remove_file(dir.join(&key_b.model).join(&key_b.run).join("grid.rwg")).unwrap();
-        let cross = load_frame_for_map(&mut state, &dir, &key_b, 1851).expect("cross-run frame");
+        let cross =
+            load_preview_frame_for_map(&mut state, &dir, &key_b, 1851).expect("cross-run frame");
         assert!(
             Arc::ptr_eq(&first.grid, &cross.grid),
             "identical grid content must be served from the cache"
@@ -7457,7 +10296,7 @@ mod tests {
         // A cold worker (empty cache) must still need the file: the cache
         // is an optimization, never a fallback data source.
         let mut cold = WorkerState::default();
-        assert!(load_frame_for_map(&mut cold, &dir, &key_b, 1851).is_err());
+        assert!(load_preview_frame_for_map(&mut cold, &dir, &key_b, 1851).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7472,7 +10311,7 @@ mod tests {
             run: "conus_rgb_natural_color_20260713".to_owned(),
         };
         let mut state = WorkerState::default();
-        let frame = load_frame_for_map(&mut state, &store, &key, 1836)
+        let frame = load_preview_frame_for_map(&mut state, &store, &key, 1836)
             .expect("reported cached composite loads through the map path");
         assert!(
             frame.image.pixels.iter().any(|pixel| pixel.a() > 0),
@@ -8522,29 +11361,117 @@ mod tests {
     }
 
     #[test]
-    fn disk_usage_counts_only_matching_band_frames() {
+    fn storage_usage_separates_previews_from_partial_native_scans() {
         let dir = test_dir("usage");
-        let one = write_band_frame(&dir, &synthetic_field(8, 6, 18, 51, 13), 1).unwrap();
-        let two = write_band_frame(&dir, &synthetic_field(8, 6, 18, 56, 13), 2).unwrap();
-        write_band_frame(&dir, &synthetic_field(8, 6, 18, 51, 8), 3).unwrap();
+        let c01_1851 = synthetic_field(8, 6, 18, 51, 1);
+        let c02_1851 = synthetic_field(8, 6, 18, 51, 2);
+        let c01_1856 = synthetic_field(8, 6, 18, 56, 1);
+        let c13_1856 = synthetic_field(8, 6, 18, 56, 13);
 
-        let usage = disk_usage(&dir, "g19", &["conus_c13".to_string()]);
-        assert_eq!(usage.frames, 2);
-        assert_eq!(
-            usage.bytes,
-            one.bytes + two.bytes,
-            "grid.rwg/run.json not counted"
-        );
+        let one = write_band_frame(&dir, &c01_1851, 1).unwrap();
+        let two = write_band_frame(&dir, &c02_1851, 2).unwrap();
+        let three = write_band_frame(&dir, &c01_1856, 3).unwrap();
+        write_band_frame(&dir, &c13_1856, 4).unwrap();
 
-        let none = disk_usage(&dir, "g19", &["meso1_c02".to_string()]);
+        for (name, bytes, scene) in [
+            ("c01-1851-source.nc", 11usize, &c01_1851.scene),
+            ("c02-1851-source.nc", 13usize, &c02_1851.scene),
+            ("c01-1856-source.nc", 17usize, &c01_1856.scene),
+            ("c13-1856-source.nc", 19usize, &c13_1856.scene),
+        ] {
+            let source = dir.join(name);
+            std::fs::write(&source, vec![scene.channel.unwrap_or_default(); bytes]).unwrap();
+            archive_goes_source(&dir, &source, scene, &format!("fixture/{name}"))
+                .expect("archive fixture source");
+        }
+
+        let prefixes = vec![
+            "conus_c01".to_owned(),
+            "conus_c02".to_owned(),
+            "conus_c03".to_owned(),
+        ];
+        let usage =
+            satellite_storage_usage(&dir, "g19", "conus", &[1, 2, 3], &prefixes, Some(3 * 1024));
+        assert!(usage.inventory_complete);
+        assert_eq!(usage.preview_channel_frames, 3);
         assert_eq!(
-            none,
-            SatDiskUsage {
-                bytes: 0,
-                frames: 0
-            }
+            usage.preview_bytes,
+            one.bytes + two.bytes + three.bytes,
+            "preview grids/manifests and the unrequested C13 frame are excluded"
         );
+        assert_eq!(usage.native_bytes, 11 + 13 + 17);
+        assert_eq!(usage.native_channel_sources, 3);
+        assert_eq!(
+            usage.native_unique_scans, 2,
+            "both incomplete C01+C02 and C01-only scan minutes still count"
+        );
+        assert_eq!(usage.native_cap_bytes, Some(9 * 1024));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_usage_traversal_is_bounded_and_scope_cannot_escape() {
+        let dir = test_dir("usage-bounds");
+        for minute in [51, 56] {
+            let field = synthetic_field(8, 6, 18, minute, 1);
+            let source = dir.join(format!("source-{minute}.nc"));
+            std::fs::write(&source, [minute as u8; 7]).unwrap();
+            archive_goes_source(
+                &dir,
+                &source,
+                &field.scene,
+                &format!("fixture/source-{minute}.nc"),
+            )
+            .unwrap();
+        }
+        let limits = SatStorageScanLimits {
+            native_scan_entries: 1,
+            ..SAT_STORAGE_SCAN_LIMITS
+        };
+        let bounded = satellite_storage_usage_with_limits(
+            &dir,
+            "g19",
+            "conus",
+            &[1],
+            &["conus_c01".to_owned()],
+            Some(u64::MAX),
+            limits,
+        );
+        assert!(!bounded.inventory_complete);
+        assert_eq!(bounded.native_unique_scans, 1);
+        assert_eq!(bounded.native_channel_sources, 1);
+        assert_eq!(
+            bounded.native_cap_bytes,
+            Some(u64::MAX),
+            "cap multiplication uses the same saturating policy as follow"
+        );
+
+        let escaped =
+            satellite_storage_usage(&dir, "..", "conus", &[1], &["conus_c01".to_owned()], None);
+        assert!(!escaped.inventory_complete);
+        assert_eq!(escaped.native_bytes, 0);
+        assert_eq!(escaped.preview_bytes, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_path_parsers_are_strict_and_bounded() {
+        assert!(valid_preview_frame_name("t2359.rws"));
+        assert!(!valid_preview_frame_name("t2460.rws"));
+        assert!(valid_native_day("20260826"));
+        assert!(valid_native_scan("20260826", "20260826T1640"));
+        assert!(!valid_native_scan("20260826", "20260825T1640"));
+        assert_eq!(native_channel_source_name("c02.nc"), Some(2));
+        assert_eq!(
+            native_channel_source_name(&format!("c02-{}.nc", "a".repeat(64))),
+            Some(2)
+        );
+        assert_eq!(native_channel_source_name("c02-short.nc"), None);
+        assert_eq!(native_channel_source_name("c17.nc"), None);
+        assert_eq!(
+            native_channel_source_name(&format!("c02-{}.nc", "a".repeat(81))),
+            None
+        );
     }
 
     #[test]
@@ -8629,6 +11556,445 @@ mod tests {
         assert_eq!(listings[0].key.run, "conus_c01_20260713");
     }
 
+    fn remote_catalog_fixture() -> Arc<RemoteSatelliteCatalog> {
+        Arc::new(RemoteSatelliteCatalog {
+            schema: crate::sat_remote::SATELLITE_CATALOG_SCHEMA.to_owned(),
+            platforms: vec![crate::sat_remote::RemoteSatellitePlatform {
+                id: "g18".to_owned(),
+                title: "GOES-18 West".to_owned(),
+                role: "operational_west".to_owned(),
+            }],
+            sectors: vec![crate::sat_remote::RemoteSatelliteSector {
+                id: "fulldisk".to_owned(),
+                title: "Full Disk · 10 minute".to_owned(),
+                cadence_seconds: 600,
+                default_poll_seconds: 60,
+            }],
+            products: vec![crate::sat_remote::RemoteSatelliteProduct {
+                id: "c02".to_owned(),
+                title: "ABI C02".to_owned(),
+                description: "Red visible".to_owned(),
+                category: "advanced".to_owned(),
+                required_channels: vec![2],
+                base_channel: 2,
+                native_resolution_km: 0.5,
+                daylight_only: true,
+                enhancement: None,
+            }],
+            enhancements: Vec::new(),
+            native_source_archive: true,
+            full_disk_native_window_reads: true,
+            latest_frame_alias: "latest".to_owned(),
+            maximum_tile_zoom: 6,
+            tile_size: 256,
+            renderer_recipe: crate::sat_remote::SATELLITE_RENDERER_RECIPE.to_owned(),
+            geocolor_note: "fixture".to_owned(),
+        })
+    }
+
+    #[test]
+    fn remote_frames_are_grouped_by_full_utc_day_without_hhmm_collisions() {
+        let catalog = remote_catalog_fixture();
+        let revision_a = "a".repeat(64);
+        let revision_b = "b".repeat(64);
+        let frames = Arc::new(RemoteSatelliteFrames {
+            schema: crate::sat_remote::SATELLITE_FRAMES_SCHEMA.to_owned(),
+            platform: "g18".to_owned(),
+            sector: "fulldisk".to_owned(),
+            product: catalog.products[0].clone(),
+            cadence_seconds: 600,
+            frames: vec![
+                crate::sat_remote::RemoteSatelliteFrame {
+                    id: "20260826T1200".to_owned(),
+                    source_revision: revision_b.clone(),
+                    scan_start_unix: 1_777_000_000,
+                    scan_end_unix: 1_777_000_030,
+                    channels: vec![2],
+                },
+                crate::sat_remote::RemoteSatelliteFrame {
+                    id: "20260825T1210".to_owned(),
+                    source_revision: "c".repeat(64),
+                    scan_start_unix: 1_776_914_200,
+                    scan_end_unix: 1_776_914_230,
+                    channels: vec![2],
+                },
+                crate::sat_remote::RemoteSatelliteFrame {
+                    id: "20260825T1200".to_owned(),
+                    source_revision: revision_a.clone(),
+                    scan_start_unix: 1_776_913_600,
+                    scan_end_unix: 1_776_913_630,
+                    channels: vec![2],
+                },
+            ],
+        });
+
+        let (bindings, listings) =
+            build_remote_run_bindings(Arc::clone(&catalog), frames).expect("remote runs");
+        assert_eq!(listings.len(), 2, "one HHMM-only run per full UTC day");
+        assert!(listings[0].key.run.ends_with("20260826"));
+        assert_eq!(listings[0].frames, vec![1200]);
+        assert!(listings[1].key.run.ends_with("20260825"));
+        assert_eq!(listings[1].frames, vec![1200, 1210]);
+        for listing in &listings {
+            assert_eq!(listing.key.model, "g18");
+            assert!(
+                listing.key.run.starts_with("fulldisk_c02_rwserver_c02_"),
+                "remote run remains admissible to the current spec filter: {}",
+                listing.key.run
+            );
+            assert!(!listing.key.run.eq("fulldisk_c02_20260826"));
+        }
+        let newest = bindings
+            .get(&(listings[0].key.model.clone(), listings[0].key.run.clone()))
+            .expect("newest binding")
+            .exact_by_hhmm
+            .get(&1200)
+            .expect("exact frame");
+        assert_eq!(newest.frame_id, "20260826T1200");
+        assert_eq!(newest.source_revision, revision_b);
+
+        let options = remote_catalog_options(&catalog);
+        assert_eq!(options.0[0].slug, "goes18");
+        assert_eq!(options.1[0].slug, "fulldisk");
+        assert_eq!(options.2[0].slug, "c02");
+    }
+
+    fn remote_day_fixture(
+        catalog: &Arc<RemoteSatelliteCatalog>,
+        frames: &[(&str, char)],
+    ) -> (
+        HashMap<(String, String), RemoteRunBinding>,
+        Vec<SatRunListing>,
+    ) {
+        let frames = Arc::new(RemoteSatelliteFrames {
+            schema: crate::sat_remote::SATELLITE_FRAMES_SCHEMA.to_owned(),
+            platform: "g18".to_owned(),
+            sector: "fulldisk".to_owned(),
+            product: catalog.products[0].clone(),
+            cadence_seconds: 600,
+            frames: frames
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, (id, revision))| crate::sat_remote::RemoteSatelliteFrame {
+                        id: (*id).to_owned(),
+                        source_revision: revision.to_string().repeat(64),
+                        scan_start_unix: 1_777_000_000 + index as i64 * 600,
+                        scan_end_unix: 1_777_000_030 + index as i64 * 600,
+                        channels: vec![2],
+                    },
+                )
+                .collect(),
+        });
+        build_remote_run_bindings(Arc::clone(catalog), frames).expect("remote day")
+    }
+
+    #[test]
+    fn remote_day_identity_is_append_stable_but_rotates_on_republish() {
+        let catalog = remote_catalog_fixture();
+        let (initial_runs, initial_listings) =
+            remote_day_fixture(&catalog, &[("20260826T1200", 'a')]);
+        let initial_key = initial_listings[0].key.clone();
+
+        let (mut appended_runs, mut appended_listings) =
+            remote_day_fixture(&catalog, &[("20260826T1210", 'b'), ("20260826T1200", 'a')]);
+        stabilize_remote_run_identities(&initial_runs, &mut appended_runs, &mut appended_listings);
+        assert_eq!(
+            appended_listings[0].key, initial_key,
+            "ordinary new frames must not churn the player's run/cache identity"
+        );
+
+        let (mut republished_runs, mut republished_listings) =
+            remote_day_fixture(&catalog, &[("20260826T1210", 'b'), ("20260826T1200", 'c')]);
+        stabilize_remote_run_identities(
+            &appended_runs,
+            &mut republished_runs,
+            &mut republished_listings,
+        );
+        let republished_key = republished_listings[0].key.clone();
+        assert_ne!(republished_key, initial_key);
+        assert!(republished_key.run.contains("_rwrev"));
+        assert!(republished_key.run.ends_with("_20260826"));
+
+        let (mut unchanged_runs, mut unchanged_listings) =
+            remote_day_fixture(&catalog, &[("20260826T1210", 'b'), ("20260826T1200", 'c')]);
+        stabilize_remote_run_identities(
+            &republished_runs,
+            &mut unchanged_runs,
+            &mut unchanged_listings,
+        );
+        assert_eq!(
+            unchanged_listings[0].key, republished_key,
+            "the republish identity must remain stable on an unchanged rescan"
+        );
+    }
+
+    #[test]
+    fn remote_scan_completion_merges_the_newest_local_snapshot() {
+        let shared = Arc::new(Mutex::new(RemoteWorkerShared::default()));
+        shared.lock().expect("shared state").latest_local = vec![SatRunListing {
+            key: SatRunKey {
+                model: "g19".to_owned(),
+                run: "conus_c13_20260826".to_owned(),
+            },
+            title: "local before write".to_owned(),
+            nx: 2,
+            ny: 2,
+            frames: vec![1200],
+        }];
+        // A second Scan/ScanAndSelect lands while the remote HTTP request is
+        // still in flight and observes a just-written 12:05 frame.
+        let newest_local = vec![SatRunListing {
+            key: SatRunKey {
+                model: "g19".to_owned(),
+                run: "conus_c13_20260826".to_owned(),
+            },
+            title: "local after write".to_owned(),
+            nx: 2,
+            ny: 2,
+            frames: vec![1200, 1205],
+        }];
+        let remote = vec![SatRunListing {
+            key: SatRunKey {
+                model: "g18".to_owned(),
+                run: "fulldisk_c02_rwserver_c02_20260826".to_owned(),
+            },
+            title: "remote".to_owned(),
+            nx: 512,
+            ny: 512,
+            frames: vec![1200],
+        }];
+        shared.lock().expect("shared state").listings = remote.clone();
+
+        // The initial response path must atomically remember the disk snapshot
+        // before publishing it. A remote completion that wins the mutex next
+        // therefore cannot rebuild Runs from the older 12:00-only snapshot.
+        let (responses, received) = channel();
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        assert!(publish_local_and_last_good_response(
+            &shared,
+            newest_local,
+            &responses,
+            &notify,
+        ));
+        let SatResponse::Runs(initial) = received.recv().expect("initial Runs") else {
+            panic!("expected initial Runs response");
+        };
+        let initial_local = initial
+            .iter()
+            .find(|listing| listing.key.model == "g19")
+            .expect("fresh local run retained in initial response");
+        assert_eq!(initial_local.frames, vec![1200, 1205]);
+        assert!(
+            initial.iter().any(|listing| listing.key.model == "g18"),
+            "Scan and ScanAndSelect must both retain last-good remote runs"
+        );
+
+        let merged = {
+            let mut state = shared.lock().expect("shared state");
+            state.listings = remote.clone();
+            merge_local_and_remote_runs(state.latest_local.clone(), &remote)
+        };
+        let local = merged
+            .iter()
+            .find(|listing| listing.key.model == "g19")
+            .expect("fresh local run retained");
+        assert_eq!(local.frames, vec![1200, 1205]);
+        assert!(merged.iter().any(|listing| listing.key.model == "g18"));
+    }
+
+    fn solid_png(size: u32, rgba: [u8; 4]) -> Arc<Vec<u8>> {
+        let image = image::RgbaImage::from_pixel(size, size, image::Rgba(rgba));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("encode PNG");
+        Arc::new(bytes.into_inner())
+    }
+
+    #[test]
+    fn remote_z1_preview_stitches_all_four_exact_tiles() {
+        let tiles = vec![
+            (0, 0, solid_png(2, [255, 0, 0, 255])),
+            (1, 0, solid_png(2, [0, 255, 0, 255])),
+            (0, 1, solid_png(2, [0, 0, 255, 255])),
+            (1, 1, solid_png(2, [255, 255, 0, 255])),
+        ];
+        let image = stitch_remote_preview_tiles(2, &tiles).expect("mosaic");
+        assert_eq!(image.size, [4, 4]);
+        assert_eq!(image[(0, 0)], Color32::from_rgb(255, 0, 0));
+        assert_eq!(image[(3, 0)], Color32::from_rgb(0, 255, 0));
+        assert_eq!(image[(0, 3)], Color32::from_rgb(0, 0, 255));
+        assert_eq!(image[(3, 3)], Color32::from_rgb(255, 255, 0));
+    }
+
+    #[test]
+    fn daylight_alpha_does_not_crop_away_the_night_side_full_disk_extent() {
+        let edge: usize = 180;
+        let mut pixels = vec![Color32::TRANSPARENT; edge.saturating_mul(edge)];
+        let night_time = Utc
+            .with_ymd_and_hms(2026, 6, 21, 7, 0, 0)
+            .unwrap()
+            .timestamp();
+        // Synthetic daylight-only fixed-grid earth: the geometric disk spans
+        // 160 pixels but only its eastern half has product alpha. The player
+        // must retain the whole native square, give the on-Earth night side a
+        // visible dark silhouette, and leave actual space transparent.
+        let center_x = edge / 2;
+        let center_y = edge / 2;
+        let radius = 80_isize;
+        for y in 0..edge {
+            for x in 0..edge {
+                let dx = x as isize - center_x as isize;
+                let dy = y as isize - center_y as isize;
+                if dx * dx + dy * dy <= radius * radius {
+                    let day_rgba = if x >= center_x {
+                        [255, 255, 255, 255]
+                    } else {
+                        [0, 0, 0, 0]
+                    };
+                    let rgba = full_disk_quicklook_pixel(
+                        day_rgba,
+                        true,
+                        Some(GoesAbiProduct::OpenGeoColorV1),
+                        Some(night_time),
+                        40.0,
+                        -105.0,
+                    );
+                    pixels[y * edge + x] =
+                        Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
+                }
+            }
+        }
+        let overview = fixed_grid_overview_image(edge, edge, pixels, false).expect("overview");
+        assert_eq!(overview.size, [edge, edge]);
+        assert_eq!(overview[(5, 5)], Color32::TRANSPARENT, "space stays clear");
+        assert_eq!(
+            overview[(center_x - 40, center_y)].to_array(),
+            FULL_DISK_NIGHT_QUICKLOOK,
+            "valid night-side Earth receives only the quicklook silhouette"
+        );
+        assert_eq!(
+            overview[(center_x + 40, center_y)],
+            Color32::WHITE,
+            "visible product color is unchanged"
+        );
+    }
+
+    #[test]
+    fn full_disk_backdrop_never_conceals_daytime_or_24_hour_missing_data() {
+        let night_time = Utc
+            .with_ymd_and_hms(2026, 6, 21, 7, 0, 0)
+            .unwrap()
+            .timestamp();
+        let day_time = Utc
+            .with_ymd_and_hms(2026, 6, 21, 19, 0, 0)
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            full_disk_quicklook_pixel(
+                [0, 0, 0, 0],
+                true,
+                Some(GoesAbiProduct::OpenGeoColorV1),
+                Some(night_time),
+                40.0,
+                -105.0,
+            ),
+            FULL_DISK_NIGHT_QUICKLOOK,
+            "only a known daylight-only product at solar night gets a limb backdrop"
+        );
+        assert_eq!(
+            full_disk_quicklook_pixel(
+                [0, 0, 0, 0],
+                true,
+                Some(GoesAbiProduct::OpenGeoColorV1),
+                Some(day_time),
+                40.0,
+                -105.0,
+            ),
+            [0, 0, 0, 0],
+            "missing daylight data must stay transparent"
+        );
+        assert_eq!(
+            full_disk_quicklook_pixel(
+                [0, 0, 0, 0],
+                true,
+                Some(GoesAbiProduct::GeoColor),
+                Some(night_time),
+                40.0,
+                -105.0,
+            ),
+            [0, 0, 0, 0],
+            "a 24-hour product outage must never be painted as ordinary night"
+        );
+        assert_eq!(
+            full_disk_quicklook_pixel(
+                [0, 0, 0, 0],
+                false,
+                Some(GoesAbiProduct::OpenGeoColorV1),
+                Some(night_time),
+                40.0,
+                -105.0,
+            ),
+            [0, 0, 0, 0],
+            "space remains transparent"
+        );
+    }
+
+    #[test]
+    fn remote_world_tiles_reproject_to_a_complete_circular_goes_disk() {
+        let edge = 96_usize;
+        let world = ColorImage::new([edge, edge], vec![Color32::RED; edge.saturating_mul(edge)]);
+        let disk = remote_goes_full_disk_quicklook(
+            &world,
+            "g19",
+            Some(GoesAbiProduct::OpenGeoColorV1),
+            Utc.with_ymd_and_hms(2026, 6, 21, 7, 0, 0)
+                .unwrap()
+                .timestamp(),
+        )
+        .expect("GOES disk");
+        assert_eq!(disk.size, [edge, edge]);
+        assert_eq!(disk[(0, 0)], Color32::TRANSPARENT, "space stays clear");
+        assert_eq!(
+            disk[(edge / 2, edge / 2)],
+            Color32::RED,
+            "source product pixels survive geometry reprojection"
+        );
+        let opaque_columns = (0..edge)
+            .filter(|&column| disk[(column, edge / 2)].a() > 0)
+            .collect::<Vec<_>>();
+        assert!(
+            opaque_columns
+                .first()
+                .is_some_and(|column| *column < edge / 4)
+                && opaque_columns
+                    .last()
+                    .is_some_and(|column| *column > edge * 3 / 4),
+            "both full-disk limbs must be present: {opaque_columns:?}"
+        );
+    }
+
+    #[test]
+    fn remote_frame_hhmm_rejects_alias_and_invalid_clock() {
+        assert_eq!(remote_frame_hhmm("20260826T2359"), Some(2359));
+        assert_eq!(remote_frame_hhmm("latest"), None);
+        assert_eq!(remote_frame_hhmm("20260826T2400"), None);
+        assert_eq!(remote_frame_hhmm("20260826T1260"), None);
+    }
+
+    #[test]
+    fn remote_full_disk_projection_uses_the_same_operational_slots_as_map_fit() {
+        assert_eq!(
+            nominal_goes_subsatellite_longitude("g19"),
+            Some(crate::sat_window::GOES_EAST_SUB_LON_DEG)
+        );
+        assert_eq!(
+            nominal_goes_subsatellite_longitude("goes18"),
+            Some(crate::sat_window::GOES_WEST_SUB_LON_DEG)
+        );
+    }
+
     /// A Follow over an invalid spec responds FollowFinished(Err) without
     /// spawning a session.
     #[test]
@@ -8643,7 +12009,7 @@ mod tests {
             .expect("worker responds");
         match response {
             SatResponse::FollowFinished(Err(message)) => {
-                assert!(message.contains("ABI band out of range"), "got: {message}");
+                assert!(message.contains("unknown layer 'c99'"), "got: {message}");
             }
             other => panic!("expected FollowFinished(Err), got {other:?}"),
         }
@@ -8655,7 +12021,9 @@ mod tests {
         let dir = test_dir("worker-roundtrip");
         write_band_frame(&dir, &synthetic_field(8, 6, 18, 51, 13), 1).unwrap();
         let worker = SatWorker::spawn(dir.clone(), || {});
-        worker.send(SatRequest::Validate(spec()));
+        let mut scalar_spec = spec();
+        scalar_spec.layer = "c13".to_owned();
+        worker.send(SatRequest::Validate(scalar_spec));
         worker.send(SatRequest::Scan);
         match worker
             .rx
@@ -9058,7 +12426,7 @@ mod tests {
     #[test]
     fn high_resolution_fulldisk_fits_shared_grid_limit_without_cropping() {
         assert_eq!(
-            grid_dims_within_cell_limit(5500, 5500, MAX_GRID_CELLS),
+            grid_dims_within_cell_limit(5500, 5500, SAT_PREVIEW_MAX_CELLS),
             Ok((5000, 5000))
         );
         assert!(GridShape::new(5000, 5000).is_ok());
@@ -9100,7 +12468,7 @@ mod tests {
         let (same_scene, (same_r, same_g, same_b)) = fit_himawari_composite_to_cell_limit(
             untouched,
             (original.clone(), original.clone(), original.clone()),
-            MAX_GRID_CELLS,
+            SAT_PREVIEW_MAX_CELLS,
         )
         .expect("in-limit composite is unchanged");
         assert_eq!(same_scene, original_scene);
@@ -9255,6 +12623,74 @@ mod tests {
         );
     }
 
+    /// Offline proof over an already retained exact C01+C02+C03 frame. This
+    /// exercises the same product-level player path as the UI without fetching
+    /// or relying on any compact `.rws` preview.
+    #[test]
+    fn export_native_product_overview_proof_when_env_is_set() {
+        let Some(store) =
+            std::env::var_os("BOWECHO_SAT_NATIVE_PRODUCT_PROOF_STORE").map(PathBuf::from)
+        else {
+            return;
+        };
+        let out = std::env::var_os("BOWECHO_SAT_NATIVE_PRODUCT_PROOF_PNG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| store.join("open-geocolor-full-disk-proof.png"));
+        let frame = load_native_product_overview(
+            &store,
+            &SatRunKey {
+                model: "g19".to_owned(),
+                run: "fulldisk_c02_rwproduct_open_geocolor_v1_20260826".to_owned(),
+            },
+            1640,
+            GoesAbiProduct::OpenGeoColorV1,
+        )
+        .expect("real retained C01+C02+C03 product overview renders");
+        let image = &frame.frame.image;
+        assert_eq!(image.size[0], image.size[1], "ABI Full disk is square");
+        assert!(
+            image.pixels.len() <= 1_048_576,
+            "player quicklook remains bounded"
+        );
+        let [width, height] = image.size;
+        let mut min_x = width;
+        let mut min_y = height;
+        let mut max_x = 0;
+        let mut max_y = 0;
+        let mut visible = 0usize;
+        let mut colored = 0usize;
+        for (index, pixel) in image.pixels.iter().enumerate() {
+            if pixel.a() == 0 {
+                continue;
+            }
+            let x = index % width;
+            let y = index / width;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            visible += 1;
+            colored += usize::from(pixel.r() != pixel.g() || pixel.g() != pixel.b());
+        }
+        assert!(
+            visible > width * height / 2,
+            "complete Earth disk is visible"
+        );
+        assert!(
+            max_x.saturating_sub(min_x) > width * 9 / 10
+                && max_y.saturating_sub(min_y) > height * 9 / 10,
+            "visible limb spans the full ABI fixed-grid quicklook"
+        );
+        assert!(
+            colored > visible / 20,
+            "Open GeoColor output must materially differ from grayscale C02"
+        );
+        for corner in [0, width - 1, (height - 1) * width, width * height - 1] {
+            assert_eq!(image.pixels[corner].a(), 0, "space remains transparent");
+        }
+        save_color_image_png(image, &out);
+    }
+
     /// LIVE A/B proof of the native-resolution window: over ONE pinned scan,
     /// ingest (a) today's default path (downsample 4) and (b) the native
     /// window, then export three PNGs — `<prefix>_default_ds4.png` (the
@@ -9384,10 +12820,10 @@ mod tests {
 
         let mut state = WorkerState::default();
         let native_hhmm = *windowed_run.frames.last().expect("windowed run has frames");
-        let native = load_frame_for_map(&mut state, &store, &windowed_run.key, native_hhmm)
+        let native = load_preview_frame_for_map(&mut state, &store, &windowed_run.key, native_hhmm)
             .expect("native frame loads");
         let default_hhmm = *default_run.frames.last().expect("default run has frames");
-        let whole = load_frame_for_map(&mut state, &store, &default_run.key, default_hhmm)
+        let whole = load_preview_frame_for_map(&mut state, &store, &default_run.key, default_hhmm)
             .expect("default frame loads");
 
         save_color_image_png(
@@ -9554,7 +12990,7 @@ mod tests {
         );
 
         let mut state = WorkerState::default();
-        let whole = load_frame_for_map(&mut state, &store, &key, first_hhmm)
+        let whole = load_preview_frame_for_map(&mut state, &store, &key, first_hhmm)
             .expect("full-disk frame loads");
         let (nx, ny) = (whole.image.size[0], whole.image.size[1]);
         let lit = whole.image.pixels.iter().filter(|p| p.a() > 0).count();

@@ -24,13 +24,14 @@ use rw_community_protocol::{
     LIST_CASES_PATH, MAX_CASE_DIRECTORY_PAGE, MissingPolicy, NATIVE_WINDOW_PAYLOAD_SCHEMA,
     ObjectManifest, POINT_SERIES_PAYLOAD_SCHEMA, PROFILE_PAYLOAD_SCHEMA,
     PUBLISH_CASE_ARTIFACT_PATH, ProfileObjectPayload, ProtocolLimits, PublicationGrant,
-    PublishCaseArtifactRequest, REQUEST_SCHEMA, RESOLVE_OBJECT_PATH, RESOLVE_SCHEMA,
-    RecipeIdentity, ResolveObjectRequest, ResolveObjectResponse, ShareQuery, ShareRequest,
-    SignedCaseRoomManifest, SignedObjectManifest, SourceProvenance, TEMPORAL_GRID_PAYLOAD_SCHEMA,
-    TimeWindow, TrustedSigningKeys, TypedObjectPayload, case_artifact_payload_bytes, object_sha256,
-    parse_signed_object_manifest_bounded, request_sha256, trusted_signing_keys_from_base64,
-    validate_object_manifest, validate_profile_payload_identity, validate_typed_payload_identity,
-    verify_signed_case, verify_signed_object,
+    PublishCaseArtifactRequest, REQUEST_SCHEMA, REQUEST_SCHEMA_V2, RESOLVE_OBJECT_PATH,
+    RESOLVE_SCHEMA, RecipeIdentity, ResolveObjectRequest, ResolveObjectResponse, ShareQuery,
+    ShareRequest, SignedCaseRoomManifest, SignedObjectManifest, SourceProvenance,
+    TEMPORAL_GRID_PAYLOAD_SCHEMA, TimeWindow, TrustedSigningKeys, TypedObjectPayload,
+    case_artifact_payload_bytes, object_sha256, parse_signed_object_manifest_bounded,
+    request_sha256, trusted_signing_keys_from_base64, validate_object_manifest,
+    validate_profile_payload_identity, validate_typed_payload_identity, verify_signed_case,
+    verify_signed_object,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,9 @@ const REMOTE_RUN_MAX_BYTES: u64 = 512 * 1024;
 const REMOTE_VARIABLES_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const REMOTE_AXIS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const REMOTE_PROFILE_CYCLE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const REMOTE_MODEL_PLANE_CONTENT_TYPE: &str = "application/vnd.rusty-weather.model-plane+f32";
+const REMOTE_MODEL_PLANE_MAGIC: &[u8; 8] = b"RWOBF32\0";
+const REMOTE_MODEL_PLANE_HEADER_BYTES: usize = 36;
 const REMOTE_PROFILE_CYCLE_MAX_VALUES: usize = 1_000_000;
 const REMOTE_MAX_MODELS: usize = 512;
 const REMOTE_MAX_RUNS: usize = 4_096;
@@ -137,6 +141,22 @@ pub(crate) struct CommunityCacheClient {
     origin_attempts: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     archival_origin_attempts: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// One bounded response from the configured Rusty Weather satellite surface.
+///
+/// The bearer credential deliberately never leaves [`CommunityCacheClient`].
+/// Satellite cache identities are built from `origin_url` and the immutable
+/// source revision, while this small envelope exposes only response metadata
+/// that the v3 adapter must validate before accepting JSON or PNG bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteSatelliteHttpResponse {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) cache_control: Option<String>,
+    pub(crate) source_revision: Option<String>,
+    pub(crate) frame: Option<String>,
+    pub(crate) renderer_recipe: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -442,6 +462,14 @@ pub(crate) struct RemoteProviderAttribution {
 pub(crate) struct RemoteSourceProvenance {
     pub provider: String,
     #[serde(default)]
+    pub forecast_producer: Option<String>,
+    #[serde(default)]
+    pub licensing_publisher: Option<String>,
+    #[serde(default)]
+    pub transport_provider: Option<String>,
+    #[serde(default)]
+    pub transport_is_mirror: bool,
+    #[serde(default)]
     pub roles: Vec<String>,
     #[serde(default)]
     pub products: Vec<String>,
@@ -644,6 +672,28 @@ pub(crate) struct RemoteProfileCatalog {
     pub variables: Vec<RemoteVariableCapability>,
 }
 
+/// One identity-checked immutable model plane returned by rw-server.
+///
+/// `codec` describes the stored source representation: a pressure plane that
+/// rw-server expands to f32 may still be a quantized approximation. Non-finite
+/// values remain absent/nodata cells and are intentionally not rewritten.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RemoteModelPlane {
+    pub model: String,
+    pub run: String,
+    pub storage_slot: u16,
+    pub valid_unix: i64,
+    pub variable: String,
+    pub units: String,
+    pub codec: String,
+    pub level_hpa: Option<u16>,
+    pub nx: usize,
+    pub ny: usize,
+    pub etag: String,
+    pub values: Vec<f32>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteProfileVariableSelection {
@@ -792,7 +842,7 @@ impl CommunityCacheClient {
             cache_root.join(TRANSFER_USAGE_FILE),
         )?;
         Ok(Self {
-            origin_url: normalized_base_url(&settings.origin_url),
+            origin_url: normalized_origin_url(&settings.origin_url),
             r2_url: (!settings.r2_hot_object_url.trim().is_empty())
                 .then(|| normalized_base_url(&settings.r2_hot_object_url)),
             bearer_token,
@@ -1311,6 +1361,71 @@ impl CommunityCacheClient {
         bounded_catalog(variables, REMOTE_MAX_VARIABLES, validate_remote_variable)
     }
 
+    /// Fetch one complete immutable model plane from the configured rw-server.
+    ///
+    /// This is a direct authenticated read, not a Community Cache publication,
+    /// so it deliberately does not apply the public-redistribution provider
+    /// allowlist. The run generation, grid, slot, variable, level, headers,
+    /// binary envelope, dimensions, and valid time are nevertheless all bound
+    /// back to the already validated catalog before values become visible.
+    #[allow(dead_code)]
+    pub(crate) fn remote_model_plane(
+        &self,
+        catalog: &RemoteProfileCatalog,
+        time: &RemoteTimePoint,
+        variable_name: &str,
+        level_hpa: Option<u16>,
+    ) -> Result<RemoteModelPlane, CommunityCacheError> {
+        let variable =
+            validate_remote_model_plane_request(catalog, time, variable_name, level_hpa)?;
+        let expected_size = remote_model_plane_expected_size(
+            &catalog.run,
+            variable.name.as_bytes().len(),
+            variable.units.as_bytes().len(),
+        )?;
+        if expected_size > self.limits.max_decoded_bytes {
+            return Err(CommunityCacheError::Response);
+        }
+        let path = remote_model_plane_path(catalog, time, variable, level_hpa);
+        let _active = self.transfers.begin()?;
+        let mut builder = self.http.get(format!("{}{path}", self.origin_url));
+        if let Some(token) = &self.bearer_token {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.send().map_err(|_| CommunityCacheError::Network)?;
+        if !response.status().is_success() {
+            return Err(CommunityCacheError::Http(response.status().as_u16()));
+        }
+        let etag = validate_remote_model_plane_headers(
+            response.headers(),
+            catalog,
+            time,
+            variable,
+            level_hpa,
+        )?;
+        let bytes = read_bounded_response(
+            response,
+            expected_size,
+            Some(expected_size),
+            &self.transfers,
+        )?;
+        let values = decode_remote_model_plane_body(&bytes, &catalog.run, time, variable)?;
+        Ok(RemoteModelPlane {
+            model: catalog.run.model.clone(),
+            run: catalog.run.run.clone(),
+            storage_slot: time.storage_slot,
+            valid_unix: time.valid_unix,
+            variable: variable.name.clone(),
+            units: variable.units.clone(),
+            codec: variable.codec.clone(),
+            level_hpa,
+            nx: catalog.run.nx,
+            ny: catalog.run.ny,
+            etag,
+            values,
+        })
+    }
+
     /// Resolve the exact remote slot-to-valid-time axis through the existing
     /// point API. The probe variable is selected from the advertised run
     /// capabilities and no local rw-store entry is required.
@@ -1473,35 +1588,7 @@ impl CommunityCacheClient {
         if !self.categories.profiles {
             return Err(CommunityCacheError::Disabled);
         }
-        validate_remote_catalog_for_request(catalog)?;
-        normalize_selected_variables(&mut selection.pressure_variables)?;
-        if !selection.surface_variables.is_empty() {
-            normalize_selected_variables(&mut selection.surface_variables)?;
-        }
-        if selection.pressure_variables.is_empty()
-            || !selection.pressure_levels_hpa.is_empty()
-            || selection
-                .pressure_variables
-                .iter()
-                .any(|name| selection.surface_variables.contains(name))
-        {
-            return Err(CommunityCacheError::Response);
-        }
-        for name in &selection.pressure_variables {
-            let variable = remote_variable(catalog, name)?;
-            if variable.kind != "pressure3d"
-                || !variable.pressure_profile
-                || !variable.profile_cycle
-            {
-                return Err(CommunityCacheError::Response);
-            }
-        }
-        for name in &selection.surface_variables {
-            let variable = remote_variable(catalog, name)?;
-            if variable.kind != "surface2d" || !variable.point_series {
-                return Err(CommunityCacheError::Response);
-            }
-        }
+        validate_remote_profile_cycle_request(catalog, &mut selection)?;
         let request = RemoteProfileCycleRequest {
             model: &catalog.run.model,
             run: &catalog.run.run,
@@ -1522,6 +1609,90 @@ impl CommunityCacheClient {
         )?;
         validate_remote_profile_cycle(&result, catalog, &selection, &self.limits)?;
         Ok(result)
+    }
+
+    /// Canonical HTTPS origin used to build non-secret satellite cache keys.
+    /// The bearer token remains private to this client.
+    pub(crate) fn satellite_origin_url(&self) -> &str {
+        &self.origin_url
+    }
+
+    /// Turn a validated Rusty Weather satellite API path into an absolute URL
+    /// beneath the already configured trusted origin.
+    pub(crate) fn satellite_absolute_url(
+        &self,
+        path_and_query: &str,
+    ) -> Result<String, CommunityCacheError> {
+        validate_satellite_api_path(path_and_query)?;
+        Ok(format!("{}{path_and_query}", self.origin_url))
+    }
+
+    /// Fetch a bounded catalog, frames, or TileJSON response. Authentication
+    /// and transfer accounting are identical to the existing operational model
+    /// GETs; only the `/v1/satellite` path family is accepted here.
+    pub(crate) fn get_satellite_path(
+        &self,
+        path_and_query: &str,
+        limit: u64,
+    ) -> Result<RemoteSatelliteHttpResponse, CommunityCacheError> {
+        let url = self.satellite_absolute_url(path_and_query)?;
+        self.get_satellite_absolute(&url, limit)
+    }
+
+    /// Fetch one absolute satellite URL only when it remains under the same
+    /// trusted HTTPS origin and API root. This is the tile worker's SSRF and
+    /// credential-boundary gate for URLs received through TileJSON.
+    pub(crate) fn get_satellite_absolute(
+        &self,
+        url: &str,
+        limit: u64,
+    ) -> Result<RemoteSatelliteHttpResponse, CommunityCacheError> {
+        if !trusted_satellite_absolute_url(&self.origin_url, url) || limit == 0 {
+            return Err(CommunityCacheError::Response);
+        }
+        let _active = self.transfers.begin()?;
+        let mut builder = self.http.get(url);
+        if let Some(token) = &self.bearer_token {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.send().map_err(|_| CommunityCacheError::Network)?;
+        if !response.status().is_success() {
+            return Err(CommunityCacheError::Http(response.status().as_u16()));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let cache_control = response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let source_revision = response
+            .headers()
+            .get("x-rw-satellite-source-revision")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let frame = response
+            .headers()
+            .get("x-rw-satellite-frame")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let renderer_recipe = response
+            .headers()
+            .get("x-rw-satellite-recipe")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = read_bounded_response(response, limit, None, &self.transfers)?;
+        Ok(RemoteSatelliteHttpResponse {
+            bytes,
+            content_type,
+            cache_control,
+            source_revision,
+            frame,
+            renderer_recipe,
+        })
     }
 
     fn get_origin_json<T: DeserializeOwned>(
@@ -2101,13 +2272,33 @@ fn validate_remote_run(run: &RemoteRunDescriptor) -> Result<(), CommunityCacheEr
         return Err(CommunityCacheError::Response);
     }
     for source in &run.source_provenance {
-        validate_provenance_token(&source.provider)?;
-        if source.roles.len() > 16 || source.products.len() > 32 {
-            return Err(CommunityCacheError::Response);
+        validate_remote_source_provenance(source)?;
+    }
+    Ok(())
+}
+
+fn validate_remote_source_provenance(
+    source: &RemoteSourceProvenance,
+) -> Result<(), CommunityCacheError> {
+    validate_provenance_token(&source.provider)?;
+    match (
+        source.forecast_producer.as_deref(),
+        source.licensing_publisher.as_deref(),
+        source.transport_provider.as_deref(),
+    ) {
+        (None, None, None) if !source.transport_is_mirror => {}
+        (Some(producer), Some(publisher), Some(transport)) => {
+            validate_provenance_token(producer)?;
+            validate_provenance_token(publisher)?;
+            validate_provenance_token(transport)?;
         }
-        for token in source.roles.iter().chain(&source.products) {
-            validate_provenance_token(token)?;
-        }
+        _ => return Err(CommunityCacheError::Response),
+    }
+    if source.roles.len() > 16 || source.products.len() > 32 {
+        return Err(CommunityCacheError::Response);
+    }
+    for token in source.roles.iter().chain(&source.products) {
+        validate_provenance_token(token)?;
     }
     Ok(())
 }
@@ -2264,25 +2455,23 @@ fn validate_remote_profile_cycle(
             return Err(CommunityCacheError::Response);
         }
         for source in &sample.source_provenance {
-            validate_provenance_token(&source.provider)?;
-            if source.roles.len() > 16
-                || source.products.len() > 32
-                || !catalog.run.source_provenance.iter().any(|expected| {
-                    expected.provider == source.provider
-                        && source
-                            .roles
-                            .iter()
-                            .all(|role| expected.roles.contains(role))
-                        && source
-                            .products
-                            .iter()
-                            .all(|product| expected.products.contains(product))
-                })
-            {
+            validate_remote_source_provenance(source)?;
+            if !catalog.run.source_provenance.iter().any(|expected| {
+                expected.provider == source.provider
+                    && expected.forecast_producer == source.forecast_producer
+                    && expected.licensing_publisher == source.licensing_publisher
+                    && expected.transport_provider == source.transport_provider
+                    && expected.transport_is_mirror == source.transport_is_mirror
+                    && source
+                        .roles
+                        .iter()
+                        .all(|role| expected.roles.contains(role))
+                    && source
+                        .products
+                        .iter()
+                        .all(|product| expected.products.contains(product))
+            }) {
                 return Err(CommunityCacheError::Response);
-            }
-            for token in source.roles.iter().chain(&source.products) {
-                validate_provenance_token(token)?;
             }
         }
 
@@ -2631,6 +2820,48 @@ fn select_axis_probe_variable(variables: &[RemoteVariableCapability]) -> Option<
         .map(|variable| variable.name.as_str())
 }
 
+pub(crate) fn request_schema_for_source_provenance(
+    sources: &[SourceProvenance],
+) -> Result<&'static str, rw_community_protocol::ProtocolError> {
+    Ok(if source_provenance_uses_structured_identity(sources)? {
+        REQUEST_SCHEMA_V2
+    } else {
+        REQUEST_SCHEMA
+    })
+}
+
+pub(crate) fn source_provenance_uses_structured_identity(
+    sources: &[SourceProvenance],
+) -> Result<bool, rw_community_protocol::ProtocolError> {
+    let mut structured = 0_usize;
+    for source in sources {
+        let identity_fields = [
+            source.forecast_producer.is_some(),
+            source.licensing_publisher.is_some(),
+            source.transport_provider.is_some(),
+        ];
+        if identity_fields.iter().all(|present| !present) && !source.transport_is_mirror {
+            continue;
+        }
+        if identity_fields.iter().all(|present| *present) {
+            structured += 1;
+            continue;
+        }
+        return Err(rw_community_protocol::ProtocolError::InvalidField {
+            field: "source_provenance",
+            reason: "structured identity fields must be supplied together, and mirror transport requires structured identity".into(),
+        });
+    }
+    match structured {
+        0 => Ok(false),
+        count if count == sources.len() => Ok(true),
+        _ => Err(rw_community_protocol::ProtocolError::InvalidField {
+            field: "source_provenance",
+            reason: "a request cannot mix legacy and structured source identities".into(),
+        }),
+    }
+}
+
 fn build_remote_profile_request(
     catalog: &RemoteProfileCatalog,
     time: &RemoteTimePoint,
@@ -2695,14 +2926,19 @@ fn build_remote_profile_request(
         .iter()
         .map(|source| SourceProvenance {
             provider: source.provider.clone(),
+            forecast_producer: source.forecast_producer.clone(),
+            licensing_publisher: source.licensing_publisher.clone(),
+            transport_provider: source.transport_provider.clone(),
+            transport_is_mirror: source.transport_is_mirror,
             roles: source.roles.clone(),
             products: source.products.clone(),
         })
         .collect::<Vec<_>>();
+    let schema = request_schema_for_source_provenance(&source_provenance)?;
     let mut variables = selection.pressure_variables.clone();
     variables.extend(selection.surface_variables.iter().cloned());
     let request = ShareRequest {
-        schema: REQUEST_SCHEMA.into(),
+        schema: schema.into(),
         model: catalog.run.model.clone(),
         run: catalog.run.run.clone(),
         snapshot_id: catalog.run.snapshot_id.clone(),
@@ -2932,10 +3168,308 @@ fn build_remote_temporal_grid_request(
 fn validate_remote_catalog_for_request(
     catalog: &RemoteProfileCatalog,
 ) -> Result<(), CommunityCacheError> {
+    validate_remote_catalog_integrity(catalog)?;
+    deny_automatic_private_run(&catalog.run)
+}
+
+/// Validate facts learned from the configured authenticated authority without
+/// making any claim that those facts may be republished through Community
+/// Cache. Direct operational reads use this boundary; signed share/publication
+/// builders add [`deny_automatic_private_run`] separately.
+fn validate_remote_catalog_integrity(
+    catalog: &RemoteProfileCatalog,
+) -> Result<(), CommunityCacheError> {
     validate_remote_run(&catalog.run)?;
     validate_remote_grid_point(&catalog.point, &catalog.run)?;
-    validate_remote_axis(&catalog.axis, &catalog.run, &catalog.variables)?;
-    deny_automatic_private_run(&catalog.run)
+    for variable in &catalog.variables {
+        validate_remote_variable(variable)?;
+    }
+    validate_remote_axis(&catalog.axis, &catalog.run, &catalog.variables)
+}
+
+fn validate_remote_profile_cycle_request(
+    catalog: &RemoteProfileCatalog,
+    selection: &mut RemoteProfileVariableSelection,
+) -> Result<(), CommunityCacheError> {
+    validate_remote_catalog_integrity(catalog)?;
+    normalize_selected_variables(&mut selection.pressure_variables)?;
+    if !selection.surface_variables.is_empty() {
+        normalize_selected_variables(&mut selection.surface_variables)?;
+    }
+    if !selection.pressure_levels_hpa.is_empty()
+        || selection
+            .pressure_variables
+            .iter()
+            .any(|name| selection.surface_variables.contains(name))
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    for name in &selection.pressure_variables {
+        let variable = remote_variable(catalog, name)?;
+        if variable.kind != "pressure3d" || !variable.pressure_profile || !variable.profile_cycle {
+            return Err(CommunityCacheError::Response);
+        }
+    }
+    for name in &selection.surface_variables {
+        let variable = remote_variable(catalog, name)?;
+        if variable.kind != "surface2d" || !variable.point_series {
+            return Err(CommunityCacheError::Response);
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_model_plane_request<'a>(
+    catalog: &'a RemoteProfileCatalog,
+    time: &RemoteTimePoint,
+    variable_name: &str,
+    level_hpa: Option<u16>,
+) -> Result<&'a RemoteVariableCapability, CommunityCacheError> {
+    validate_remote_catalog_integrity(catalog)?;
+    if !catalog.axis.iter().any(|candidate| candidate == time) {
+        return Err(CommunityCacheError::Response);
+    }
+    let variable = remote_variable(catalog, variable_name)?;
+    if !variable.available_slots.contains(&time.storage_slot) {
+        return Err(CommunityCacheError::Unavailable);
+    }
+    let kind_matches = match (variable.kind.as_str(), level_hpa) {
+        ("surface2d", None) => variable.levels_hpa.is_empty(),
+        ("pressure3d", Some(level)) => variable.levels_hpa.contains(&level),
+        _ => false,
+    };
+    if !kind_matches {
+        return Err(CommunityCacheError::Response);
+    }
+    Ok(variable)
+}
+
+fn remote_model_plane_path(
+    catalog: &RemoteProfileCatalog,
+    time: &RemoteTimePoint,
+    variable: &RemoteVariableCapability,
+    level_hpa: Option<u16>,
+) -> String {
+    let level_query = level_hpa.map_or_else(String::new, |level| format!("&level_hpa={level}"));
+    format!(
+        "/v1/models/{}/runs/{}/planes/{}/{}.bin?expected_snapshot_id={}&expected_grid_hash={}{}",
+        encode_path_segment(&catalog.run.model),
+        encode_path_segment(&catalog.run.run),
+        time.storage_slot,
+        encode_path_segment(&variable.name),
+        encode_query_component(&catalog.run.snapshot_id),
+        encode_query_component(&catalog.run.grid_hash),
+        level_query,
+    )
+}
+
+fn remote_model_plane_expected_size(
+    run: &RemoteRunDescriptor,
+    variable_len: usize,
+    units_len: usize,
+) -> Result<u64, CommunityCacheError> {
+    if variable_len == 0
+        || variable_len > usize::from(u16::MAX)
+        || units_len == 0
+        || units_len > usize::from(u16::MAX)
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    let cells = run
+        .nx
+        .checked_mul(run.ny)
+        .ok_or(CommunityCacheError::Response)?;
+    let size = cells
+        .checked_mul(size_of::<f32>())
+        .and_then(|value_bytes| value_bytes.checked_add(REMOTE_MODEL_PLANE_HEADER_BYTES))
+        .and_then(|bytes| bytes.checked_add(variable_len))
+        .and_then(|bytes| bytes.checked_add(units_len))
+        .ok_or(CommunityCacheError::Response)?;
+    u64::try_from(size).map_err(|_| CommunityCacheError::Response)
+}
+
+fn required_remote_model_plane_header<'a>(
+    headers: &'a reqwest::header::HeaderMap,
+    name: &str,
+) -> Result<&'a str, CommunityCacheError> {
+    let mut values = headers.get_all(name).iter();
+    let value = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(CommunityCacheError::Response)?;
+    if value.is_empty() || values.next().is_some() {
+        return Err(CommunityCacheError::Response);
+    }
+    Ok(value)
+}
+
+fn validate_remote_model_plane_headers(
+    headers: &reqwest::header::HeaderMap,
+    catalog: &RemoteProfileCatalog,
+    time: &RemoteTimePoint,
+    variable: &RemoteVariableCapability,
+    level_hpa: Option<u16>,
+) -> Result<String, CommunityCacheError> {
+    let content_type = required_remote_model_plane_header(headers, "content-type")?;
+    if !content_type.eq_ignore_ascii_case(REMOTE_MODEL_PLANE_CONTENT_TYPE)
+        || headers.contains_key(reqwest::header::CONTENT_ENCODING)
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    let cache_control = required_remote_model_plane_header(headers, "cache-control")?;
+    let directives = cache_control
+        .split(',')
+        .map(|directive| directive.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if directives.len() != 3
+        || !directives.contains("public")
+        || !directives.contains("max-age=31536000")
+        || !directives.contains("immutable")
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    if required_remote_model_plane_header(headers, "x-rw-nodata")? != "non-finite-transparent"
+        || required_remote_model_plane_header(headers, "x-rw-model-variable")? != variable.name
+        || required_remote_model_plane_header(headers, "x-rw-model-units")? != variable.units
+        || required_remote_model_plane_header(headers, "x-rw-model-codec")? != variable.codec
+        || required_remote_model_plane_header(headers, "x-rw-valid-unix")?
+            .parse::<i64>()
+            .ok()
+            != Some(time.valid_unix)
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    match level_hpa {
+        Some(expected) => {
+            if required_remote_model_plane_header(headers, "x-rw-model-level-hpa")?
+                .parse::<u16>()
+                .ok()
+                != Some(expected)
+            {
+                return Err(CommunityCacheError::Response);
+            }
+        }
+        None if headers.contains_key("x-rw-model-level-hpa") => {
+            return Err(CommunityCacheError::Response);
+        }
+        None => {}
+    }
+    let etag = required_remote_model_plane_header(headers, "etag")?;
+    validate_remote_model_plane_etag(etag, catalog, time, level_hpa)?;
+    Ok(etag.to_owned())
+}
+
+fn validate_remote_model_plane_etag(
+    etag: &str,
+    catalog: &RemoteProfileCatalog,
+    time: &RemoteTimePoint,
+    level_hpa: Option<u16>,
+) -> Result<(), CommunityCacheError> {
+    if etag.len() > 256 || etag.starts_with("W/") {
+        return Err(CommunityCacheError::Response);
+    }
+    let inner = etag
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or(CommunityCacheError::Response)?;
+    let prefix = format!("{}-{}-", catalog.run.snapshot_id, time.storage_slot);
+    let suffix = level_hpa.map_or_else(|| "-surface".to_owned(), |level| format!("-{level}hpa"));
+    let metadata_id = inner
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix(&suffix))
+        .ok_or(CommunityCacheError::Response)?;
+    validate_remote_component(metadata_id)
+}
+
+fn decode_remote_model_plane_body(
+    bytes: &[u8],
+    run: &RemoteRunDescriptor,
+    time: &RemoteTimePoint,
+    variable: &RemoteVariableCapability,
+) -> Result<Vec<f32>, CommunityCacheError> {
+    let expected_size = remote_model_plane_expected_size(
+        run,
+        variable.name.as_bytes().len(),
+        variable.units.as_bytes().len(),
+    )?;
+    if bytes.len() as u64 != expected_size
+        || bytes.len() < REMOTE_MODEL_PLANE_HEADER_BYTES
+        || &bytes[..8] != REMOTE_MODEL_PLANE_MAGIC
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    let version = u32::from_le_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|_| CommunityCacheError::Response)?,
+    );
+    let nx = usize::try_from(u32::from_le_bytes(
+        bytes[12..16]
+            .try_into()
+            .map_err(|_| CommunityCacheError::Response)?,
+    ))
+    .map_err(|_| CommunityCacheError::Response)?;
+    let ny = usize::try_from(u32::from_le_bytes(
+        bytes[16..20]
+            .try_into()
+            .map_err(|_| CommunityCacheError::Response)?,
+    ))
+    .map_err(|_| CommunityCacheError::Response)?;
+    let valid_unix = i64::from_le_bytes(
+        bytes[20..28]
+            .try_into()
+            .map_err(|_| CommunityCacheError::Response)?,
+    );
+    let variable_len = usize::from(u16::from_le_bytes(
+        bytes[28..30]
+            .try_into()
+            .map_err(|_| CommunityCacheError::Response)?,
+    ));
+    let units_len = usize::from(u16::from_le_bytes(
+        bytes[30..32]
+            .try_into()
+            .map_err(|_| CommunityCacheError::Response)?,
+    ));
+    let reserved = u32::from_le_bytes(
+        bytes[32..36]
+            .try_into()
+            .map_err(|_| CommunityCacheError::Response)?,
+    );
+    let variable_end = REMOTE_MODEL_PLANE_HEADER_BYTES
+        .checked_add(variable_len)
+        .ok_or(CommunityCacheError::Response)?;
+    let values_start = variable_end
+        .checked_add(units_len)
+        .ok_or(CommunityCacheError::Response)?;
+    if version != 1
+        || reserved != 0
+        || nx != run.nx
+        || ny != run.ny
+        || valid_unix != time.valid_unix
+        || variable_len != variable.name.len()
+        || units_len != variable.units.len()
+        || values_start > bytes.len()
+        || &bytes[REMOTE_MODEL_PLANE_HEADER_BYTES..variable_end] != variable.name.as_bytes()
+        || &bytes[variable_end..values_start] != variable.units.as_bytes()
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    let cells = nx.checked_mul(ny).ok_or(CommunityCacheError::Response)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(cells)
+        .map_err(|_| CommunityCacheError::Quota)?;
+    for chunk in bytes[values_start..].chunks_exact(size_of::<f32>()) {
+        values.push(f32::from_le_bytes(
+            chunk
+                .try_into()
+                .map_err(|_| CommunityCacheError::Response)?,
+        ));
+    }
+    if values.len() != cells {
+        return Err(CommunityCacheError::Response);
+    }
+    Ok(values)
 }
 
 fn remote_variable<'a>(
@@ -3017,12 +3551,17 @@ fn remote_request(
         .iter()
         .map(|source| SourceProvenance {
             provider: source.provider.clone(),
+            forecast_producer: source.forecast_producer.clone(),
+            licensing_publisher: source.licensing_publisher.clone(),
+            transport_provider: source.transport_provider.clone(),
+            transport_is_mirror: source.transport_is_mirror,
             roles: source.roles.clone(),
             products: source.products.clone(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let schema = request_schema_for_source_provenance(&source_provenance)?;
     Ok(ShareRequest {
-        schema: REQUEST_SCHEMA.into(),
+        schema: schema.into(),
         model: catalog.run.model.clone(),
         run: catalog.run.run.clone(),
         snapshot_id: catalog.run.snapshot_id.clone(),
@@ -3972,6 +4511,87 @@ fn normalized_base_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_owned()
 }
 
+/// Settings historically documented both the authority root and its `/v1`
+/// API prefix as valid origin spellings. Every client route is already rooted
+/// at `/v1`, so retain compatibility by canonicalizing one terminal API
+/// prefix instead of ever issuing `/v1/v1/...` requests.
+fn normalized_origin_url(value: &str) -> String {
+    let mut normalized = normalized_base_url(value);
+    if normalized
+        .get(normalized.len().saturating_sub(3)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("/v1"))
+    {
+        normalized.truncate(normalized.len() - 3);
+    }
+    normalized
+}
+
+fn validate_satellite_api_path(value: &str) -> Result<(), CommunityCacheError> {
+    if value.len() > 8 * 1024
+        || !value.is_ascii()
+        || !value.starts_with("/v1/satellite/")
+        || value.starts_with("//")
+        || value.contains(['\\', '#'])
+        || value
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_ascii_whitespace())
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    let path = value.split('?').next().unwrap_or_default();
+    let lower = path.to_ascii_lowercase();
+    if path.contains("//")
+        || lower.contains("%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || path.split('/').any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err(CommunityCacheError::Response);
+    }
+    Ok(())
+}
+
+/// True only for a concrete URL below the configured origin's satellite API
+/// root. TileJSON templates are validated before placeholder expansion; this
+/// gate intentionally accepts no braces, user-info, fragment, or cross-origin
+/// redirect target.
+fn trusted_satellite_absolute_url(origin_root: &str, candidate: &str) -> bool {
+    let Ok(origin) = reqwest::Url::parse(origin_root) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(candidate) else {
+        return false;
+    };
+    if !origin.scheme().eq_ignore_ascii_case("https")
+        || !url.scheme().eq_ignore_ascii_case("https")
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || origin.host_str() != url.host_str()
+        || origin.port_or_known_default() != url.port_or_known_default()
+    {
+        return false;
+    }
+
+    let origin_path = origin.path().trim_end_matches('/');
+    let required_prefix = if origin_path.is_empty() {
+        "/v1/satellite/".to_owned()
+    } else {
+        format!("{origin_path}/v1/satellite/")
+    };
+    if !url.path().starts_with(&required_prefix) {
+        return false;
+    }
+    let relative_start = origin_path.len();
+    let path_and_query = match url.query() {
+        Some(query) => format!("{}?{query}", &url.path()[relative_start..]),
+        None => url.path()[relative_start..].to_owned(),
+    };
+    validate_satellite_api_path(&path_and_query).is_ok()
+}
+
 fn read_bounded_json<T: DeserializeOwned>(
     response: reqwest::blocking::Response,
     limit: u64,
@@ -4185,6 +4805,10 @@ mod tests {
                 last_valid_unix: Some(1_786_500_000),
                 source_provenance: vec![RemoteSourceProvenance {
                     provider: provider.into(),
+                    forecast_producer: None,
+                    licensing_publisher: None,
+                    transport_provider: None,
+                    transport_is_mirror: false,
                     roles: vec!["pressure".into(), "surface".into()],
                     products: vec!["wrfprs".into(), "wrfsfc".into()],
                 }],
@@ -4229,6 +4853,245 @@ mod tests {
                 remote_variable("u_10m", "surface2d", false, true, vec![]),
             ],
         }
+    }
+
+    fn small_model_plane_catalog(model: &str, provider: &str) -> RemoteProfileCatalog {
+        let mut catalog = remote_profile_catalog(model, provider);
+        catalog.run.nx = 2;
+        catalog.run.ny = 2;
+        catalog.point.x = 1;
+        catalog.point.y = 1;
+        catalog
+    }
+
+    fn model_plane_body(
+        catalog: &RemoteProfileCatalog,
+        variable: &RemoteVariableCapability,
+        time: &RemoteTimePoint,
+        values: &[f32],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(REMOTE_MODEL_PLANE_MAGIC);
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&(catalog.run.nx as u32).to_le_bytes());
+        bytes.extend_from_slice(&(catalog.run.ny as u32).to_le_bytes());
+        bytes.extend_from_slice(&time.valid_unix.to_le_bytes());
+        bytes.extend_from_slice(&(variable.name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&(variable.units.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(variable.name.as_bytes());
+        bytes.extend_from_slice(variable.units.as_bytes());
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn model_plane_headers(
+        catalog: &RemoteProfileCatalog,
+        variable: &RemoteVariableCapability,
+        time: &RemoteTimePoint,
+        level_hpa: Option<u16>,
+    ) -> reqwest::header::HeaderMap {
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        let mut insert = |name: &'static str, value: String| {
+            headers.insert(name, HeaderValue::from_str(&value).unwrap());
+        };
+        insert("content-type", REMOTE_MODEL_PLANE_CONTENT_TYPE.into());
+        insert(
+            "cache-control",
+            "public, max-age=31536000, immutable".into(),
+        );
+        insert("x-rw-nodata", "non-finite-transparent".into());
+        insert("x-rw-model-variable", variable.name.clone());
+        insert("x-rw-model-units", variable.units.clone());
+        insert("x-rw-model-codec", variable.codec.clone());
+        insert("x-rw-valid-unix", time.valid_unix.to_string());
+        if let Some(level) = level_hpa {
+            insert("x-rw-model-level-hpa", level.to_string());
+        }
+        let suffix = level_hpa.map_or_else(|| "surface".to_owned(), |level| format!("{level}hpa"));
+        insert(
+            "etag",
+            format!(
+                "\"{}-{}-7-{suffix}\"",
+                catalog.run.snapshot_id, time.storage_slot
+            ),
+        );
+        headers
+    }
+
+    #[test]
+    fn immutable_model_plane_surface_contract_is_fully_identity_bound() {
+        // CPTEC is intentionally not approved for automatic public
+        // redistribution. Direct reads from an authenticated rw-server must
+        // still work without silently changing that publication policy.
+        let catalog = small_model_plane_catalog("eta_cptec_8km", "cptec-inpe");
+        let time = &catalog.axis[0];
+        let variable = super::remote_variable(&catalog, "temperature_2m").unwrap();
+        assert!(
+            matches!(
+                validate_remote_catalog_for_request(&catalog),
+                Err(CommunityCacheError::Disabled)
+            ),
+            "the Community Cache publication boundary must remain closed"
+        );
+        assert_eq!(
+            validate_remote_model_plane_request(&catalog, time, "temperature_2m", None).unwrap(),
+            variable
+        );
+        assert_eq!(
+            remote_model_plane_path(&catalog, time, variable, None),
+            format!(
+                "/v1/models/eta_cptec_8km/runs/20260812_00z/planes/1/temperature_2m.bin?expected_snapshot_id={}&expected_grid_hash={}",
+                catalog.run.snapshot_id, catalog.run.grid_hash
+            )
+        );
+
+        let headers = model_plane_headers(&catalog, variable, time, None);
+        let etag =
+            validate_remote_model_plane_headers(&headers, &catalog, time, variable, None).unwrap();
+        assert!(etag.ends_with("-7-surface\""));
+        let body = model_plane_body(
+            &catalog,
+            variable,
+            time,
+            &[273.15, f32::NAN, -2.5, f32::INFINITY],
+        );
+        assert_eq!(
+            body.len() as u64,
+            remote_model_plane_expected_size(
+                &catalog.run,
+                variable.name.len(),
+                variable.units.len()
+            )
+            .unwrap()
+        );
+        let values = decode_remote_model_plane_body(&body, &catalog.run, time, variable).unwrap();
+        assert_eq!(values[0], 273.15);
+        assert!(values[1].is_nan());
+        assert_eq!(values[2], -2.5);
+        assert!(values[3].is_infinite());
+    }
+
+    #[test]
+    fn new_model_direct_profile_cycles_do_not_gain_publication_rights() {
+        for (model, provider, producer, publisher, transport) in [
+            (
+                "hrdps-west",
+                "eccc-msc-hrdps-west-dd-alpha",
+                "eccc-msc",
+                "environment-canada",
+                "eccc-msc",
+            ),
+            (
+                "eta-cptec-8km",
+                "cptec-inpe",
+                "cptec-inpe",
+                "inpe",
+                "cptec-inpe",
+            ),
+        ] {
+            let mut catalog = small_model_plane_catalog(model, provider);
+            let provenance = &mut catalog.run.source_provenance[0];
+            provenance.forecast_producer = Some(producer.into());
+            provenance.licensing_publisher = Some(publisher.into());
+            provenance.transport_provider = Some(transport.into());
+            let selection = RemoteProfileVariableSelection {
+                pressure_variables: vec!["temperature_iso".into(), "dewpoint_iso".into()],
+                surface_variables: vec!["temperature_2m".into(), "u_10m".into()],
+                pressure_levels_hpa: vec![],
+            };
+            let mut direct_selection = selection.clone();
+            validate_remote_profile_cycle_request(&catalog, &mut direct_selection)
+                .unwrap_or_else(|error| panic!("{model} direct profile cycle rejected: {error}"));
+            assert!(matches!(
+                build_remote_profile_request(
+                    &catalog,
+                    &catalog.axis[0],
+                    selection,
+                    &ProtocolLimits::default(),
+                ),
+                Err(CommunityCacheError::Disabled)
+            ));
+        }
+    }
+
+    #[test]
+    fn immutable_model_plane_pressure_contract_requires_advertised_level() {
+        let catalog = small_model_plane_catalog("hrrr", "noaa-aws-public-data");
+        let time = &catalog.axis[1];
+        let variable = super::remote_variable(&catalog, "temperature_iso").unwrap();
+        assert!(
+            validate_remote_model_plane_request(&catalog, time, "temperature_iso", Some(700))
+                .is_ok()
+        );
+        assert_eq!(
+            remote_model_plane_path(&catalog, time, variable, Some(700)),
+            format!(
+                "/v1/models/hrrr/runs/20260812_00z/planes/2/temperature_iso.bin?expected_snapshot_id={}&expected_grid_hash={}&level_hpa=700",
+                catalog.run.snapshot_id, catalog.run.grid_hash
+            )
+        );
+        assert!(
+            validate_remote_model_plane_request(&catalog, time, "temperature_iso", Some(925))
+                .is_err()
+        );
+        assert!(
+            validate_remote_model_plane_request(&catalog, time, "temperature_iso", None).is_err()
+        );
+        assert!(
+            validate_remote_model_plane_request(&catalog, time, "temperature_2m", Some(700))
+                .is_err()
+        );
+
+        let headers = model_plane_headers(&catalog, variable, time, Some(700));
+        assert!(
+            validate_remote_model_plane_headers(&headers, &catalog, time, variable, Some(700))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn immutable_model_plane_rejects_malformed_headers_and_envelopes() {
+        use reqwest::header::HeaderValue;
+
+        let catalog = small_model_plane_catalog("hrrr", "noaa-aws-public-data");
+        let time = &catalog.axis[0];
+        let variable = super::remote_variable(&catalog, "temperature_2m").unwrap();
+        let valid_headers = model_plane_headers(&catalog, variable, time, None);
+        for (name, value) in [
+            ("content-type", "application/octet-stream"),
+            ("cache-control", "public, max-age=0, immutable"),
+            ("x-rw-nodata", "zero"),
+            ("x-rw-model-variable", "dewpoint_2m"),
+            ("x-rw-model-units", "degF"),
+            ("x-rw-model-codec", "lossless-ish"),
+            ("x-rw-valid-unix", "0"),
+            ("etag", "W/\"weak\""),
+        ] {
+            let mut headers = valid_headers.clone();
+            headers.insert(name, HeaderValue::from_static(value));
+            assert!(
+                validate_remote_model_plane_headers(&headers, &catalog, time, variable, None)
+                    .is_err(),
+                "accepted malformed {name}"
+            );
+        }
+        let valid_body = model_plane_body(&catalog, variable, time, &[1.0, 2.0, 3.0, 4.0]);
+        for offset in [0_usize, 8, 12, 16, 20, 28, 30, 32, 36] {
+            let mut malformed = valid_body.clone();
+            malformed[offset] ^= 0xff;
+            assert!(
+                decode_remote_model_plane_body(&malformed, &catalog.run, time, variable).is_err(),
+                "accepted malformed byte at offset {offset}"
+            );
+        }
+        let mut trailing = valid_body;
+        trailing.push(0);
+        assert!(decode_remote_model_plane_body(&trailing, &catalog.run, time, variable).is_err());
     }
 
     fn pressure_profile(name: &str) -> RemotePressureProfile {
@@ -4327,6 +5190,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["pressure".into()],
                 products: vec!["wrfprs".into()],
             }],
@@ -4363,6 +5230,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["surface".into()],
                 products: vec!["wrfsfc".into()],
             }],
@@ -4488,6 +5359,34 @@ mod tests {
             invalid.exact_time_axis = exact_time_axis;
             assert!(validate_remote_run(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn remote_source_provenance_accepts_legacy_and_rejects_partial_identity() {
+        let legacy: RemoteSourceProvenance = serde_json::from_value(serde_json::json!({
+            "provider": "noaa-aws-public-data",
+            "roles": ["pressure"],
+            "products": ["wrfprs"]
+        }))
+        .unwrap();
+        assert_eq!(legacy.forecast_producer, None);
+        assert_eq!(legacy.licensing_publisher, None);
+        assert_eq!(legacy.transport_provider, None);
+        assert!(!legacy.transport_is_mirror);
+        validate_remote_source_provenance(&legacy).unwrap();
+
+        let mut structured = legacy.clone();
+        structured.forecast_producer = Some("noaa-ncep".into());
+        structured.licensing_publisher = Some("noaa-ncep".into());
+        structured.transport_provider = Some("amazon-web-services".into());
+        structured.transport_is_mirror = true;
+        validate_remote_source_provenance(&structured).unwrap();
+
+        structured.transport_provider = None;
+        assert!(validate_remote_source_provenance(&structured).is_err());
+        let mut legacy_mirror = legacy;
+        legacy_mirror.transport_is_mirror = true;
+        assert!(validate_remote_source_provenance(&legacy_mirror).is_err());
     }
 
     #[test]
@@ -4652,6 +5551,35 @@ mod tests {
                 .is_err()
             );
         }
+
+        let mut structured_catalog = catalog.clone();
+        let expected_source = &mut structured_catalog.run.source_provenance[0];
+        expected_source.forecast_producer = Some("noaa-ncep".into());
+        expected_source.licensing_publisher = Some("noaa-ncep".into());
+        expected_source.transport_provider = Some("amazon-web-services".into());
+        expected_source.transport_is_mirror = true;
+        let mut structured_result = remote_profile_cycle_result(&structured_catalog);
+        assert!(
+            validate_remote_profile_cycle(
+                &structured_result,
+                &structured_catalog,
+                &selection,
+                &ProtocolLimits::default()
+            )
+            .is_ok()
+        );
+        structured_result.samples[0].source_provenance[0].transport_provider =
+            Some("google-cloud".into());
+        assert!(
+            validate_remote_profile_cycle(
+                &structured_result,
+                &structured_catalog,
+                &selection,
+                &ProtocolLimits::default()
+            )
+            .is_err(),
+            "sample provenance may not substitute a different structured transport identity"
+        );
     }
 
     #[test]
@@ -5840,6 +6768,7 @@ mod tests {
             &ProtocolLimits::default(),
         )
         .unwrap();
+        assert_eq!(request.schema, REQUEST_SCHEMA);
         assert_eq!(request.model, "hrrr");
         assert_eq!(request.run, catalog.run.run);
         assert_eq!(request.snapshot_id, catalog.run.snapshot_id);
@@ -5871,6 +6800,24 @@ mod tests {
         assert!(!request.publication.explicit_owner_publication);
         assert!(request.publication.redistribution_rights_confirmed);
         request.validate(&ProtocolLimits::default()).unwrap();
+        assert_eq!(
+            request_sha256(&request).unwrap(),
+            "725004c32c4c051f2b0d76e363f1c51aadf6ca878e5974e2fb4d26b0a2c3af91",
+            "the all-legacy v1 request identity must remain byte-for-byte stable"
+        );
+        let serialized = serde_json::to_value(&request).unwrap();
+        let source = &serialized["source_provenance"][0];
+        for field in [
+            "forecast_producer",
+            "licensing_publisher",
+            "transport_provider",
+            "transport_is_mirror",
+        ] {
+            assert!(
+                source.get(field).is_none(),
+                "legacy wire form leaked {field}"
+            );
+        }
 
         let repeated = build_remote_profile_request(
             &catalog,
@@ -5887,6 +6834,68 @@ mod tests {
             request_sha256(&request).unwrap(),
             request_sha256(&repeated).unwrap()
         );
+    }
+
+    #[test]
+    fn remote_profile_builder_uses_v2_only_for_uniform_structured_identity() {
+        let mut catalog = remote_profile_catalog("hrrr", "noaa-aws-public-data");
+        let source = &mut catalog.run.source_provenance[0];
+        source.forecast_producer = Some("noaa-ncep".into());
+        source.licensing_publisher = Some("noaa-ncep".into());
+        source.transport_provider = Some("amazon-web-services".into());
+        source.transport_is_mirror = true;
+        let selection = || RemoteProfileVariableSelection {
+            pressure_variables: vec!["temperature_iso".into()],
+            surface_variables: vec!["temperature_2m".into()],
+            pressure_levels_hpa: vec![500],
+        };
+
+        let structured = build_remote_profile_request(
+            &catalog,
+            &catalog.axis[0],
+            selection(),
+            &ProtocolLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(structured.schema, rw_community_protocol::REQUEST_SCHEMA_V2);
+        assert_eq!(
+            structured.source_provenance[0].forecast_producer.as_deref(),
+            Some("noaa-ncep")
+        );
+        assert_eq!(
+            structured.source_provenance[0]
+                .licensing_publisher
+                .as_deref(),
+            Some("noaa-ncep")
+        );
+        assert_eq!(
+            structured.source_provenance[0]
+                .transport_provider
+                .as_deref(),
+            Some("amazon-web-services")
+        );
+        assert!(structured.source_provenance[0].transport_is_mirror);
+        structured.validate(&ProtocolLimits::default()).unwrap();
+
+        let legacy = remote_profile_catalog("hrrr", "noaa-aws-public-data")
+            .run
+            .source_provenance[0]
+            .clone();
+        catalog.run.source_provenance.insert(0, legacy);
+        let error = build_remote_profile_request(
+            &catalog,
+            &catalog.axis[0],
+            selection(),
+            &ProtocolLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CommunityCacheError::Protocol(rw_community_protocol::ProtocolError::InvalidField {
+                field: "source_provenance",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -5952,5 +6961,65 @@ mod tests {
         catalog = remote_profile_catalog("hrrr", "noaa-aws-public-data");
         catalog.variables[0].available_slots.push(99);
         assert!(validate_remote_axis(&catalog.axis, &catalog.run, &catalog.variables).is_err());
+    }
+
+    #[test]
+    fn satellite_paths_are_confined_to_the_configured_api_root() {
+        assert_eq!(
+            normalized_origin_url("https://weather.example.edu/v1/"),
+            "https://weather.example.edu"
+        );
+        assert_eq!(
+            normalized_origin_url("https://weather.example.edu/rw/V1"),
+            "https://weather.example.edu/rw"
+        );
+        assert_eq!(
+            normalized_origin_url("https://weather.example.edu/v10"),
+            "https://weather.example.edu/v10"
+        );
+        assert!(validate_satellite_api_path("/v1/satellite/catalog").is_ok());
+        assert!(
+            validate_satellite_api_path(
+                "/v1/satellite/g19/conus/clean_ir/20260825T1200/tilejson.json"
+            )
+            .is_ok()
+        );
+        for rejected in [
+            "//evil.example/v1/satellite/catalog",
+            "/v1/models",
+            "/v1/satellite/../secret",
+            "/v1/satellite/%2e%2e/secret",
+            "/v1/satellite/%2F%2Fevil.example/tile",
+            "/v1/satellite/catalog#fragment",
+            "/v1/satellite/catalog\nheader",
+        ] {
+            assert!(
+                validate_satellite_api_path(rejected).is_err(),
+                "accepted {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn satellite_absolute_urls_are_https_same_origin_and_base_path_bound() {
+        let origin = "https://weather.example.edu/rw";
+        assert!(trusted_satellite_absolute_url(
+            origin,
+            "https://weather.example.edu/rw/v1/satellite/g19/conus/clean_ir/20260825T1200/tiles/rw-sat-native-v2/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/4/3/6.png"
+        ));
+        for rejected in [
+            "http://weather.example.edu/rw/v1/satellite/catalog",
+            "https://evil.example/rw/v1/satellite/catalog",
+            "https://weather.example.edu/v1/satellite/catalog",
+            "https://weather.example.edu/rw2/v1/satellite/catalog",
+            "https://user:secret@weather.example.edu/rw/v1/satellite/catalog",
+            "https://weather.example.edu/rw/v1/satellite/%2e%2e/secret",
+            "https://weather.example.edu/rw/v1/satellite/catalog#fragment",
+        ] {
+            assert!(
+                !trusted_satellite_absolute_url(origin, rejected),
+                "accepted {rejected:?}"
+            );
+        }
     }
 }

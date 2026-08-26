@@ -13,13 +13,15 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Timelike, Utc};
-use rustwx_core::{GridShape, LatLonGrid, MAX_GRID_CELLS};
+use rustwx_core::{GridShape, LatLonGrid};
 use rw_sat::store::{WrittenFrame, frame_file_name};
 use rw_store::format::RwsWriterInfo;
 use rw_store::grid::{GridFile, write_grid};
 use rw_store::lock::RunLock;
 use rw_store::run::{RwsHourEntry, RwsRunManifest};
 use rw_store::writer::HourWriter;
+
+use crate::sat_worker::SAT_PREVIEW_MAX_CELLS;
 
 pub(crate) const RGB_R_VAR: &str = "rgb_r";
 pub(crate) const RGB_G_VAR: &str = "rgb_g";
@@ -218,9 +220,9 @@ fn validate_input(
         .width
         .checked_mul(image.height)
         .ok_or_else(|| format!("RGB dimensions {}x{} overflow", image.width, image.height))?;
-    if pixel_count > MAX_GRID_CELLS {
+    if pixel_count > SAT_PREVIEW_MAX_CELLS {
         return Err(format!(
-            "RGB image has {pixel_count} pixels; shared grid safety limit is {MAX_GRID_CELLS}"
+            "RGB preview has {pixel_count} pixels; BowEcho's preview budget is {SAT_PREVIEW_MAX_CELLS} (native satellite sources are retained separately at full resolution)"
         ));
     }
     let expected_bytes = pixel_count.checked_mul(3).ok_or_else(|| {

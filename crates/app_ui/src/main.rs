@@ -29,12 +29,13 @@ use render2d::{
     composite_reflectivity_grid, dealias_velocity_grid, dealias_velocity_grid_pyart_region,
     dealias_velocity_grid_region_global_rift, dealias_volume_v4,
     detect_rotation_sites_from_dealiased, echo_top_grid, gust_proxy_grid_from_dealiased,
-    hail_grids, identify_storm_cells, marc_grid_from_dealiased, mehs_grid,
-    moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid_from_dealiased,
-    reflectivity_cross_section_with_smoothing, rotation_velocity_cut_indices, smooth_moment_grid,
-    storm_relative_velocity_mps, upsample_moment_grid,
-    velocity_cross_section_from_dealiased_with_smoothing, viewport_rgba_buffer_len,
-    viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
+    hail_grids, identify_storm_cells, marc_grid_from_dealiased, mask_sweep_reveal_rgba_in_place,
+    mehs_grid, moment_cross_section_with_smoothing, poh_grid,
+    radial_divergence_grid_from_dealiased, reflectivity_cross_section_with_smoothing,
+    rotation_velocity_cut_indices, smooth_moment_grid, storm_relative_velocity_mps,
+    upsample_moment_grid, velocity_cross_section_from_dealiased_with_smoothing,
+    viewport_rgba_buffer_len, viewport_sample_cache_storage_upper_bound, vil_density_grid,
+    vil_grid,
 };
 use serde::{Deserialize, Serialize};
 use settings::{LoopSweepControl, SweepPolicy, SweepPolicyMode, SweepPolicySet, SweepProductGroup};
@@ -111,8 +112,10 @@ mod raster_quality;
 mod rebuildable_cache;
 mod rhi;
 mod river_gauges;
+mod sat_native_map;
 mod sat_paint;
 mod sat_plot;
+mod sat_remote;
 mod sat_rgb_store;
 mod sat_window;
 mod sat_worker;
@@ -134,6 +137,7 @@ mod sounding_correction_ui;
 mod sounding_table_config;
 mod spc_layers;
 mod spc_md_image;
+mod sweep_animation;
 mod table_editor;
 mod taiwan_cwa;
 mod tor_tracks;
@@ -426,6 +430,7 @@ pub(crate) use ui_core::loop_engine::FrameHistory;
 // were the FIRST view on the engine, extra panes the SECOND (spec §7
 // adoption order overlays → panes → primary). The primary path still runs
 // its legacy plumbing until 4e.
+use sweep_animation::{SweepAnimator, SweepState, catch_up_factor};
 pub(crate) use ui_core::loop_engine::{
     ArchiveWindow, EngineId, EngineRole, FeedSource, HistoryLimits, InstallSelection, LiveAction,
     Liveness, LoopEngine, SelectionPolicy, StepOutcome, SweepContext,
@@ -584,6 +589,12 @@ const ACTIVE_ALERT_ZONE_FETCH_CONCURRENCY: usize = 8;
 const HAZARD_OUTLINE_VERTEX_LIMIT: usize = 1_024;
 const HAZARD_OUTLINE_FAMILY_VERTEX_BUDGET: usize = 32_768;
 const HAZARD_OUTLINE_MIN_VERTEX_LIMIT: usize = 48;
+/// Wheel/trackpad zoom emits a stream of separate input frames. Rebuilding
+/// exact screen-space warning unions (and full model rasters) in the gaps
+/// between those events made a single gesture enqueue a succession of obsolete
+/// regional views. Keep cheap outlines/current textures during the gesture and
+/// restore exact work once the wheel has been quiet for this long.
+const MAP_SCROLL_SETTLE_MS: u64 = 180;
 /// Screen-pixel radius for the Shift+click "pin this station's 3h obs
 /// timeline" gesture and its hover-card hint. Matches the pinned-inspector
 /// release radius so the pin and release gestures share one feel.
@@ -1383,6 +1394,16 @@ const OUTLOOK_RING_WRAPAROUND_SPACING_MULTIPLE: f32 = 128.0;
 const OUTLOOK_RING_WRAPAROUND_MAX_DIAGONAL_MULTIPLE: f32 = 40.0;
 const MAP_LAYER_RERENDER_PAN_PX: f32 = 0.5;
 const MAP_LAYER_RERENDER_ZOOM_RATIO: f32 = 0.001;
+/// Model rasters are CPU sampled. Keep close/default views nearly pixel-for-
+/// pixel while bounding regional/national work, where a full logical-pixel
+/// raster spends millions of inverse-grid lookups on detail the screen cannot
+/// resolve. The downsampled texture still spans the complete map extent.
+const MODEL_LAYER_FOCUSED_PIXEL_BUDGET: usize = 2_000_000;
+const MODEL_LAYER_REGIONAL_PIXEL_BUDGET: usize = 700_000;
+const MODEL_LAYER_WIDE_PIXEL_BUDGET: usize = 360_000;
+const MODEL_LAYER_REGIONAL_MAX_SCALE: f32 = 72.0;
+const MODEL_LAYER_WIDE_MAX_SCALE: f32 = 32.0;
+const MODEL_LAYER_RENDER_MAX_EDGE: usize = 2_048;
 /// Timeline follow only steers the satellite map layer to a frame within
 /// this many seconds of the displayed radar moment. Beyond it, no stored
 /// scan says anything about that moment — the map stays wherever the
@@ -3382,6 +3403,10 @@ struct ViewerApp {
     // Frame-cost caches (RefCell: draw fns take &self on the UI thread).
     basemap_shape_cache: std::cell::RefCell<ShapeCache<Vec<egui::Shape>>>,
     hazard_shape_cache: std::cell::RefCell<ShapeCache<Arc<HazardOverlayShapes>>>,
+    /// End of the quiet period after the most recent map wheel/trackpad zoom.
+    /// This is deliberately map-input-specific: unrelated slider/window drags
+    /// must never blank warning fills.
+    map_scroll_settle_until: Option<Instant>,
     // Cross-section (RHI) draw mode + rendered section.
     cross_section_armed: bool,
     /// Session visibility of the cross-section viewer. A/B endpoints and the
@@ -3425,6 +3450,9 @@ struct ViewerApp {
     /// first open; store shares rusty-weather's rolling sat store).
     sat: Option<sat_worker::SatWorker>,
     sat_panel: rw_ui::SatellitePanel,
+    /// Honest split between compact player previews and retained native
+    /// satellite sources for the active GOES scope.
+    sat_storage_usage: Option<sat_worker::SatStorageUsage>,
     sat_player: rw_ui::SatPlayerPanel,
     /// Mirrored satellite store listings. `SatPlayerPanel` owns its copy
     /// privately, while the unified radar/event timeline needs frame times
@@ -3515,8 +3543,27 @@ struct ViewerApp {
     sat_layer_build_rx: Option<mpsc::Receiver<Option<SatMapLayer>>>,
     /// GPU map raster plus its generation/view and whether the rendered
     /// viewport contained at least one non-transparent satellite pixel.
-    sat_layer_texture: Option<(egui::TextureHandle, u64, ModelLayerView, bool)>,
-    sat_layer_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
+    /// Last successfully rendered satellite raster plus its exact displayed
+    /// identity. The identity stays with a retained texture so a failed/new
+    /// frame can never be painted under the requested frame's timestamp.
+    sat_layer_texture: Option<(
+        egui::TextureHandle,
+        u64,
+        ModelLayerView,
+        bool,
+        rw_ui::SatRunKey,
+        u16,
+    )>,
+    sat_layer_render_rx: Option<mpsc::Receiver<SatLayerRender>>,
+    /// Cooperative stop token for the one detached satellite raster worker.
+    /// A dropped receiver alone does not stop native NetCDF/HTTP tile work.
+    sat_layer_render_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    sat_layer_render_generation: Option<u64>,
+    sat_layer_render_view: Option<ModelLayerView>,
+    /// Transient native-tile failures keep the last valid texture and retry
+    /// with bounded backoff instead of installing a transparent success.
+    sat_layer_render_retry_after: Option<Instant>,
+    sat_layer_render_failures: u8,
     sat_layer_generation: u64,
     /// Content-addressed satellite InverseLut cache, most-recent first (see
     /// [`SatLutCacheEntry`]). Deliberately NOT cleared on spec change or
@@ -3907,6 +3954,8 @@ struct ViewerApp {
     styles_newer_schema: bool,
     hidden_hazard_families: BTreeSet<String>,
     display_live_chunk_updates: bool,
+    /// Smooth radial reveal for the primary pane's growing realtime cut.
+    live_sweep: LiveSweepRuntime,
     live_refresh_skip_reason: Option<String>,
     live_hazard_auto_refresh: bool,
     show_performance_stats: bool,
@@ -4480,6 +4529,167 @@ fn previous_dealias_reference_volume(
                 && frame.volume.volume_time < current.volume_time
         })
         .map(|frame| Arc::clone(&frame.volume))
+}
+
+#[derive(Clone)]
+struct CompletedSweepUnderlay {
+    volume: Arc<RadarVolume>,
+    cut: usize,
+    history_index: usize,
+}
+
+/// Split-cut identity. Reflectivity alone is not enough: a short-range
+/// Doppler leg can also carry REF and must never underpaint a long-range
+/// surveillance leg at the same nominal elevation.
+fn live_sweep_leg(cut: &ElevationCut) -> (bool, bool) {
+    let has_velocity = cut.moments.contains_key(&MomentType::Velocity);
+    let has_dual_pol = cut
+        .moments
+        .contains_key(&MomentType::DifferentialReflectivity)
+        || cut
+            .moments
+            .contains_key(&MomentType::CorrelationCoefficient)
+        || cut.moments.contains_key(&MomentType::DifferentialPhase);
+    (has_velocity, has_dual_pol)
+}
+
+fn live_sweep_cut_is_complete(cut: &ElevationCut) -> bool {
+    SweepAnimator::new()
+        .observe(cut, Duration::ZERO)
+        .is_some_and(|state| state.complete)
+}
+
+const SWEEP_UNDERLAY_ELEVATION_TOLERANCE_DEG: f32 = 0.15;
+
+/// Median measured radial elevation for one sweep. The stored cut angle can
+/// describe the commanded or first settling angle; the median resists that
+/// one-sided antenna ramp and is the stable value for SAILS/VCP matching.
+fn median_sweep_elevation_deg(cut: &ElevationCut) -> Option<f32> {
+    let mut elevations = cut
+        .radials
+        .iter()
+        .map(|radial| radial.elevation_deg)
+        .filter(|elevation| elevation.is_finite())
+        .collect::<Vec<_>>();
+    if elevations.is_empty() {
+        return None;
+    }
+    elevations.sort_by(f32::total_cmp);
+    Some(elevations[elevations.len() / 2])
+}
+
+/// Find a complete cut carrying the same units, nominal elevation, and
+/// surveillance/Doppler leg as `target`.
+fn completed_matching_sweep_cut(
+    volume: &RadarVolume,
+    target: &ElevationCut,
+    moment: &MomentType,
+) -> Option<usize> {
+    let target_elevation = median_sweep_elevation_deg(target)?;
+    let compatible = |cut: &ElevationCut| {
+        cut.moments
+            .get(moment)
+            .is_some_and(|grid| grid.radial_count() > 0)
+            && live_sweep_leg(cut) == live_sweep_leg(target)
+            && median_sweep_elevation_deg(cut).is_some_and(|elevation| {
+                (elevation - target_elevation).abs() <= SWEEP_UNDERLAY_ELEVATION_TOLERANCE_DEG
+            })
+            && live_sweep_cut_is_complete(cut)
+    };
+
+    // Elevation number is a useful SAILS discriminator only after measured
+    // angle compatibility is established. Across VCP changes the same number
+    // can denote a materially different physical tilt.
+    if let Some(number) = target.elevation_number
+        && let Some((index, _)) = volume
+            .cuts
+            .iter()
+            .enumerate()
+            .filter(|(_, cut)| cut.elevation_number == Some(number) && compatible(cut))
+            .max_by_key(|(_, cut)| cut.radials.len())
+    {
+        return Some(index);
+    }
+
+    volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter(|(_, cut)| compatible(cut))
+        .max_by_key(|(_, cut)| cut.radials.len())
+        .map(|(index, _)| index)
+}
+
+/// Last finished picture suitable for the unrevealed wedge. Prefer the newest
+/// older complete volume. If none is retained, an earlier completed SAILS cut
+/// in this same volume is an honest fallback.
+fn previous_completed_sweep(
+    frames: &[FrameHistoryEntry],
+    current: &Arc<RadarVolume>,
+    current_cut: usize,
+    moment: &MomentType,
+) -> Option<CompletedSweepUnderlay> {
+    let target = current.cuts.get(current_cut)?;
+    let current_ptr = Arc::as_ptr(current) as usize;
+    let current_position = frames
+        .iter()
+        .position(|frame| Arc::as_ptr(&frame.volume) as usize == current_ptr)
+        .or_else(|| {
+            let identity = frame_identity_for_volume(current.as_ref());
+            frames.iter().position(|frame| frame.identity == identity)
+        })?;
+
+    // Only the newest eligible finished volume represents the last picture.
+    // Searching farther back after that volume lacks the commanded tilt can
+    // resurrect 10-30-minute-old echoes over a much fresher same-volume SAILS
+    // repeat.
+    if let Some((history_index, frame)) =
+        frames[..current_position]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, frame)| {
+                !matches!(
+                    frame.status,
+                    FrameStatus::Preview | FrameStatus::LivePartial
+                ) && frame.volume.site.id.eq_ignore_ascii_case(&current.site.id)
+                    && frame.volume.volume_time < current.volume_time
+                    && current
+                        .volume_time
+                        .signed_duration_since(frame.volume.volume_time)
+                        <= chrono::Duration::minutes(30)
+            })
+        && let Some(cut) = completed_matching_sweep_cut(frame.volume.as_ref(), target, moment)
+    {
+        return Some(CompletedSweepUnderlay {
+            volume: Arc::clone(&frame.volume),
+            cut,
+            history_index,
+        });
+    }
+
+    let target_elevation = median_sweep_elevation_deg(target)?;
+    let cut = current.cuts[..current_cut]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, candidate)| {
+            let same_units = candidate
+                .moments
+                .get(moment)
+                .is_some_and(|grid| grid.radial_count() > 0);
+            let same_leg = live_sweep_leg(candidate) == live_sweep_leg(target);
+            let same_tilt = median_sweep_elevation_deg(candidate).is_some_and(|elevation| {
+                (elevation - target_elevation).abs() <= SWEEP_UNDERLAY_ELEVATION_TOLERANCE_DEG
+            });
+            (same_units && same_leg && same_tilt && live_sweep_cut_is_complete(candidate))
+                .then_some(index)
+        })?;
+    Some(CompletedSweepUnderlay {
+        volume: Arc::clone(current),
+        cut,
+        history_index: current_position,
+    })
 }
 
 /// Background velocity analyses are intentionally scan-complete. Live-partial
@@ -5692,15 +5902,23 @@ struct WeatherGovRadarAlarmRecord {
 struct SatMapLayer {
     key: rw_ui::SatRunKey,
     hhmm: u16,
+    /// Exact retained NetCDF source, sampled through bounded native XYZ
+    /// windows at the current map zoom.
+    native: Option<Arc<sat_native_map::NativeTileRenderer>>,
+    /// Bounded `.rws` fallback for old GOES frames and non-GOES providers.
+    preview: Option<SatMapPreviewLayer>,
+    opacity: f32,
+    visible: bool,
+    generation: u64,
+}
+
+struct SatMapPreviewLayer {
     image: Arc<egui::ColorImage>,
     grid: Arc<rw_store::grid::GridFile>,
     lut: Arc<model_layer::InverseLut>,
     nx: usize,
     ny: usize,
     flip_rows: bool,
-    opacity: f32,
-    visible: bool,
-    generation: u64,
 }
 
 /// One cached satellite inverse-geolocation LUT, keyed by the grid's
@@ -5858,6 +6076,50 @@ struct MapLayerSlot {
     layer: model_layer::ModelMapLayer,
     texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
     render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
+    /// Cooperative stop flag for the detached raster thread. Dropping an
+    /// mpsc receiver only rejects the final send; without this token an old
+    /// regional render still burns every inverse lookup after hide/remove or
+    /// after a newer camera request supersedes it.
+    render_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    render_generation: Option<u64>,
+    render_view: Option<ModelLayerView>,
+}
+
+impl MapLayerSlot {
+    /// Cancel the detached raster worker at its next row boundary and forget
+    /// its result channel. Safe to call repeatedly. This is `pub(crate)` so
+    /// the sibling layer-rail UI can make hide/remove/palette actions cancel
+    /// synchronously instead of waiting for the next map paint.
+    pub(crate) fn cancel_render(&mut self) {
+        if let Some(cancel) = self.render_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.render_rx = None;
+        self.render_generation = None;
+        self.render_view = None;
+    }
+
+    fn finish_render(&mut self) {
+        self.render_cancel = None;
+        self.render_rx = None;
+        self.render_generation = None;
+        self.render_view = None;
+    }
+
+    fn render_request_is_obsolete(&self, generation: u64, view: &ModelLayerView) -> bool {
+        self.render_rx.is_some()
+            && (self.render_generation != Some(generation)
+                || self
+                    .render_view
+                    .as_ref()
+                    .is_none_or(|requested| model_layer_view_needs_rerender(requested, view)))
+    }
+}
+
+impl Drop for MapLayerSlot {
+    fn drop(&mut self) {
+        self.cancel_render();
+    }
 }
 
 /// The map view a model-layer raster was rendered for.
@@ -5893,6 +6155,91 @@ fn model_layer_view_needs_rerender(rendered: &ModelLayerView, current: &ModelLay
     );
     let pan_px = east_km.hypot(north_km) as f32 * current.map_scale / 111.32;
     pan_px > MAP_LAYER_RERENDER_PAN_PX
+}
+
+fn model_layer_render_pixel_budget(map_scale: f32) -> usize {
+    if !map_scale.is_finite() || map_scale <= MODEL_LAYER_WIDE_MAX_SCALE {
+        MODEL_LAYER_WIDE_PIXEL_BUDGET
+    } else if map_scale <= MODEL_LAYER_REGIONAL_MAX_SCALE {
+        MODEL_LAYER_REGIONAL_PIXEL_BUDGET
+    } else {
+        MODEL_LAYER_FOCUSED_PIXEL_BUDGET
+    }
+}
+
+fn model_layer_render_worker_limit(threads: usize) -> usize {
+    if threads <= 4 { 1 } else { 2 }
+}
+
+fn model_layer_render_worker_available(active: usize, threads: usize) -> bool {
+    active < model_layer_render_worker_limit(threads)
+}
+
+/// Choose a bounded raster size without changing its aspect or geographic
+/// footprint. `logical_*` are map points; the result is texture pixels.
+fn model_layer_render_dimensions(
+    logical_width: f64,
+    logical_height: f64,
+    map_scale: f32,
+) -> (usize, usize) {
+    let logical_width = if logical_width.is_finite() {
+        logical_width.max(8.0)
+    } else {
+        8.0
+    };
+    let logical_height = if logical_height.is_finite() {
+        logical_height.max(8.0)
+    } else {
+        8.0
+    };
+    let budget = model_layer_render_pixel_budget(map_scale).max(64);
+    let area = logical_width * logical_height;
+    let area_scale = (budget as f64 / area).sqrt().min(1.0);
+    let edge_scale = (MODEL_LAYER_RENDER_MAX_EDGE as f64 / logical_width)
+        .min(MODEL_LAYER_RENDER_MAX_EDGE as f64 / logical_height)
+        .min(1.0);
+    let scale = area_scale.min(edge_scale);
+    let mut width = (logical_width * scale).floor().max(8.0) as usize;
+    let mut height = (logical_height * scale).floor().max(8.0) as usize;
+    // The minimum edge can push a pathological panorama a few pixels over
+    // budget. Keep the hard bound total even for such inputs.
+    if width.saturating_mul(height) > budget {
+        if width >= height {
+            width = (budget / height.max(1)).max(8);
+        } else {
+            height = (budget / width.max(1)).max(8);
+        }
+    }
+    (width, height)
+}
+
+/// Map one bounded-raster pixel center back into the complete logical map
+/// rectangle. Using logical dimensions here (rather than the reduced raster
+/// dimensions) is what prevents regional renders from cropping their extent.
+fn model_layer_sample_enu_km(
+    column: usize,
+    row: usize,
+    raster_width: usize,
+    raster_height: usize,
+    logical_width: f64,
+    logical_height: f64,
+    km_per_point: f64,
+) -> (f64, f64) {
+    let logical_x = (column as f64 + 0.5) * logical_width / raster_width.max(1) as f64;
+    let logical_y = (row as f64 + 0.5) * logical_height / raster_height.max(1) as f64;
+    (
+        (logical_x - logical_width * 0.5) * km_per_point,
+        (logical_height * 0.5 - logical_y) * km_per_point,
+    )
+}
+
+fn model_slot_needs_latest_field_refresh(
+    slot: &MapLayerSlot,
+    latest: &Arc<rw_ui::FieldData>,
+) -> bool {
+    slot.layer.visible
+        && slot.layer.field.key.var == latest.key.var
+        && !Arc::ptr_eq(&slot.layer.field, latest)
 }
 
 /// Whether a field came from a locally-ingested WRF/NetCDF run (store model
@@ -6015,6 +6362,13 @@ fn model_layer_value_color(
 fn map_layer_rerender_deferred(ctx: &egui::Context) -> bool {
     ctx.input(|input| {
         input.pointer.any_down() || input.smooth_scroll_delta.length_sq() > f32::EPSILON
+    })
+}
+
+fn map_scroll_settle_remaining(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    deadline.and_then(|until| {
+        let remaining = until.saturating_duration_since(now);
+        (!remaining.is_zero()).then_some(remaining)
     })
 }
 
@@ -6246,6 +6600,14 @@ struct SpcFetchResult {
 
 type ModelLayerRender = (u64, ModelLayerView, egui::ColorImage, f32);
 
+struct SatLayerRender {
+    generation: u64,
+    view: ModelLayerView,
+    image: Result<egui::ColorImage, String>,
+    native: bool,
+    native_error: Option<String>,
+}
+
 /// A rotation site detected on the lowest velocity tilt, geolocated.
 #[derive(Clone, Copy, Debug)]
 struct RotationMarker {
@@ -6394,6 +6756,82 @@ fn simradar_comparison_synchronized_cut(
 /// feed from the pin before every engine consultation — direct pin writes
 /// (loads, restores, tests) converge on the next tick, so the mirror can
 /// never drift for more than one frame.
+/// Per-radar-pane presentation state for a growing realtime Level-II cut.
+///
+/// The downloader installs chunks in bursts. This clock turns those bursts
+/// into a clockwise reveal at the antenna's measured rate, without ever
+/// painting beyond the newest radial that has actually decoded.
+#[derive(Default)]
+struct LiveSweepRuntime {
+    animator: SweepAnimator,
+    state: Option<SweepState>,
+    key: Option<LiveSweepKey>,
+    stepped_at: Option<Instant>,
+}
+
+impl LiveSweepRuntime {
+    fn reset(&mut self) {
+        self.animator.reset();
+        self.state = None;
+        self.key = None;
+        self.stepped_at = None;
+    }
+}
+
+fn step_live_sweep_runtime(
+    runtime: &mut LiveSweepRuntime,
+    key: LiveSweepKey,
+    cut: &ElevationCut,
+    render_pending: bool,
+    now: Instant,
+) -> bool {
+    if runtime.key.as_ref() != Some(&key) {
+        runtime.reset();
+        runtime.key = Some(key);
+    }
+    // A reveal step changes the render key. Advancing while the prior render
+    // is in flight would make every completed result stale, so each pane is
+    // deliberately self-paced by its render lane.
+    if render_pending {
+        return false;
+    }
+    let elapsed = runtime
+        .stepped_at
+        .map(|stepped_at| now.saturating_duration_since(stepped_at))
+        .unwrap_or_default();
+    let catch_up = runtime
+        .state
+        .map(|state| catch_up_factor(state.pending_deg()))
+        .unwrap_or(1.0);
+    let before = runtime.state;
+    runtime.state = runtime.animator.observe(cut, elapsed.mul_f32(catch_up));
+    runtime.stepped_at = Some(now);
+    before != runtime.state
+}
+
+/// Everything that gives a sweep reveal its meaning. A product or cut change
+/// keeps the radial metadata intact while replacing every pixel, so both must
+/// participate alongside the volume identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveSweepKey {
+    identity: FrameIdentity,
+    product: DisplayProduct,
+    cut: usize,
+}
+
+/// Completed compatible sweep painted underneath an arriving one. This is
+/// deliberately separate from `RenderRequest::previous_volume`, whose sole
+/// contract is the Analyst3d temporal dealias prior.
+#[derive(Clone)]
+struct SweepRevealRequest {
+    underlay_volume: Option<Arc<RadarVolume>>,
+    underlay_previous_volume: Option<Arc<RadarVolume>>,
+    underlay_dealias_env: Option<Arc<EnvironmentalWindProfile>>,
+    underlay_cut: usize,
+    start_deg: f32,
+    revealed_deg: f32,
+}
+
 struct PaneView {
     /// The pane's loop machine (`EngineRole::Pane { slot }`).
     engine: LoopEngine,
@@ -6451,6 +6889,7 @@ struct PaneView {
     texture_key: Option<TextureKey>,
     pending_render_key: Option<TextureKey>,
     render_ms: Option<f32>,
+    live_sweep: LiveSweepRuntime,
 }
 
 impl PaneView {
@@ -6501,6 +6940,7 @@ impl PaneView {
             texture_key: None,
             pending_render_key: None,
             render_ms: None,
+            live_sweep: LiveSweepRuntime::default(),
         }
     }
 
@@ -6560,6 +7000,7 @@ impl PaneView {
         self.texture_key = None;
         self.pending_render_key = None;
         self.render_ms = None;
+        self.live_sweep.reset();
     }
 
     /// The pane clear blast radius (census D4): the engine-owned loop
@@ -6609,6 +7050,10 @@ struct RenderRequest {
     /// dealiaser's temporal prior. Kept as an Arc so background/prewarm
     /// workers never borrow mutable UI history.
     previous_volume: Option<Arc<RadarVolume>>,
+    /// Visual underpaint for an incomplete live sweep. Unlike
+    /// `previous_volume`, this is presentation data and is rendered through
+    /// the same product/filter/dealias pipeline as the incoming sweep.
+    sweep_reveal: Option<SweepRevealRequest>,
     /// RAP 0-h analysis wind profile at the radar site (CONUS only) — the
     /// v4 engine's absolute Nyquist-branch anchor. None until the
     /// background fetch lands, and always None for intl sites (the engine's
@@ -6646,6 +7091,23 @@ struct RenderedTexture {
     used_sample_cache: bool,
     radar_range_km: f32,
 }
+
+/// Finished underlay rasters are invariant while a chunk frontier eases over
+/// them. Keeping a small byte-bounded worker-local LRU avoids re-rendering the
+/// same completed tilt on every animation step (especially important on
+/// low-core systems whose ordinary moment-cache capacity is one).
+struct CachedSweepUnderlayRaster {
+    key: TextureKey,
+    _volume: Arc<RadarVolume>,
+    _previous_volume: Option<Arc<RadarVolume>>,
+    _dealias_env: Option<Arc<EnvironmentalWindProfile>>,
+    width: usize,
+    height: usize,
+    rgba: Arc<[u8]>,
+}
+
+const SWEEP_UNDERLAY_CACHE_MAX_ENTRIES: usize = 4;
+const SWEEP_UNDERLAY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 struct CachedLoopRenderedTexture {
     width: usize,
@@ -8255,6 +8717,7 @@ fn spawn_loop_prewarm_render_workers() -> PrewarmPool<RenderRequest, AsyncRender
         let mut sample_caches: Vec<RenderWorkerSampleCache> = Vec::new();
         let mut geometry_caches: Vec<RenderWorkerGeometryCache> = Vec::new();
         let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
+        let mut sweep_underlay_caches: Vec<CachedSweepUnderlayRaster> = Vec::new();
         move |request: RenderRequest| {
             let key = request.key.clone();
             let lane = request.lane;
@@ -8266,6 +8729,7 @@ fn spawn_loop_prewarm_render_workers() -> PrewarmPool<RenderRequest, AsyncRender
                 &mut sample_caches,
                 &mut geometry_caches,
                 &mut last_direct_viewports,
+                &mut sweep_underlay_caches,
                 cache_policy,
             );
             AsyncRenderResult { key, lane, result }
@@ -8300,6 +8764,7 @@ fn spawn_render_worker_with_mode(
         let mut sample_caches: Vec<RenderWorkerSampleCache> = Vec::new();
         let mut geometry_caches: Vec<RenderWorkerGeometryCache> = Vec::new();
         let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
+        let mut sweep_underlay_caches: Vec<CachedSweepUnderlayRaster> = Vec::new();
         // Queued requests, at most one per lane (newer replaces same-lane).
         // With a single lane this degenerates to exactly the old newest-only
         // coalescing; with several lanes no lane's request is dropped.
@@ -8359,6 +8824,7 @@ fn spawn_render_worker_with_mode(
                 &mut sample_caches,
                 &mut geometry_caches,
                 &mut last_direct_viewports,
+                &mut sweep_underlay_caches,
                 cache_policy,
             );
             let should_warm_sample_cache = result.as_ref().is_ok_and(|rendered| {
@@ -10137,6 +10603,7 @@ impl ViewerApp {
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
+            map_scroll_settle_until: None,
             cross_section_armed: false,
             cross_section_view_open: false,
             context_menu_lonlat: None,
@@ -10157,6 +10624,7 @@ impl ViewerApp {
             )),
             sat: None,
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
+            sat_storage_usage: None,
             sat_player: rw_ui::SatPlayerPanel::new(),
             sat_run_listings: Vec::new(),
             show_satellite: false,
@@ -10195,6 +10663,11 @@ impl ViewerApp {
             sat_layer_build_rx: None,
             sat_layer_texture: None,
             sat_layer_render_rx: None,
+            sat_layer_render_cancel: None,
+            sat_layer_render_generation: None,
+            sat_layer_render_view: None,
+            sat_layer_render_retry_after: None,
+            sat_layer_render_failures: 0,
             sat_layer_generation: 0,
             sat_lut_cache: Vec::new(),
             sat_last_frame: None,
@@ -10388,7 +10861,11 @@ impl ViewerApp {
             style_registry,
             styles_newer_schema: loaded_styles.newer_schema,
             hidden_hazard_families: restored_hidden_hazard_families,
-            display_live_chunk_updates: false,
+            // Realtime Level-II chunks are the normal live path. Keep the
+            // escape hatch in the UI, but show smoothly arriving sweeps by
+            // default instead of waiting for a full low tilt.
+            display_live_chunk_updates: true,
+            live_sweep: LiveSweepRuntime::default(),
             live_refresh_skip_reason: None,
             live_hazard_auto_refresh: restored_live_hazard_auto_refresh,
             show_performance_stats: false,
@@ -11290,7 +11767,14 @@ impl ViewerApp {
     fn clear_loop_render_cache(&mut self) {
         self.loop_render_cache.clear();
         self.loop_render_cache_bytes = 0;
-        self.loop_prewarm_inflight.clear();
+        // Do not clear `loop_prewarm_inflight` here. The prewarm pool still
+        // owns every queued/in-progress request, and each one must continue
+        // consuming a slot until its real result is drained. Forgetting those
+        // requests lets every site/context reset enqueue another full batch
+        // into the pool's FIFO, which is the restart-only backlog this
+        // accounting is meant to prevent. Stale results remain harmless:
+        // `poll_loop_prewarm_renders` retires their slot, then rejects them
+        // against `loop_render_context` before they can enter the cache.
         self.loop_render_context = None;
     }
 
@@ -16109,8 +16593,9 @@ impl ViewerApp {
     /// Moved-verbatim drain (spec §6 migration row `loop_prewarm_receiver`),
     /// NOT unified with the lanes above — results land in
     /// `loop_render_cache`, installing directly only when a result is the
-    /// exact frame playback is waiting on. Never schedules a follow-up poll:
-    /// prewarm results are opportunistic.
+    /// exact frame playback is waiting on. While requests remain outstanding,
+    /// schedule a cheap follow-up poll so every slot eventually retires even
+    /// if the UI becomes idle immediately after a zoom/context change.
     fn poll_loop_prewarm_renders(&mut self, ctx: &egui::Context) {
         let mut budget = DrainBudget::for_lane(LaneId::Prewarm);
         loop {
@@ -16121,7 +16606,7 @@ impl ViewerApp {
             match self.loop_prewarm.try_recv() {
                 Ok(message) => {
                     budget.note_message();
-                    self.loop_prewarm_inflight.retain(|key| key != &message.key);
+                    self.retire_loop_prewarm_request(&message.key);
                     if message.lane != LaneId::Prewarm {
                         continue;
                     }
@@ -16150,8 +16635,12 @@ impl ViewerApp {
                 }
             }
         }
-        if budget.saw_message() {
-            ctx.request_repaint();
+        match post_drain_repaint(budget.saw_message(), !self.loop_prewarm_inflight.is_empty()) {
+            RepaintDecision::Now => ctx.request_repaint(),
+            RepaintDecision::PollSoon => {
+                ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
+            }
+            RepaintDecision::Idle => {}
         }
     }
 
@@ -16346,6 +16835,224 @@ impl ViewerApp {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn live_sweep_reveal_request(
+        &self,
+        runtime: &LiveSweepRuntime,
+        frames: &[FrameHistoryEntry],
+        selected_index: usize,
+        volume: &Arc<RadarVolume>,
+        cut: usize,
+        product: &DisplayProduct,
+        render_dealiased_velocity: bool,
+    ) -> Option<SweepRevealRequest> {
+        let state = runtime.state.filter(|state| !state.complete)?;
+        let expected_key = LiveSweepKey {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            product: product.clone(),
+            cut,
+        };
+        if runtime.key.as_ref() != Some(&expected_key)
+            || product
+                .derived()
+                .is_some_and(DerivedProduct::is_volume_wide)
+        {
+            return None;
+        }
+
+        let moment = product.base_moment();
+        let underlay = previous_completed_sweep(frames, volume, cut, &moment)
+            .filter(|underlay| is_displayable_on_cut(&underlay.volume, underlay.cut, product));
+        let needs_analyst_context = self.dealias_engine == DealiasEngine::Analyst3d
+            && (render_dealiased_velocity || self.unfold_velocity_display);
+        let underlay_previous_volume = underlay.as_ref().and_then(|underlay| {
+            needs_analyst_context
+                .then(|| {
+                    previous_dealias_reference_volume(
+                        frames,
+                        underlay.history_index.min(selected_index),
+                        &underlay.volume,
+                    )
+                })
+                .flatten()
+        });
+        let underlay_dealias_env = underlay.as_ref().and_then(|underlay| {
+            needs_analyst_context
+                .then(|| self.dealias_env_profile_for_volume(underlay.volume.as_ref()))
+                .flatten()
+        });
+        Some(SweepRevealRequest {
+            underlay_volume: underlay
+                .as_ref()
+                .map(|underlay| Arc::clone(&underlay.volume)),
+            underlay_previous_volume,
+            underlay_dealias_env,
+            underlay_cut: underlay
+                .as_ref()
+                .map(|underlay| underlay.cut)
+                .unwrap_or(cut),
+            start_deg: state.start_deg,
+            revealed_deg: state.revealed_deg,
+        })
+    }
+
+    /// Advance the radial presentation clocks after render results have been
+    /// drained and selections sanitized, but before panes request their next
+    /// textures. Only a selected realtime partial at the live edge animates;
+    /// archive browsing, playback, and recording always use finished rasters.
+    fn advance_live_sweep_reveals(&mut self, ctx: &egui::Context) {
+        if !self.display_live_chunk_updates || self.media.is_recording() {
+            self.live_sweep.reset();
+            for pane in &mut self.extra_panes {
+                pane.live_sweep.reset();
+            }
+            return;
+        }
+
+        let now = Instant::now();
+        let primary_live_edge = !self.primary.cursor.playing
+            && !self.primary.cursor.browsing
+            && self.primary.cursor.index.saturating_add(1) >= self.primary.history.len();
+        let primary_observation = if matches!(
+            self.displayed_primary_frame_status,
+            Some(FrameStatus::LivePartial | FrameStatus::LiveComplete)
+        ) && primary_live_edge
+            && !self
+                .selected_product
+                .derived()
+                .is_some_and(DerivedProduct::is_volume_wide)
+        {
+            self.volume.as_ref().and_then(|volume| {
+                let cut = display_cut_for_product(
+                    volume.as_ref(),
+                    self.selected_cut,
+                    &self.selected_product,
+                )?;
+                Some((
+                    Arc::clone(volume),
+                    cut,
+                    LiveSweepKey {
+                        identity: frame_identity_for_volume(volume.as_ref()),
+                        product: self.selected_product.clone(),
+                        cut,
+                    },
+                ))
+            })
+        } else {
+            None
+        };
+        if let Some((volume, cut_index, key)) = primary_observation {
+            if let Some(cut) = volume.cuts.get(cut_index) {
+                let moved = step_live_sweep_runtime(
+                    &mut self.live_sweep,
+                    key,
+                    cut,
+                    self.pending_render_key.is_some(),
+                    now,
+                );
+                if moved {
+                    ctx.request_repaint();
+                }
+                if self
+                    .live_sweep
+                    .state
+                    .is_some_and(|state| state.pending_deg() > 0.0)
+                {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                }
+            } else {
+                self.live_sweep.reset();
+            }
+        } else {
+            self.live_sweep.reset();
+        }
+
+        for pane_slot in 0..self.extra_panes.len() {
+            let observation = {
+                let pane = &self.extra_panes[pane_slot];
+                let uses_own_history = pane.owns_radar() && pane.volume.is_some();
+                let (volume, status, playing, browsing, cursor_index, history_len) =
+                    if uses_own_history {
+                        (
+                            pane.volume.clone(),
+                            pane.displayed_frame_status,
+                            pane.engine.cursor.playing,
+                            pane.engine.cursor.browsing,
+                            pane.engine.cursor.index,
+                            pane.engine.history.len(),
+                        )
+                    } else {
+                        (
+                            self.volume.clone(),
+                            self.displayed_primary_frame_status,
+                            self.primary.cursor.playing,
+                            self.primary.cursor.browsing,
+                            self.primary.cursor.index,
+                            self.primary.history.len(),
+                        )
+                    };
+                if !matches!(
+                    status,
+                    Some(FrameStatus::LivePartial | FrameStatus::LiveComplete)
+                ) || playing
+                    || browsing
+                    || cursor_index.saturating_add(1) < history_len
+                    || pane
+                        .product
+                        .derived()
+                        .is_some_and(DerivedProduct::is_volume_wide)
+                {
+                    None
+                } else {
+                    volume.and_then(|volume| {
+                        let cut = display_cut_for_product(
+                            volume.as_ref(),
+                            pane.cut.unwrap_or(self.selected_cut),
+                            &pane.product,
+                        )?;
+                        Some((
+                            Arc::clone(&volume),
+                            cut,
+                            LiveSweepKey {
+                                identity: frame_identity_for_volume(volume.as_ref()),
+                                product: pane.product.clone(),
+                                cut,
+                            },
+                            pane.pending_render_key.is_some(),
+                        ))
+                    })
+                }
+            };
+
+            let pane = &mut self.extra_panes[pane_slot];
+            if let Some((volume, cut_index, key, render_pending)) = observation {
+                if let Some(cut) = volume.cuts.get(cut_index) {
+                    let moved = step_live_sweep_runtime(
+                        &mut pane.live_sweep,
+                        key,
+                        cut,
+                        render_pending,
+                        now,
+                    );
+                    if moved {
+                        ctx.request_repaint();
+                    }
+                    if pane
+                        .live_sweep
+                        .state
+                        .is_some_and(|state| state.pending_deg() > 0.0)
+                    {
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    }
+                } else {
+                    pane.live_sweep.reset();
+                }
+            } else {
+                pane.live_sweep.reset();
+            }
+        }
+    }
+
     fn primary_render_request_for_loop_step(
         &self,
         ctx: &egui::Context,
@@ -16435,19 +17142,33 @@ impl ViewerApp {
         } else {
             previous_volume
         };
+        let render_dealiased_velocity =
+            self.product_render_uses_dealiased_velocity(&self.selected_product);
+        let sweep_reveal = self.live_sweep_reveal_request(
+            &self.live_sweep,
+            &self.primary.history,
+            self.primary.cursor.index,
+            &volume,
+            cut,
+            &self.selected_product,
+            render_dealiased_velocity,
+        );
         // Smart-default raster quality: `supersample_factor` is the displayed
         // frame's chosen quality (1 during active playback) or the loop-frame
-        // factor. factor 1 leaves the base options/key bit-identical to today.
+        // factor. A transient sweep stays native-resolution so its two-layer
+        // render keeps pace with the antenna; the completed frame returns to
+        // the user's ordinary quality automatically.
         let (viewport_options, _) = self.viewport_raster_options(ctx, rect)?;
-        let supersample_factor =
-            raster_supersample_factor_for_product(&self.selected_product, supersample_factor);
+        let supersample_factor = if sweep_reveal.is_some() {
+            1
+        } else {
+            raster_supersample_factor_for_product(&self.selected_product, supersample_factor)
+        };
         let viewport_options = viewport_options.supersampled(supersample_factor);
         let viewport_key = raster_quality::viewport_key_for_options(viewport_options);
         let color_tables = self.render_color_tables_for_product(&self.selected_product);
         let color_table_signature =
             color_tables.signature_for_family(self.selected_product.color_family());
-        let render_dealiased_velocity =
-            self.product_render_uses_dealiased_velocity(&self.selected_product);
         let smoothing = self.smoothing_for_product(&self.selected_product);
         let dealias_reference_volume_ptr =
             if self.dealias_engine == DealiasEngine::Analyst3d && render_dealiased_velocity {
@@ -16483,6 +17204,7 @@ impl ViewerApp {
             smoothing,
             dealias_engine: self.dealias_engine,
             gate_filter_decidbz: self.gate_filter_key(),
+            sweep_reveal: sweep_reveal.as_ref().map(SweepRevealKey::new),
             viewport: viewport_key,
         };
         Some(RenderRequest {
@@ -16490,6 +17212,7 @@ impl ViewerApp {
             lane: LaneId::Primary,
             volume,
             previous_volume,
+            sweep_reveal,
             dealias_env,
             cut,
             product: self.selected_product.clone(),
@@ -16513,6 +17236,21 @@ impl ViewerApp {
             return;
         };
         let key = request.key.clone();
+        if request.sweep_reveal.is_some() {
+            // Reveal frames are transient live presentation, not loop assets.
+            // Keeping them out of the loop cache prevents a new RGBA allocation
+            // for every fraction-of-a-degree step and keeps prewarm workers on
+            // actual history frames.
+            if self.texture_key.as_ref() == Some(&key) {
+                return;
+            }
+            if self.pending_render_key.as_ref() == Some(&key) {
+                ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
+                return;
+            }
+            self.start_render_request(request, ctx);
+            return;
+        }
         if self.smooth_camera_follow_playback_active() {
             if self
                 .texture_key
@@ -16570,7 +17308,9 @@ impl ViewerApp {
         self.loop_render_context = Some(context);
         self.loop_render_cache.clear();
         self.loop_render_cache_bytes = 0;
-        self.loop_prewarm_inflight.clear();
+        // Queued and running jobs outlive this context. Keep their accounting
+        // until their actual results arrive; the drain rejects their pixels
+        // using the new `loop_render_context`.
     }
 
     fn loop_render_cache_hit(&mut self, key: &TextureKey) -> Option<RenderedTexture> {
@@ -16633,7 +17373,42 @@ impl ViewerApp {
     fn pause_loop_prewarm_for_interaction(&mut self) {
         self.loop_prewarm_paused_until =
             Some(Instant::now() + Duration::from_millis(LOOP_PREWARM_INTERACTION_PAUSE_MS));
-        self.loop_prewarm_inflight.clear();
+        // Pausing stops new speculative work. It cannot cancel work already
+        // owned by the shared pool, so those keys must keep consuming their
+        // slots until the result drain retires them.
+    }
+
+    /// Reserve one of the globally bounded prewarm slots before submitting a
+    /// request to the pool. The reservation deliberately spans render-context
+    /// changes: only a matching result (or a disconnected pool) retires it.
+    fn reserve_loop_prewarm_request(&mut self, key: TextureKey, limit: usize) -> bool {
+        if self.loop_prewarm_inflight.len() >= limit
+            || self
+                .loop_prewarm_inflight
+                .iter()
+                .any(|inflight| inflight == &key)
+        {
+            return false;
+        }
+        self.loop_prewarm_inflight.push(key);
+        debug_assert!(self.loop_prewarm_inflight.len() <= limit);
+        true
+    }
+
+    /// Retire exactly one submitted request. Duplicate keys are not normally
+    /// possible (`reserve_loop_prewarm_request` rejects them), but removing one
+    /// rather than all preserves one-result/one-slot accounting if that
+    /// invariant is ever relaxed.
+    fn retire_loop_prewarm_request(&mut self, key: &TextureKey) -> bool {
+        let Some(index) = self
+            .loop_prewarm_inflight
+            .iter()
+            .position(|inflight| inflight == key)
+        else {
+            return false;
+        };
+        self.loop_prewarm_inflight.swap_remove(index);
+        true
     }
 
     fn loop_prewarm_paused_for_interaction(&self) -> bool {
@@ -16713,9 +17488,13 @@ impl ViewerApp {
             }
             request.lane = LaneId::Prewarm;
             let key = request.key.clone();
-            if self.loop_prewarm.send(request).is_ok() {
-                self.loop_prewarm_inflight.push(key);
-            } else {
+            if !self.reserve_loop_prewarm_request(key.clone(), inflight_limit) {
+                continue;
+            }
+            if self.loop_prewarm.send(request).is_err() {
+                self.retire_loop_prewarm_request(&key);
+                // A failed send means every request receiver is gone. No
+                // queued/running job can remain to produce a future result.
                 self.loop_prewarm_inflight.clear();
                 break;
             }
@@ -16824,6 +17603,186 @@ impl ViewerApp {
 
     #[allow(clippy::too_many_arguments)]
     fn render_viewport_payload(
+        request: &RenderRequest,
+        reusable_pixels: &mut Vec<u8>,
+        reusable_pixels_signature: &mut Option<RenderWorkerViewportSignature>,
+        moment_caches: &mut Vec<RenderWorkerMomentCache>,
+        sample_caches: &mut Vec<RenderWorkerSampleCache>,
+        geometry_caches: &mut Vec<RenderWorkerGeometryCache>,
+        last_direct_viewports: &mut Vec<RenderWorkerViewportSignature>,
+        sweep_underlay_caches: &mut Vec<CachedSweepUnderlayRaster>,
+        cache_policy: RenderWorkerCachePolicy,
+    ) -> Result<RenderedTexture, String> {
+        let Some(reveal) = request.sweep_reveal.as_ref() else {
+            return Self::render_single_viewport_payload(
+                request,
+                reusable_pixels,
+                reusable_pixels_signature,
+                moment_caches,
+                sample_caches,
+                geometry_caches,
+                last_direct_viewports,
+                cache_policy,
+            );
+        };
+
+        let worker_start = Instant::now();
+        let mut incoming = Self::render_single_viewport_payload(
+            request,
+            reusable_pixels,
+            reusable_pixels_signature,
+            moment_caches,
+            sample_caches,
+            geometry_caches,
+            last_direct_viewports,
+            cache_policy,
+        )?;
+        let mut previous_rgba: Option<Arc<[u8]>> = None;
+        let mut previous_render_ms = 0.0;
+        let mut previous_sample_cache_ms = None;
+        let mut previous_used_sample_cache = true;
+
+        if let Some(underlay_request) = Self::sweep_underlay_render_request(request, reveal) {
+            let cache_hit = sweep_underlay_caches
+                .iter()
+                .position(|cached| cached.key == underlay_request.key)
+                .map(|index| sweep_underlay_caches.remove(index));
+            if let Some(cached) = cache_hit
+                && cached.width == incoming.width
+                && cached.height == incoming.height
+            {
+                previous_rgba = Some(Arc::clone(&cached.rgba));
+                sweep_underlay_caches.push(cached);
+            } else {
+                let mut underlay_pixels = Vec::new();
+                let mut underlay_pixels_signature = None;
+                // An unavailable underlay is not a failure of the live frame.
+                // The compositor then uses transparent pixels outside the
+                // arrived arc, exactly the honest first-volume behavior.
+                if let Ok(underlay) = Self::render_single_viewport_payload(
+                    &underlay_request,
+                    &mut underlay_pixels,
+                    &mut underlay_pixels_signature,
+                    moment_caches,
+                    sample_caches,
+                    geometry_caches,
+                    last_direct_viewports,
+                    cache_policy,
+                ) && underlay.width == incoming.width
+                    && underlay.height == incoming.height
+                {
+                    previous_render_ms = underlay.render_ms;
+                    previous_sample_cache_ms = underlay.sample_cache_build_ms;
+                    previous_used_sample_cache = underlay.used_sample_cache;
+                    let rendered_rgba: Arc<[u8]> = underlay.rgba.into();
+                    previous_rgba = Some(Arc::clone(&rendered_rgba));
+                    sweep_underlay_caches.push(CachedSweepUnderlayRaster {
+                        key: underlay_request.key.clone(),
+                        _volume: Arc::clone(&underlay_request.volume),
+                        _previous_volume: underlay_request.previous_volume.clone(),
+                        _dealias_env: underlay_request.dealias_env.clone(),
+                        width: underlay.width,
+                        height: underlay.height,
+                        rgba: rendered_rgba,
+                    });
+                    while sweep_underlay_caches.len() > SWEEP_UNDERLAY_CACHE_MAX_ENTRIES
+                        || sweep_underlay_caches
+                            .iter()
+                            .map(|cached| cached.rgba.len())
+                            .sum::<usize>()
+                            > SWEEP_UNDERLAY_CACHE_MAX_BYTES
+                    {
+                        sweep_underlay_caches.remove(0);
+                    }
+                }
+            }
+        }
+
+        let composite_start = Instant::now();
+        mask_sweep_reveal_rgba_in_place(
+            &mut incoming.rgba,
+            previous_rgba.as_deref(),
+            request.viewport_options,
+            reveal.start_deg,
+            reveal.revealed_deg,
+        )
+        .map_err(|err| err.to_string())?;
+        let composite_ms = composite_start.elapsed().as_secs_f32() * 1000.0;
+        // The returned bytes are no longer the plain incoming raster even
+        // though that raster supplied their geometry. Poison the recycle
+        // signature so the next render cannot take the transparency-reuse
+        // fast path and accidentally preserve old underlay pixels.
+        incoming.buffer_signature.volume_ptr = 0;
+        incoming.render_ms += previous_render_ms + composite_ms;
+        incoming.worker_ms = worker_start.elapsed().as_secs_f32() * 1000.0;
+        incoming.sample_cache_build_ms =
+            match (incoming.sample_cache_build_ms, previous_sample_cache_ms) {
+                (Some(incoming), Some(previous)) => Some(incoming + previous),
+                (some @ Some(_), None) | (None, some @ Some(_)) => some,
+                (None, None) => None,
+            };
+        incoming.used_sample_cache &= previous_used_sample_cache;
+        Ok(incoming)
+    }
+
+    fn sweep_underlay_render_request(
+        request: &RenderRequest,
+        reveal: &SweepRevealRequest,
+    ) -> Option<RenderRequest> {
+        let volume = reveal.underlay_volume.as_ref().map(Arc::clone)?;
+        let previous_volume = reveal.underlay_previous_volume.clone();
+        let dealias_env = reveal.underlay_dealias_env.clone();
+        let dealias_reference_volume_ptr = if request.dealias_engine == DealiasEngine::Analyst3d
+            && request.render_dealiased_velocity
+        {
+            previous_volume
+                .as_ref()
+                .map(|reference| Arc::as_ptr(reference) as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let dealias_env_ptr = if request.render_dealiased_velocity {
+            dealias_env
+                .as_ref()
+                .map(|profile| Arc::as_ptr(profile) as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut key = request.key.clone();
+        key.volume_ptr = Arc::as_ptr(&volume) as usize;
+        key.dealias_reference_volume_ptr = dealias_reference_volume_ptr;
+        key.dealias_env_ptr = dealias_env_ptr;
+        key.cut = reveal.underlay_cut;
+        key.sweep_reveal = None;
+        let radar_range_km =
+            selected_grid_range_km_for(volume.as_ref(), reveal.underlay_cut, &request.product)
+                .unwrap_or(request.radar_range_km);
+        Some(RenderRequest {
+            key,
+            lane: request.lane,
+            volume,
+            previous_volume,
+            sweep_reveal: None,
+            dealias_env,
+            cut: reveal.underlay_cut,
+            product: request.product.clone(),
+            render_dealiased_velocity: request.render_dealiased_velocity,
+            plain_velocity_render_dealiased: request.plain_velocity_render_dealiased,
+            color_tables: request.color_tables.clone(),
+            storm_motion: request.storm_motion,
+            hail_levels_m: request.hail_levels_m,
+            smoothing: request.smoothing,
+            dealias_engine: request.dealias_engine,
+            gate_filter_decidbz: request.gate_filter_decidbz,
+            viewport_options: request.viewport_options,
+            radar_range_km,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_single_viewport_payload(
         request: &RenderRequest,
         reusable_pixels: &mut Vec<u8>,
         reusable_pixels_signature: &mut Option<RenderWorkerViewportSignature>,
@@ -19063,13 +20022,7 @@ impl ViewerApp {
         // Extra panes are displayed radar layers too — give them the same
         // smart-default quality as the primary frame. ET stays at the native
         // viewport resolution so supersampling cannot soften its bins.
-        let (viewport_options, _) = self.viewport_raster_options(ctx, rect)?;
-        let supersample_factor = raster_supersample_factor_for_product(
-            &product,
-            self.displayed_raster_supersample_factor(),
-        );
-        let viewport_options = viewport_options.supersampled(supersample_factor);
-        let viewport_key = raster_quality::viewport_key_for_options(viewport_options);
+        let (base_viewport_options, _) = self.viewport_raster_options(ctx, rect)?;
         let volume = self.display_source_volume_for_extra_pane_product(
             pane_slot,
             &product,
@@ -19086,6 +20039,33 @@ impl ViewerApp {
         let color_table_signature = color_tables.signature_for_family(product.color_family());
         let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
         let smoothing = self.smoothing_for_product(&product);
+        let (sweep_frames, sweep_selected_index) = {
+            let pane = &self.extra_panes[pane_slot];
+            if pane.owns_radar() && pane.volume.is_some() {
+                (pane.engine.history.as_slice(), pane.engine.cursor.index)
+            } else {
+                (self.primary.history.as_slice(), self.primary.cursor.index)
+            }
+        };
+        let sweep_reveal = self.live_sweep_reveal_request(
+            &self.extra_panes[pane_slot].live_sweep,
+            sweep_frames,
+            sweep_selected_index,
+            &volume,
+            cut,
+            &product,
+            render_dealiased_velocity,
+        );
+        let supersample_factor = if sweep_reveal.is_some() {
+            1
+        } else {
+            raster_supersample_factor_for_product(
+                &product,
+                self.displayed_raster_supersample_factor(),
+            )
+        };
+        let viewport_options = base_viewport_options.supersampled(supersample_factor);
+        let viewport_key = raster_quality::viewport_key_for_options(viewport_options);
         let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
             && (render_dealiased_velocity || self.unfold_velocity_display))
             .then(|| {
@@ -19147,6 +20127,7 @@ impl ViewerApp {
             smoothing,
             dealias_engine: self.dealias_engine,
             gate_filter_decidbz: self.gate_filter_key(),
+            sweep_reveal: sweep_reveal.as_ref().map(SweepRevealKey::new),
             viewport: viewport_key,
         };
         let radar_range_km = selected_grid_range_km_for(volume.as_ref(), cut, &product)
@@ -19156,6 +20137,7 @@ impl ViewerApp {
             lane: LaneId::Pane(pane_lane),
             volume,
             previous_volume,
+            sweep_reveal,
             dealias_env,
             cut,
             product,
@@ -21998,6 +22980,7 @@ impl eframe::App for ViewerApp {
         self.maybe_advance_extra_pane_history_loops(&ctx);
         self.maybe_apply_continuous_camera_follow(&ctx);
         self.sanitize_selection();
+        self.advance_live_sweep_reveals(&ctx);
         self.reconcile_vrot_source();
         self.poll_rotation_markers(&ctx);
         self.poll_tor_tracks(&ctx);
@@ -23540,10 +24523,17 @@ impl ViewerApp {
                                 self.sat_player.selected_run(),
                                 self.sat_last_frame.as_ref(),
                             ) {
-                                worker.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
+                                worker.send(sat_worker::SatRequest::LoadFrame {
+                                    key,
+                                    hhmm,
+                                    native_product: None,
+                                });
                             }
                         }
-                        if let Some((key, hhmm)) = self.sat_map_recolor_target() {
+                        if let Some((key, hhmm)) = self
+                            .sat_map_recolor_target()
+                            .filter(|(key, _)| !sat_paint::satellite_run_key_is_remote(key))
+                        {
                             self.request_sat_map_frame(key, hhmm);
                         }
                     }
@@ -26445,9 +27435,9 @@ impl ViewerApp {
                 ui.checkbox(&mut self.primary.live.enabled, "Live")
                     .on_hover_text("Auto-refresh the primary radar with the newest live data");
             }
-            ui.checkbox(&mut self.display_live_chunk_updates, "Chunks")
+            ui.checkbox(&mut self.display_live_chunk_updates, "Sweep chunks")
                 .on_hover_text(
-                    "Display incomplete live chunk tilts before a full low-level tilt is available",
+                    "Show growing realtime Level-II sweeps as chunks arrive. Newly arrived radials reveal smoothly over the previous completed tilt.",
                 );
             // Native file dialog on every supported desktop platform.
             #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -29353,6 +30343,7 @@ impl ViewerApp {
     fn invalidate_model_layer_color_family(&mut self, family: ColorTableFamily) {
         for slot in &mut self.model_layers {
             if slot.layer.custom_color_family == Some(family) {
+                slot.cancel_render();
                 slot.layer.generation = slot.layer.generation.wrapping_add(1);
                 slot.texture = None;
             }
@@ -32451,6 +33442,29 @@ impl ViewerApp {
         true
     }
 
+    /// Extend the quiet-period deadline after an actual map zoom. This is
+    /// called only after loupe scroll routing, so Ctrl/Command-wheel over the
+    /// loupe cannot suppress unrelated map work.
+    fn note_map_scroll_zoom(&mut self, ctx: &egui::Context) {
+        self.map_scroll_settle_until =
+            Some(Instant::now() + Duration::from_millis(MAP_SCROLL_SETTLE_MS));
+        ctx.request_repaint_after(Duration::from_millis(MAP_SCROLL_SETTLE_MS));
+    }
+
+    /// True while wheel/trackpad zoom has not yet been quiet long enough for
+    /// exact screen-space geometry and viewport rasters to be worth building.
+    /// Request the one repaint that restores them at the settled view even if
+    /// the UI receives no more input.
+    fn map_scroll_is_settling(&self, ctx: &egui::Context) -> bool {
+        let Some(remaining) =
+            map_scroll_settle_remaining(self.map_scroll_settle_until, Instant::now())
+        else {
+            return false;
+        };
+        ctx.request_repaint_after(remaining);
+        true
+    }
+
     fn single_pane_canvas(
         &mut self,
         ui: &mut egui::Ui,
@@ -32551,6 +33565,7 @@ impl ViewerApp {
                     self.map_center_lat += lat_before - lat_after;
                 }
                 self.clamp_map_center();
+                self.note_map_scroll_zoom(ui.ctx());
             }
         }
         let cursor_position = response
@@ -32622,7 +33637,8 @@ impl ViewerApp {
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_radar_layer_renders(ui.ctx(), rect);
         self.request_texture_render(ui.ctx(), rect);
-        let hazard_shapes = self.hazard_overlay_shapes_for_draw(rect, !map_pan_drag_active);
+        let hazard_fills_enabled = !map_pan_drag_active && !self.map_scroll_is_settling(ui.ctx());
+        let hazard_shapes = self.hazard_overlay_shapes_for_draw(rect, hazard_fills_enabled);
         self.draw_hazard_fills(painter, hazard_shapes.as_deref());
         self.draw_radar_overlay_layers(ui.ctx(), painter, rect);
         // Max-value swath trail, beneath the live frame so the current echo
@@ -33100,6 +34116,7 @@ impl ViewerApp {
                             self.map_center_lat += lat_before - lat_after;
                         }
                         self.clamp_map_center();
+                        self.note_map_scroll_zoom(ui.ctx());
                     }
                 }
                 // Each pane reports ITS OWN product/tilt under the cursor.
@@ -33414,6 +34431,7 @@ impl ViewerApp {
         // pass above. Clear a measurement owned by the prior pane before the
         // paint pass, rather than allowing it to linger until next repaint.
         self.reconcile_vrot_source();
+        let hazard_fills_enabled = !map_pan_drag_active && !self.map_scroll_is_settling(ui.ctx());
 
         // Paint pass: post-interaction transform; site markers recomputed
         // here so they land at the final positions too.
@@ -33432,7 +34450,7 @@ impl ViewerApp {
                 .pane_product_cut(cell_index)
                 .unwrap_or_else(|| (self.selected_product.clone(), self.selected_cut));
             let cell_painter = ui.painter_at(cell);
-            let hazard_shapes = self.hazard_overlay_shapes_for_draw(cell, !map_pan_drag_active);
+            let hazard_shapes = self.hazard_overlay_shapes_for_draw(cell, hazard_fills_enabled);
             self.draw_basemap(&cell_painter, cell);
             self.draw_spc_outlooks(&cell_painter, cell);
             self.draw_upper_air_layer(&cell_painter, cell);
@@ -36604,6 +37622,9 @@ impl ViewerApp {
     /// then recompute surface-based CAPE from the corrected surface
     /// lifted through the store's isobaric profiles (analyze-then-derive).
     fn start_oa_derive(&mut self, product: oa_derived::OaProduct, ctx: &egui::Context) {
+        if !self.model_enabled {
+            return;
+        }
         let Some(template) = self
             .model_dock
             .as_ref()
@@ -36813,6 +37834,9 @@ impl ViewerApp {
     /// The composite pass: correct ALL FOUR surface fields with the live
     /// obs, then run sharprs' full parameter suite per strided cell.
     fn start_oa_composites(&mut self, ctx: &egui::Context) {
+        if !self.model_enabled {
+            return;
+        }
         let Some(template) = self
             .model_dock
             .as_ref()
@@ -36942,6 +37966,15 @@ impl ViewerApp {
     }
 
     fn poll_oa_composites(&mut self, ctx: &egui::Context) {
+        if !self.model_enabled {
+            self.oa_comp_rx = None;
+            self.oa_composites = None;
+            self.oa_comp_pick = None;
+            self.oa_comp_total = 0;
+            self.oa_comp_progress
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let Some(receiver) = &self.oa_comp_rx else {
             return;
         };
@@ -36966,6 +37999,10 @@ impl ViewerApp {
     }
 
     fn poll_oa_cape(&mut self, ctx: &egui::Context) {
+        if !self.model_enabled {
+            self.oa_cape_rx = None;
+            return;
+        }
         let Some(receiver) = &self.oa_cape_rx else {
             return;
         };
@@ -36991,6 +38028,9 @@ impl ViewerApp {
     /// innovations vs the dock's current field, station-space iteration,
     /// one gridding pass; the corrected field comes back as a new layer.
     fn start_mesoanalysis(&mut self, ctx: &egui::Context) {
+        if !self.model_enabled {
+            return;
+        }
         let Some(field) = self
             .model_dock
             .as_ref()
@@ -38664,6 +39704,10 @@ impl ViewerApp {
     }
 
     fn poll_mesoanalysis(&mut self, ctx: &egui::Context) {
+        if !self.model_enabled {
+            self.oa_rx = None;
+            return;
+        }
         let Some(receiver) = &self.oa_rx else {
             return;
         };
@@ -38691,7 +39735,7 @@ impl ViewerApp {
         level_hpa: u16,
         ctx: &egui::Context,
     ) {
-        if self.upper_air_rx.in_flight() {
+        if !self.model_enabled || self.upper_air_rx.in_flight() {
             return;
         }
         self.status = format!(
@@ -38709,6 +39753,11 @@ impl ViewerApp {
     }
 
     fn poll_upper_air(&mut self, ctx: &egui::Context) {
+        if !self.model_enabled {
+            self.upper_air_rx.cancel();
+            self.upper_air_layer = None;
+            return;
+        }
         match self.upper_air_rx.poll() {
             SlotPoll::Ready(Ok(layer)) => {
                 self.status = layer.summary.clone();
@@ -38990,43 +40039,61 @@ impl ViewerApp {
             })
     }
 
-    fn poll_model_layer(&mut self, ctx: &egui::Context) {
-        if (self.wrf_window_open || self.formula_lab_window_open) && !self.model_enabled {
-            self.model_enabled = true;
+    /// Make the Model master switch a real ownership boundary. Receivers are
+    /// cancellation handles for detached work; clearing only the dock left
+    /// layer/LUT/upper-air workers and textures alive when the dock had never
+    /// been opened (or had already been dropped).
+    fn teardown_disabled_model_state(&mut self) {
+        if self.model_dock.is_some() {
+            // Capture the editor draft before dropping its single owner;
+            // on_exit cannot persist state from a dock that no longer exists.
+            self.persist_formula_lab_state();
         }
+        self.model_layer_build_rx = None;
+        self.model_lut_rx = None;
+        self.upper_air_rx.cancel();
+        self.upper_air_layer = None;
+        for slot in &mut self.model_layers {
+            slot.cancel_render();
+        }
+        self.model_layers.clear();
+        self.model_lut = None;
+        self.model_layer_render_ms = None;
+        self.model_timeline_last_key = None;
+        self.last_sounding_request = None;
+        self.hail_env_pending = false;
+
+        // Public gridded composites use the same model layer build/render
+        // pipeline. Do not let an already-running fetch repopulate it later in
+        // this update after the master switch has torn the pipeline down.
+        self.grid_composite_rx = None;
+        self.grid_composite_loading = None;
+        self.grid_composite_pending_field = None;
+        self.grid_composite_announce_status = false;
+
+        self.oa_rx = None;
+        self.oa_cape_rx = None;
+        self.oa_comp_rx = None;
+        self.oa_composites = None;
+        self.oa_comp_pick = None;
+        self.oa_comp_total = 0;
+        self.oa_comp_progress
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.oa_last_summary = None;
+
+        self.model_dock = None;
+        self.model_dock_open = false;
+        self.wrf_window_open = false;
+        self.formula_lab_window_open = false;
+        self.wrf_open_models_requested = false;
+        self.workspace.undock(dock::WorkspacePane::Model);
+        self.workspace.undock(dock::WorkspacePane::Wrf);
+        self.workspace.undock(dock::WorkspacePane::FormulaLab);
+    }
+
+    fn poll_model_layer(&mut self, ctx: &egui::Context) {
         if !self.model_enabled {
-            // Closing the owning windows while a formula evaluates must not
-            // drop its receiver. Honor the disabled model switch as soon as
-            // the worker publishes or stops; until then, pump only.
-            if self
-                .model_dock
-                .as_ref()
-                .is_some_and(model_data::ModelDataDock::formula_lab_busy)
-            {
-                if let Some(dock) = self.model_dock.as_mut() {
-                    dock.pump();
-                }
-                ctx.request_repaint_after(Duration::from_millis(250));
-                return;
-            }
-            if self.model_dock.is_some() {
-                // Capture the editor draft before dropping its single owner;
-                // on_exit cannot persist state from a dock that no longer
-                // exists.
-                self.persist_formula_lab_state();
-                // Tear down: drop the dock/layer/LUT so nothing model-side
-                // runs until re-enabled. Docked Model/WRF/Formula Lab panes
-                // leave the workspace too (prefer_docked keeps the comeback).
-                self.model_dock = None;
-                self.model_layers.clear();
-                self.model_lut = None;
-                self.model_dock_open = false;
-                self.wrf_window_open = false;
-                self.formula_lab_window_open = false;
-                self.workspace.undock(dock::WorkspacePane::Model);
-                self.workspace.undock(dock::WorkspacePane::Wrf);
-                self.workspace.undock(dock::WorkspacePane::FormulaLab);
-            }
+            self.teardown_disabled_model_state();
             return;
         }
         // Keep the dock's worker drained even when its window is closed.
@@ -39082,10 +40149,10 @@ impl ViewerApp {
             .model_dock
             .as_ref()
             .and_then(|dock| dock.latest_field())
-            && self.model_layers.iter().any(|slot| {
-                slot.layer.field.key.var == latest.key.var
-                    && !Arc::ptr_eq(&slot.layer.field, latest)
-            })
+            && self
+                .model_layers
+                .iter()
+                .any(|slot| model_slot_needs_latest_field_refresh(slot, latest))
         {
             swap = Some(Arc::clone(latest));
         }
@@ -39099,7 +40166,9 @@ impl ViewerApp {
                 .as_ref()
                 .is_some_and(|dock| dock.user_style_override_for(latest.as_ref()));
             for slot in &mut self.model_layers {
-                if slot.layer.field.key.var != latest.key.var {
+                // Hidden means dormant: preserve its chosen field/hour and do
+                // not spawn LUT/build/render work behind the crossed-out eye.
+                if !model_slot_needs_latest_field_refresh(slot, &latest) {
                     continue;
                 }
                 let same_grid = match (slot.layer.field.grid.as_ref(), latest.grid.as_ref()) {
@@ -39118,6 +40187,7 @@ impl ViewerApp {
                         slot.layer.production.is_some(),
                         user_override,
                     );
+                    slot.cancel_render();
                     slot.layer.field = Arc::clone(&latest);
                     slot.layer.generation = slot.layer.generation.wrapping_add(1);
                     slot.texture = None;
@@ -39219,6 +40289,7 @@ impl ViewerApp {
                             let opacity = slot.layer.opacity;
                             let visible = slot.layer.visible;
                             let custom_color_family = slot.layer.custom_color_family;
+                            slot.cancel_render();
                             slot.layer = layer;
                             slot.layer.opacity = opacity;
                             slot.layer.visible = visible;
@@ -39231,6 +40302,9 @@ impl ViewerApp {
                                 layer,
                                 texture: None,
                                 render_rx: None,
+                                render_cancel: None,
+                                render_generation: None,
+                                render_view: None,
                             });
                         }
                     } else {
@@ -39244,12 +40318,17 @@ impl ViewerApp {
         }
         // Drain per-slot render results.
         for slot in &mut self.model_layers {
+            if !slot.layer.visible {
+                slot.cancel_render();
+                continue;
+            }
             let Some(receiver) = &slot.render_rx else {
                 continue;
             };
-            match receiver.try_recv() {
+            let result = receiver.try_recv();
+            match result {
                 Ok((generation, key, image, render_ms)) => {
-                    slot.render_rx = None;
+                    slot.finish_render();
                     self.model_layer_render_ms = Some(render_ms);
                     if slot.layer.generation == generation {
                         let texture =
@@ -39259,7 +40338,7 @@ impl ViewerApp {
                     ctx.request_repaint();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => slot.render_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => slot.finish_render(),
             }
         }
     }
@@ -39557,6 +40636,9 @@ impl ViewerApp {
         ctx: &egui::Context,
         force: bool,
     ) {
+        if !self.model_enabled {
+            return;
+        }
         if self.grid_composite_rx.is_some() && !force {
             return;
         }
@@ -39574,6 +40656,13 @@ impl ViewerApp {
     }
 
     fn poll_grid_composite_layer(&mut self, ctx: &egui::Context) {
+        if !self.model_enabled {
+            self.grid_composite_rx = None;
+            self.grid_composite_loading = None;
+            self.grid_composite_pending_field = None;
+            self.grid_composite_announce_status = false;
+            return;
+        }
         if let Some(receiver) = &self.grid_composite_rx {
             match receiver.try_recv() {
                 Ok((source, result)) => {
@@ -39647,7 +40736,7 @@ impl ViewerApp {
 
     /// Build (or rebuild) the map layer for a field on a background thread.
     fn start_model_layer_build(&mut self, field: Arc<rw_ui::FieldData>, ctx: &egui::Context) {
-        if self.model_layer_build_rx.is_some() {
+        if !self.model_enabled || self.model_layer_build_rx.is_some() {
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -39795,12 +40884,34 @@ impl ViewerApp {
     /// differently from the basemap. Instead, keep stale rasters hidden until
     /// the matching viewport render arrives.
     fn draw_model_layers(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.model_enabled {
+            for slot in &mut self.model_layers {
+                slot.cancel_render();
+            }
+            return;
+        }
         let view = self.model_layer_current_view();
         let color_tables = self.color_tables.clone();
-        let defer_render = map_layer_rerender_deferred(painter.ctx());
+        let defer_render = map_layer_rerender_deferred(painter.ctx())
+            || self.map_scroll_is_settling(painter.ctx());
+        let worker_threads = effective_worker_threads();
+        let mut active_render_workers = self
+            .model_layers
+            .iter()
+            .filter(|slot| slot.render_rx.is_some())
+            .count();
         for slot in &mut self.model_layers {
             if !slot.layer.visible {
+                active_render_workers =
+                    active_render_workers.saturating_sub(usize::from(slot.render_rx.is_some()));
+                slot.cancel_render();
                 continue;
+            }
+            if slot.render_request_is_obsolete(slot.layer.generation, &view) {
+                // Latest wins: abandon the detached old-view worker before
+                // deciding whether the settled view should spawn a new one.
+                active_render_workers = active_render_workers.saturating_sub(1);
+                slot.cancel_render();
             }
             let current = slot
                 .texture
@@ -39809,10 +40920,19 @@ impl ViewerApp {
             let needs_render = current
                 .map(|(_, _, have)| model_layer_view_needs_rerender(have, &view))
                 .unwrap_or(true);
-            if needs_render && !defer_render && slot.render_rx.is_none() {
+            if needs_render
+                && !defer_render
+                && slot.render_rx.is_none()
+                && model_layer_render_worker_available(active_render_workers, worker_threads)
+            {
                 let (sender, receiver) = mpsc::channel();
                 slot.render_rx = Some(receiver);
+                active_render_workers += 1;
                 let generation = slot.layer.generation;
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                slot.render_cancel = Some(Arc::clone(&cancel));
+                slot.render_generation = Some(generation);
+                slot.render_view = Some(view);
                 let field = Arc::clone(&slot.layer.field);
                 let lut = Arc::clone(&slot.layer.lut);
                 let colormap = slot.layer.colormap;
@@ -39829,42 +40949,52 @@ impl ViewerApp {
                 let center_lon = view.center_lon as f64;
                 let km_per_pt = 111.32 / view.map_scale as f64;
                 let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+                let (w, h) = model_layer_render_dimensions(w_pts, h_pts, view.map_scale);
                 let ctx = painter.ctx().clone();
                 thread::spawn(move || {
                     let render_start = Instant::now();
-                    let w = w_pts.max(8.0) as usize;
-                    let h = h_pts.max(8.0) as usize;
                     let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
                     let range = field.range;
-                    for (i, px) in pixels.iter_mut().enumerate() {
-                        let x = (i % w) as f64;
-                        let y = (i / w) as f64;
-                        let east_km = (x - w as f64 / 2.0) * km_per_pt;
-                        let north_km = (h as f64 / 2.0 - y) * km_per_pt;
-                        let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
-                        let Some(index) = lut.lookup(lat as f32, lon as f32) else {
-                            continue;
-                        };
-                        let Some(value) = model_layer::sample_field_value(
-                            field.as_ref(),
-                            index,
-                            lat as f32,
-                            lon as f32,
-                        ) else {
-                            continue;
-                        };
-                        // Shared resolver — the inspector chip samples the
-                        // SAME function, so chip color == painted color.
-                        if let Some(color) = model_layer_value_color(
-                            custom_table.as_deref(),
-                            model_table.as_deref(),
-                            production.as_deref(),
-                            range,
-                            colormap,
-                            value,
-                        ) {
-                            *px = color;
+                    for row in 0..h {
+                        // Cooperative cancellation at a row boundary bounds
+                        // obsolete work without adding an atomic load to every
+                        // expensive model sample.
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
                         }
+                        for column in 0..w {
+                            let (east_km, north_km) = model_layer_sample_enu_km(
+                                column, row, w, h, w_pts, h_pts, km_per_pt,
+                            );
+                            let (lat, lon) =
+                                aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
+                            let Some(index) = lut.lookup(lat as f32, lon as f32) else {
+                                continue;
+                            };
+                            let Some(value) = model_layer::sample_field_value(
+                                field.as_ref(),
+                                index,
+                                lat as f32,
+                                lon as f32,
+                            ) else {
+                                continue;
+                            };
+                            // Shared resolver — the inspector chip samples the
+                            // SAME function, so chip color == painted color.
+                            if let Some(color) = model_layer_value_color(
+                                custom_table.as_deref(),
+                                model_table.as_deref(),
+                                production.as_deref(),
+                                range,
+                                colormap,
+                                value,
+                            ) {
+                                pixels[row * w + column] = color;
+                            }
+                        }
+                    }
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
                     }
                     let image = egui::ColorImage {
                         size: [w, h],
@@ -39896,6 +41026,9 @@ impl ViewerApp {
     }
 
     fn draw_upper_air_layer(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.model_enabled {
+            return;
+        }
         let Some(layer) = &self.upper_air_layer else {
             return;
         };
@@ -45626,6 +46759,48 @@ fn cross_section_smoothing_label(smoothing: CrossSectionSmoothing) -> &'static s
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SweepRevealKey {
+    underlay_volume_ptr: usize,
+    underlay_previous_volume_ptr: usize,
+    underlay_dealias_env_ptr: usize,
+    underlay_cut: usize,
+    start_millideg: i32,
+    revealed_millideg: i32,
+}
+
+impl SweepRevealKey {
+    fn new(reveal: &SweepRevealRequest) -> Self {
+        let quantize = |degrees: f32| {
+            if degrees.is_finite() {
+                (degrees * 1_000.0).round() as i32
+            } else {
+                i32::MAX
+            }
+        };
+        Self {
+            underlay_volume_ptr: reveal
+                .underlay_volume
+                .as_ref()
+                .map(|volume| Arc::as_ptr(volume) as usize)
+                .unwrap_or(0),
+            underlay_previous_volume_ptr: reveal
+                .underlay_previous_volume
+                .as_ref()
+                .map(|volume| Arc::as_ptr(volume) as usize)
+                .unwrap_or(0),
+            underlay_dealias_env_ptr: reveal
+                .underlay_dealias_env
+                .as_ref()
+                .map(|profile| Arc::as_ptr(profile) as usize)
+                .unwrap_or(0),
+            underlay_cut: reveal.underlay_cut,
+            start_millideg: quantize(reveal.start_deg),
+            revealed_millideg: quantize(reveal.revealed_deg),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TextureKey {
     volume_ptr: usize,
@@ -45646,6 +46821,10 @@ struct TextureKey {
     smoothing: SmoothingMode,
     dealias_engine: DealiasEngine,
     gate_filter_decidbz: i16,
+    /// Transient live-sweep presentation identity. Without it, every eased
+    /// step has the same texture key and the request guard suppresses the
+    /// animation after its first frame.
+    sweep_reveal: Option<SweepRevealKey>,
     viewport: ViewportKey,
 }
 
@@ -45662,6 +46841,7 @@ fn texture_keys_match_data_and_style(left: &TextureKey, right: &TextureKey) -> b
         && left.smoothing == right.smoothing
         && left.dealias_engine == right.dealias_engine
         && left.gate_filter_decidbz == right.gate_filter_decidbz
+        && left.sweep_reveal == right.sweep_reveal
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48204,6 +49384,7 @@ fn model_download_cadence_hint(model: rustwx_core::ModelId, cycle: u8) -> &'stat
         ModelId::CmaGeps => "3-hourly 000-078, 6-hourly 084-360; provider statistics",
         ModelId::Rdps => "hourly 000-084",
         ModelId::Hrdps => "hourly 000-048",
+        ModelId::HrdpsWest => "hourly 000-048; experimental 1 km West / short retention",
         ModelId::Reps => "3-hourly 003-072; provider statistics",
         ModelId::IconEu if cycle.is_multiple_of(6) => "hourly 000-078, 3-hourly 081-120",
         ModelId::IconEu => "hourly 000-030, then 036/042/048",
@@ -48212,6 +49393,7 @@ fn model_download_cadence_hint(model: rustwx_core::ModelId, cycle: u8) -> &'stat
         ModelId::Geps => "3-hourly 003-192, 6-hourly 198-384; provider statistics",
         ModelId::WrfCptec7km => "hourly 000-180; South America",
         ModelId::BramsCptec8km => "hourly 001-180; South America",
+        ModelId::EtaCptec8km => "hourly 000-264; South America",
         ModelId::Gefs if cycle == 0 => "3-hourly 000-384, 6-hourly 390-840; control member",
         ModelId::Gefs => "3-hourly 000-240, 6-hourly 246-384; control member",
         ModelId::Aigfs => "6-hourly 000-384",
@@ -55614,11 +56796,13 @@ mod tests {
                     smoothing: SmoothingMode::Native,
                     dealias_engine: DealiasEngine::Region,
                     gate_filter_decidbz: i16::MIN,
+                    sweep_reveal: None,
                     viewport: test_viewport_key(320, 240),
                 },
                 lane: LaneId::Primary,
                 volume,
                 previous_volume: None,
+                sweep_reveal: None,
                 dealias_env: None,
                 cut: 0,
                 product,
@@ -55866,6 +57050,7 @@ mod tests {
         let mut sample_caches = Vec::new();
         let mut geometry_caches = Vec::new();
         let mut last_direct_viewports = Vec::new();
+        let mut sweep_underlay_caches = Vec::new();
         let mut rendered_cache = Vec::new();
         let mut first_render_ms = Vec::new();
         let mut first_worker_ms = Vec::new();
@@ -55893,6 +57078,7 @@ mod tests {
                 &mut sample_caches,
                 &mut geometry_caches,
                 &mut last_direct_viewports,
+                &mut sweep_underlay_caches,
                 cache_policy,
             )
             .unwrap_or_else(|err| panic!("render {label} frame {index}: {err}"));
@@ -56048,11 +57234,13 @@ mod tests {
                 smoothing: SmoothingMode::Native,
                 dealias_engine: DealiasEngine::Region,
                 gate_filter_decidbz: i16::MIN,
+                sweep_reveal: None,
                 viewport: viewport_key,
             },
             lane: LaneId::Primary,
             volume,
             previous_volume: None,
+            sweep_reveal: None,
             dealias_env: None,
             cut,
             product: product.clone(),
@@ -56765,11 +57953,13 @@ mod tests {
                 smoothing: SmoothingMode::Native,
                 dealias_engine: DealiasEngine::Region,
                 gate_filter_decidbz: i16::MIN,
+                sweep_reveal: None,
                 viewport: test_viewport_key(1320, 820),
             },
             lane: LaneId::Primary,
             volume,
             previous_volume: None,
+            sweep_reveal: None,
             dealias_env: None,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
@@ -58670,6 +59860,7 @@ mod tests {
 
         let mut partial_app = test_viewer_app_with_hazards(Vec::new());
         partial_app.app_settings.live_low_sweep_auto_advance = true;
+        partial_app.display_live_chunk_updates = false;
         partial_app.volume = Some(Arc::new(test_reflectivity_sails_volume_with_radials(
             &[(0.50, 0)],
             720,
@@ -58741,6 +59932,371 @@ mod tests {
     }
 
     #[test]
+    fn live_sweep_underlay_uses_previous_complete_matching_leg() {
+        let scan_time = Utc.with_ymd_and_hms(2026, 8, 25, 20, 0, 0).unwrap();
+        let previous = Arc::new(test_volume_with_site_time("KTLX", scan_time));
+        let mut current = test_reflectivity_sails_volume_with_radials(&[(0.52, 0)], 120);
+        current.site = radar_core::RadarSite::new("KTLX");
+        current.volume_time = scan_time + chrono::Duration::minutes(5);
+        let current = Arc::new(current);
+        let frames = vec![
+            FrameHistoryEntry {
+                identity: frame_identity_for_volume(previous.as_ref()),
+                path: PathBuf::from("previous"),
+                volume: Arc::clone(&previous),
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: "previous".to_owned(),
+            },
+            FrameHistoryEntry {
+                identity: frame_identity_for_volume(current.as_ref()),
+                path: PathBuf::from("current"),
+                volume: Arc::clone(&current),
+                timings: None,
+                status: FrameStatus::LivePartial,
+                source_label: "current".to_owned(),
+            },
+        ];
+
+        let underlay = previous_completed_sweep(&frames, &current, 0, &MomentType::Reflectivity)
+            .expect("previous complete reflectivity leg");
+        assert!(Arc::ptr_eq(&underlay.volume, &previous));
+        assert_eq!(underlay.cut, 0);
+
+        let mut wrong_leg = previous.as_ref().clone();
+        add_velocity_moments_to_volume(&mut wrong_leg);
+        let wrong_leg = Arc::new(wrong_leg);
+        let wrong_frames = vec![
+            FrameHistoryEntry {
+                identity: frame_identity_for_volume(wrong_leg.as_ref()),
+                path: PathBuf::from("wrong-leg"),
+                volume: wrong_leg,
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: "wrong leg".to_owned(),
+            },
+            frames[1].clone(),
+        ];
+        assert!(
+            previous_completed_sweep(&wrong_frames, &current, 0, &MomentType::Reflectivity,)
+                .is_none(),
+            "a combined Doppler leg must not underpaint a surveillance leg"
+        );
+    }
+
+    #[test]
+    fn arriving_sails_cut_can_underpaint_from_completed_same_volume_cut() {
+        let volume = Arc::new(test_reflectivity_sails_volume_mixed_radials(&[
+            (0.50, 0, 360),
+            (0.55, 30_000, 120),
+        ]));
+        let frames = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("same-volume"),
+            volume: Arc::clone(&volume),
+            timings: None,
+            status: FrameStatus::LivePartial,
+            source_label: "same volume".to_owned(),
+        }];
+
+        let underlay = previous_completed_sweep(&frames, &volume, 1, &MomentType::Reflectivity)
+            .expect("completed earlier SAILS-compatible sweep");
+        assert!(Arc::ptr_eq(&underlay.volume, &volume));
+        assert_eq!(underlay.cut, 0);
+    }
+
+    #[test]
+    fn same_volume_sails_matching_uses_measured_median_not_stored_cut_angle() {
+        let mut volume = test_reflectivity_sails_volume_mixed_radials(&[
+            (0.50, 0, 360),
+            (0.53, 30_000, 360),
+            (0.90, 60_000, 360),
+            (0.50, 90_000, 60),
+        ]);
+        // Deliberately misleading commanded/settling angles. The radial
+        // medians above are the physical elevations the antenna measured.
+        volume.cuts[0].elevation_deg = 0.72;
+        volume.cuts[1].elevation_deg = 0.78;
+        volume.cuts[2].elevation_deg = 0.91;
+        volume.cuts[3].elevation_deg = 0.10;
+        let volume = Arc::new(volume);
+        let frames = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("median-sails"),
+            volume: Arc::clone(&volume),
+            timings: None,
+            status: FrameStatus::LivePartial,
+            source_label: "same volume".to_owned(),
+        }];
+
+        let underlay = previous_completed_sweep(&frames, &volume, 3, &MomentType::Reflectivity)
+            .expect("newest completed measured-compatible sweep");
+        assert!(Arc::ptr_eq(&underlay.volume, &volume));
+        assert_eq!(underlay.cut, 1);
+    }
+
+    #[test]
+    fn same_elevation_number_cannot_cross_underpaint_a_vcp_angle_change() {
+        let base_time = Utc.with_ymd_and_hms(2026, 8, 25, 18, 0, 0).unwrap();
+        let mut previous = test_reflectivity_sails_volume_with_radials(&[(15.6, 0)], 360);
+        previous.site = radar_core::RadarSite::new("KTLX");
+        previous.volume_time = base_time;
+        let previous = Arc::new(previous);
+        let mut current = test_reflectivity_sails_volume_with_radials(&[(14.0, 0)], 60);
+        current.site = radar_core::RadarSite::new("KTLX");
+        current.volume_time = base_time + chrono::Duration::minutes(5);
+        let current = Arc::new(current);
+        let frames = [
+            (Arc::clone(&previous), FrameStatus::Complete),
+            (Arc::clone(&current), FrameStatus::LivePartial),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (volume, status))| FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from(format!("vcp-angle-{index}")),
+            volume,
+            timings: None,
+            status,
+            source_label: "vcp transition".to_owned(),
+        })
+        .collect::<Vec<_>>();
+
+        assert!(
+            previous_completed_sweep(&frames, &current, 0, &MomentType::Reflectivity).is_none(),
+            "the same elevation number is not the same physical tilt across VCPs"
+        );
+    }
+
+    #[test]
+    fn fresh_same_volume_sails_beats_an_older_matching_scan() {
+        let base_time = Utc.with_ymd_and_hms(2026, 8, 25, 18, 0, 0).unwrap();
+        let mut older = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 360);
+        older.site = radar_core::RadarSite::new("KTLX");
+        older.volume_time = base_time;
+        let older = Arc::new(older);
+        let mut newest_prior = test_reflectivity_sails_volume_with_radials(&[(1.8, 0)], 360);
+        newest_prior.site = radar_core::RadarSite::new("KTLX");
+        newest_prior.volume_time = base_time + chrono::Duration::minutes(5);
+        let newest_prior = Arc::new(newest_prior);
+        let mut current =
+            test_reflectivity_sails_volume_mixed_radials(&[(0.5, 0, 360), (0.5, 30_000, 60)]);
+        current.site = radar_core::RadarSite::new("KTLX");
+        current.volume_time = base_time + chrono::Duration::minutes(10);
+        let current = Arc::new(current);
+        let frames = [
+            (Arc::clone(&older), FrameStatus::Complete),
+            (Arc::clone(&newest_prior), FrameStatus::Complete),
+            (Arc::clone(&current), FrameStatus::LivePartial),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (volume, status))| FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from(format!("freshness-{index}")),
+            volume,
+            timings: None,
+            status,
+            source_label: "underlay freshness".to_owned(),
+        })
+        .collect::<Vec<_>>();
+
+        let underlay = previous_completed_sweep(&frames, &current, 1, &MomentType::Reflectivity)
+            .expect("same-volume completed SAILS sweep");
+        assert!(Arc::ptr_eq(&underlay.volume, &current));
+        assert_eq!(underlay.cut, 0);
+    }
+
+    #[test]
+    fn live_sweep_clock_eases_a_new_chunk_without_passing_its_frontier() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.display_live_chunk_updates = true;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        let scan_time = Utc.with_ymd_and_hms(2026, 8, 25, 21, 0, 0).unwrap();
+        let mut first = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 120);
+        first.site = radar_core::RadarSite::new("KTLX");
+        first.volume_time = scan_time;
+        let first = Arc::new(first);
+        app.volume = Some(Arc::clone(&first));
+        app.primary.history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(first.as_ref()),
+            path: PathBuf::from("live"),
+            volume: Arc::clone(&first),
+            timings: None,
+            status: FrameStatus::LivePartial,
+            source_label: "live".to_owned(),
+        });
+        app.displayed_primary_frame_status = Some(FrameStatus::LivePartial);
+        let ctx = egui::Context::default();
+
+        app.advance_live_sweep_reveals(&ctx);
+        let first_state = app.live_sweep.state.expect("first partial sweep state");
+        assert!(!first_state.complete);
+        app.live_sweep.stepped_at = Some(Instant::now() - Duration::from_secs(1));
+
+        let mut grown = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 240);
+        grown.site = radar_core::RadarSite::new("KTLX");
+        grown.volume_time = scan_time;
+        let grown = Arc::new(grown);
+        app.volume = Some(Arc::clone(&grown));
+        app.primary.history.iter_mut().next().unwrap().volume = Arc::clone(&grown);
+        app.advance_live_sweep_reveals(&ctx);
+
+        let grown_state = app.live_sweep.state.expect("grown partial sweep state");
+        assert!(grown_state.revealed_deg > first_state.revealed_deg);
+        assert!(grown_state.revealed_deg < 239.5);
+        assert!(grown_state.pending_deg() > 0.0);
+
+        // The end chunk changes frame status to LiveComplete before the
+        // presentation catches its final frontier. Keep easing that last
+        // burst instead of snapping the closing wedge all at once.
+        app.live_sweep.stepped_at = Some(Instant::now() - Duration::from_secs(1));
+        let mut complete = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 360);
+        complete.site = radar_core::RadarSite::new("KTLX");
+        complete.volume_time = scan_time;
+        let complete = Arc::new(complete);
+        app.volume = Some(Arc::clone(&complete));
+        let frame = app.primary.history.iter_mut().next().unwrap();
+        frame.volume = Arc::clone(&complete);
+        frame.status = FrameStatus::LiveComplete;
+        app.displayed_primary_frame_status = Some(FrameStatus::LiveComplete);
+        app.advance_live_sweep_reveals(&ctx);
+        let closing_state = app.live_sweep.state.expect("closing sweep state");
+        assert!(!closing_state.complete);
+        assert!(closing_state.revealed_deg < 359.5);
+
+        app.live_sweep.stepped_at = Some(Instant::now() - Duration::from_secs(20));
+        app.advance_live_sweep_reveals(&ctx);
+        assert!(app.live_sweep.state.is_some_and(|state| state.complete));
+    }
+
+    #[test]
+    fn sweep_reveal_position_participates_in_texture_identity() {
+        let reveal = |revealed_deg| SweepRevealRequest {
+            underlay_volume: None,
+            underlay_previous_volume: None,
+            underlay_dealias_env: None,
+            underlay_cut: 0,
+            start_deg: 197.5,
+            revealed_deg,
+        };
+        assert_ne!(
+            SweepRevealKey::new(&reveal(120.0)),
+            SweepRevealKey::new(&reveal(121.0))
+        );
+
+        let base = reveal(120.0);
+        let previous = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            360,
+        ));
+        let with_previous = SweepRevealRequest {
+            underlay_previous_volume: Some(previous),
+            ..base.clone()
+        };
+        assert_ne!(
+            SweepRevealKey::new(&base),
+            SweepRevealKey::new(&with_previous),
+            "a newly available Analyst3d temporal anchor must invalidate the composite"
+        );
+
+        let with_environment = SweepRevealRequest {
+            underlay_dealias_env: Some(Arc::new(EnvironmentalWindProfile {
+                levels: Vec::new(),
+                valid_time: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            })),
+            ..base.clone()
+        };
+        assert_ne!(
+            SweepRevealKey::new(&base),
+            SweepRevealKey::new(&with_environment),
+            "a newly available Analyst3d RAP profile must invalidate the composite"
+        );
+    }
+
+    #[test]
+    fn sweep_reveal_render_composites_and_reuses_completed_underlay() {
+        let previous = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            360,
+        ));
+        let current = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            120,
+        ));
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let color_tables = ColorTableSet::default();
+        let color_table_signature = color_tables.signature_for_family(product.color_family());
+        let mut request = khdc_profile_render_request(
+            current,
+            0,
+            product,
+            color_tables,
+            color_table_signature,
+            khdc_profile_viewport(96, 96),
+        );
+        let reveal = SweepRevealRequest {
+            underlay_volume: Some(previous),
+            underlay_previous_volume: None,
+            underlay_dealias_env: None,
+            underlay_cut: 0,
+            start_deg: 0.0,
+            revealed_deg: 120.0,
+        };
+        request.key.sweep_reveal = Some(SweepRevealKey::new(&reveal));
+        request.sweep_reveal = Some(reveal);
+
+        let mut reusable_pixels = Vec::new();
+        let mut reusable_pixels_signature = None;
+        let mut moment_caches = Vec::new();
+        let mut sample_caches = Vec::new();
+        let mut geometry_caches = Vec::new();
+        let mut last_direct_viewports = Vec::new();
+        let mut sweep_underlay_caches = Vec::new();
+        let rendered = ViewerApp::render_viewport_payload(
+            &request,
+            &mut reusable_pixels,
+            &mut reusable_pixels_signature,
+            &mut moment_caches,
+            &mut sample_caches,
+            &mut geometry_caches,
+            &mut last_direct_viewports,
+            &mut sweep_underlay_caches,
+            test_cache_policy(1),
+        )
+        .expect("sweep reveal render");
+
+        assert_eq!(rendered.rgba.len(), 96 * 96 * 4);
+        assert_eq!(rendered.buffer_signature.volume_ptr, 0);
+        assert_eq!(sweep_underlay_caches.len(), 1);
+
+        let reveal = request
+            .sweep_reveal
+            .as_mut()
+            .expect("configured reveal request");
+        reveal.revealed_deg = 180.0;
+        request.key.sweep_reveal = Some(SweepRevealKey::new(reveal));
+        ViewerApp::render_viewport_payload(
+            &request,
+            &mut reusable_pixels,
+            &mut reusable_pixels_signature,
+            &mut moment_caches,
+            &mut sample_caches,
+            &mut geometry_caches,
+            &mut last_direct_viewports,
+            &mut sweep_underlay_caches,
+            test_cache_policy(1),
+        )
+        .expect("second sweep reveal render");
+        assert_eq!(
+            sweep_underlay_caches.len(),
+            1,
+            "the completed tilt raster should be reused while the frontier moves"
+        );
+    }
+
+    #[test]
     fn terminal_radar_complete_low_level_tilt_accepts_360_radials() {
         let mut terminal = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 360);
         terminal.site.id = "TCVG".to_owned();
@@ -58773,6 +60329,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         };
         app.texture_key = Some(retained_texture_key.clone());
@@ -59427,6 +60984,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         };
         let mut next_cut = first.clone();
@@ -59521,6 +61079,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         };
 
@@ -59532,10 +61091,59 @@ mod tests {
             &current_key,
         );
 
-        assert!(app.loop_prewarm_inflight.is_empty());
+        assert_eq!(
+            app.loop_prewarm_inflight,
+            vec![current_key],
+            "interaction pauses new submissions but must not forget work already owned by the pool"
+        );
         assert!(
             app.loop_render_context.is_none(),
             "manual pan/zoom/scrub should not even establish a prewarm context"
+        );
+    }
+
+    #[test]
+    fn loop_prewarm_accounting_survives_repeated_zoom_context_invalidations() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let limit = loop_prewarm_inflight_limit(8);
+        let base_key =
+            test_screen_texture_key(42, 0, DisplayProduct::Moment(MomentType::Reflectivity));
+
+        // Model the old failure mode: every zoom establishes a new viewport
+        // context, interaction pauses prewarming, and cache invalidation runs.
+        // None of those operations cancels the request already owned by the
+        // pool, so the global accounting must stay capped across all of them.
+        for generation in 0..100u32 {
+            let mut key = base_key.clone();
+            key.volume_ptr = generation as usize + 1;
+            key.viewport.width = 720 + generation;
+
+            app.ensure_loop_render_context(&key);
+            app.pause_loop_prewarm_for_interaction();
+            let _ = app.reserve_loop_prewarm_request(key, limit);
+            app.clear_loop_render_cache();
+
+            assert!(
+                app.loop_prewarm_inflight.len() <= limit,
+                "zoom/context invalidation queued more than the global prewarm limit"
+            );
+        }
+        assert_eq!(
+            app.loop_prewarm_inflight.len(),
+            limit,
+            "the test must saturate the prewarm bound"
+        );
+
+        // Real results retire their reservations one-for-one, even though all
+        // of these keys now belong to stale render contexts.
+        let completed = app.loop_prewarm_inflight.clone();
+        for key in &completed {
+            assert!(app.retire_loop_prewarm_request(key));
+        }
+        assert!(app.loop_prewarm_inflight.is_empty());
+        assert!(
+            !app.retire_loop_prewarm_request(&base_key),
+            "an unrelated result must not retire another request's slot"
         );
     }
 
@@ -62237,6 +63845,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         };
 
@@ -62732,6 +64341,7 @@ mod tests {
             let mut sample_caches = Vec::new();
             let mut geometry_caches = Vec::new();
             let mut direct_viewports = Vec::new();
+            let mut sweep_underlay_caches = Vec::new();
             ViewerApp::render_viewport_payload(
                 request,
                 &mut pixels,
@@ -62740,6 +64350,7 @@ mod tests {
                 &mut sample_caches,
                 &mut geometry_caches,
                 &mut direct_viewports,
+                &mut sweep_underlay_caches,
                 policy,
             )
             .expect("render");
@@ -62867,6 +64478,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         };
         app.texture_key = Some(current_key.clone());
@@ -62942,6 +64554,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         };
         app.texture_key = Some(primary_key.clone());
@@ -62993,6 +64606,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         });
         app.primary.history.push(FrameHistoryEntry {
@@ -63023,6 +64637,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         });
 
@@ -63044,6 +64659,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         });
         assert!(app.loop_record_selected_textures_ready(LoopTimelineTarget::Primary));
@@ -63075,6 +64691,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         });
 
@@ -63109,6 +64726,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         });
         app.radar_layers.push(layer);
@@ -63131,6 +64749,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         });
         assert!(app.loop_record_selected_textures_ready(LoopTimelineTarget::Primary));
@@ -63161,6 +64780,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         });
         let pane_volume = Arc::new(test_velocity_sails_volume_with_radials(
@@ -63186,6 +64806,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         });
 
@@ -63961,6 +65582,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         });
 
@@ -64071,6 +65693,32 @@ mod tests {
         // Degenerate settings are clamped, never zero/negative/runaway.
         assert!(scroll_zoom_factor(600.0, 0) > 1.0);
         assert!(scroll_zoom_factor(600.0, u16::MAX) < 4.0);
+    }
+
+    #[test]
+    fn map_scroll_settle_deadline_defers_then_restores_exact_work() {
+        let now = Instant::now();
+        let quiet = Duration::from_millis(MAP_SCROLL_SETTLE_MS);
+        let first_deadline = now + quiet;
+
+        assert_eq!(
+            map_scroll_settle_remaining(Some(first_deadline), now),
+            Some(quiet)
+        );
+        assert_eq!(
+            map_scroll_settle_remaining(Some(first_deadline), first_deadline),
+            None,
+            "the settled repaint must restore exact warning/model work"
+        );
+
+        // A later wheel event replaces the deadline rather than allowing a
+        // rebuild in the gap between trackpad events.
+        let second_event = now + Duration::from_millis(120);
+        let extended_deadline = second_event + quiet;
+        assert_eq!(
+            map_scroll_settle_remaining(Some(extended_deadline), first_deadline),
+            Some(Duration::from_millis(120))
+        );
     }
 
     #[test]
@@ -64262,6 +65910,13 @@ mod tests {
     #[test]
     fn satellite_run_scan_keeps_only_the_active_source_and_product() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        // Keep this scalar-product filter test explicit. Rusty Weather's
+        // default moved from C13 to GeoColor, whose valid local follow runs
+        // include several required component bands (including C02 and C13).
+        app.sat_panel = rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec {
+            layer: "c13".to_owned(),
+            ..rw_ui::SatFollowSpec::default()
+        });
         let runs = vec![
             test_sat_run("g19", "conus_c13_20260615", &[1750]),
             test_sat_run("g19", "conus_c02_20260615", &[1750]),
@@ -64347,6 +66002,14 @@ mod tests {
         app.sat_run_listings = vec![test_sat_run("g19", "conus_c13_20260615", &[1755])];
         app.sat_map_inflight = Some((old_key.clone(), 1755));
         app.sat_map_pending = Some((old_key, 1800));
+        let render_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.sat_layer_render_cancel = Some(Arc::clone(&render_cancel));
+        let (_render_tx, render_rx) = mpsc::channel();
+        app.sat_layer_render_rx = Some(render_rx);
+        app.sat_layer_render_generation = Some(42);
+        app.sat_layer_render_view = Some(app.model_layer_current_view());
+        app.sat_layer_render_retry_after = Some(Instant::now() + Duration::from_secs(8));
+        app.sat_layer_render_failures = 4;
         let generation = app.sat_layer_generation;
 
         app.clear_satellite_display_for_spec_change();
@@ -64357,7 +66020,48 @@ mod tests {
         assert!(app.sat_map_pending.is_none());
         assert!(app.sat_layer.is_none());
         assert!(app.sat_layer_texture.is_none());
+        assert!(render_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.sat_layer_render_rx.is_none());
+        assert!(app.sat_layer_render_generation.is_none());
+        assert!(app.sat_layer_render_view.is_none());
+        assert!(app.sat_layer_render_retry_after.is_none());
+        assert_eq!(app.sat_layer_render_failures, 0);
         assert_ne!(app.sat_layer_generation, generation);
+    }
+
+    #[test]
+    fn satellite_prefetch_load_caches_texture_without_moving_playhead_or_map() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let key = rw_ui::SatRunKey {
+            model: "g19".to_owned(),
+            run: "conus_c13_20260826".to_owned(),
+        };
+        app.sat_last_frame = Some((key.clone(), 1200));
+        app.sat_map_inflight = Some((key.clone(), 1200));
+
+        assert!(app.cache_loaded_satellite_frame(
+            key.clone(),
+            1205,
+            false,
+            rw_ui::SatFrameImage {
+                key: key.clone(),
+                hhmm: 1205,
+                image: egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]),
+                read_ms: 1.0,
+            },
+        ));
+
+        assert_eq!(
+            app.sat_last_frame,
+            Some((key.clone(), 1200)),
+            "a prefetched neighbor is cache data, not displayed identity"
+        );
+        assert_eq!(
+            app.sat_map_inflight,
+            Some((key, 1200)),
+            "prefetch completion must not retarget map-follow"
+        );
+        assert!(app.sat_map_pending.is_none());
     }
 
     #[test]
@@ -64374,16 +66078,20 @@ mod tests {
         let frame = || sat_worker::SatMapFrame {
             key: key.clone(),
             hhmm: 1755,
-            image: egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]),
-            grid: Arc::new(rw_store::grid::GridFile {
-                nx: 2,
-                ny: 2,
-                lat: vec![35.1, 35.1, 35.0, 35.0],
-                lon: vec![-97.1, -97.0, -97.1, -97.0],
-                projection: None,
-                hash: "test-grid".to_owned(),
+            native: None,
+            remote: None,
+            preview: Some(sat_worker::SatMapPreview {
+                image: egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]),
+                grid: Arc::new(rw_store::grid::GridFile {
+                    nx: 2,
+                    ny: 2,
+                    lat: vec![35.1, 35.1, 35.0, 35.0],
+                    lon: vec![-97.1, -97.0, -97.1, -97.0],
+                    projection: None,
+                    hash: "test-grid".to_owned(),
+                }),
+                flip_rows: false,
             }),
-            flip_rows: false,
         };
 
         // Layer removed while the request was in flight: the remove path
@@ -64466,16 +66174,20 @@ mod tests {
         let frame = |key: &rw_ui::SatRunKey, hhmm: u16| sat_worker::SatMapFrame {
             key: key.clone(),
             hhmm,
-            image: egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]),
-            grid: Arc::new(rw_store::grid::GridFile {
-                nx: 2,
-                ny: 2,
-                lat: vec![35.1, 35.1, 35.0, 35.0],
-                lon: vec![-97.1, -97.0, -97.1, -97.0],
-                projection: None,
-                hash: "fulldisk-grid-sha".to_owned(),
+            native: None,
+            remote: None,
+            preview: Some(sat_worker::SatMapPreview {
+                image: egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]),
+                grid: Arc::new(rw_store::grid::GridFile {
+                    nx: 2,
+                    ny: 2,
+                    lat: vec![35.1, 35.1, 35.0, 35.0],
+                    lon: vec![-97.1, -97.0, -97.1, -97.0],
+                    projection: None,
+                    hash: "fulldisk-grid-sha".to_owned(),
+                }),
+                flip_rows: false,
             }),
-            flip_rows: false,
         };
         let cached_lut = test_sat_lut();
         app.sat_lut_cache_insert(
@@ -64497,8 +66209,9 @@ mod tests {
             "cached grid identity must skip the background LUT build"
         );
         let layer = app.sat_layer.as_ref().expect("layer installed");
+        let preview = layer.preview.as_ref().expect("preview fallback");
         assert!(
-            Arc::ptr_eq(&layer.lut, &cached_lut),
+            Arc::ptr_eq(&preview.lut, &cached_lut),
             "the cached LUT object is reused, not rebuilt"
         );
         assert_eq!(layer.key, run_a);
@@ -64516,7 +66229,10 @@ mod tests {
         assert!(app.sat_layer_build_rx.is_none());
         let layer = app.sat_layer.as_ref().expect("rollover layer installed");
         assert_eq!(layer.key, run_b);
-        assert!(Arc::ptr_eq(&layer.lut, &cached_lut));
+        assert!(Arc::ptr_eq(
+            &layer.preview.as_ref().expect("preview fallback").lut,
+            &cached_lut
+        ));
         assert!(
             (layer.opacity - 0.42).abs() < f32::EPSILON,
             "opacity survives"
@@ -64671,6 +66387,22 @@ mod tests {
 
         // Nothing selected, nothing shown: nothing to refresh.
         assert!(sat_enhancement_refresh_frames(&runs, None, None).is_empty());
+
+        let remote = test_sat_run(
+            "g19",
+            "conus_c13_rwserver_abi-c13_20260705",
+            &[1750, 1755, 1800],
+        );
+        let remote_last = (remote.key.clone(), 1755);
+        assert!(
+            sat_enhancement_refresh_frames(
+                std::slice::from_ref(&remote),
+                Some(&remote.key),
+                Some(&remote_last),
+            )
+            .is_empty()
+        );
+        assert!(sat_paint::satellite_run_key_is_remote(&remote.key));
     }
 
     fn test_model_store_tree(model: &str, run: &str, hours: &[u16]) -> rw_ui::StoreTree {
@@ -64784,7 +66516,124 @@ mod tests {
             },
             texture: None,
             render_rx: None,
+            render_cancel: None,
+            render_generation: None,
+            render_view: None,
         }
+    }
+
+    #[test]
+    fn hidden_model_slot_does_not_follow_the_docks_latest_field() {
+        let mut slot = test_model_layer("hrrr", "20260615_17z", 0);
+        let latest = test_model_field("hrrr", "20260615_17z", 1);
+
+        slot.layer.visible = false;
+        assert!(!model_slot_needs_latest_field_refresh(&slot, &latest));
+
+        slot.layer.visible = true;
+        assert!(model_slot_needs_latest_field_refresh(&slot, &latest));
+        slot.layer.field = Arc::clone(&latest);
+        assert!(
+            !model_slot_needs_latest_field_refresh(&slot, &latest),
+            "the already-current field must not refresh itself"
+        );
+    }
+
+    #[test]
+    fn model_slot_cancellation_is_latest_wins_and_drop_safe() {
+        let mut slot = test_model_layer("hrrr", "20260615_17z", 0);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_sender, receiver) = mpsc::channel::<ModelLayerRender>();
+        let requested = ModelLayerView {
+            center_lat: 35.0,
+            center_lon: -97.0,
+            map_scale: 40.0,
+        };
+        let newer = ModelLayerView {
+            center_lon: -90.0,
+            ..requested
+        };
+        slot.render_rx = Some(receiver);
+        slot.render_cancel = Some(Arc::clone(&cancel));
+        slot.render_generation = Some(slot.layer.generation);
+        slot.render_view = Some(requested);
+
+        assert!(slot.render_request_is_obsolete(slot.layer.generation, &newer));
+        slot.cancel_render();
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(slot.render_rx.is_none());
+        assert!(slot.render_view.is_none());
+
+        let drop_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_sender, receiver) = mpsc::channel::<ModelLayerRender>();
+        slot.render_rx = Some(receiver);
+        slot.render_cancel = Some(Arc::clone(&drop_cancel));
+        drop(slot);
+        assert!(
+            drop_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "removing a layer must stop its detached raster worker"
+        );
+    }
+
+    #[test]
+    fn model_master_off_tears_down_workers_even_without_a_dock() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let mut slot = test_model_layer("hrrr", "20260615_17z", 0);
+        let raster_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_raster_sender, raster_receiver) = mpsc::channel::<ModelLayerRender>();
+        slot.render_rx = Some(raster_receiver);
+        slot.render_cancel = Some(Arc::clone(&raster_cancel));
+        slot.render_generation = Some(slot.layer.generation);
+        slot.render_view = Some(ModelLayerView {
+            center_lat: 35.0,
+            center_lon: -97.0,
+            map_scale: 40.0,
+        });
+        app.model_layers.push(slot);
+
+        let (_build_sender, build_receiver) = mpsc::channel();
+        app.model_layer_build_rx = Some(build_receiver);
+        let (_lut_sender, lut_receiver) = mpsc::channel();
+        app.model_lut_rx = Some(lut_receiver);
+        app.model_lut = Some(("test-grid".to_owned(), test_sat_lut()));
+        let (_upper_sender, upper_receiver) = mpsc::channel();
+        app.upper_air_rx.inject_for_test(upper_receiver);
+        let (_grid_sender, grid_receiver) = mpsc::channel();
+        app.grid_composite_rx = Some(grid_receiver);
+        app.grid_composite_pending_field = Some(test_model_field("hrrr", "20260615_17z", 1));
+        let (_oa_sender, oa_receiver) = mpsc::channel();
+        app.oa_rx = Some(oa_receiver);
+        let (_oa_cape_sender, oa_cape_receiver) = mpsc::channel();
+        app.oa_cape_rx = Some(oa_cape_receiver);
+        let (_oa_comp_sender, oa_comp_receiver) = mpsc::channel();
+        app.oa_comp_rx = Some(oa_comp_receiver);
+        app.oa_comp_total = 10;
+        app.oa_comp_progress
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        app.formula_lab_window_open = true;
+        assert!(
+            app.model_dock.is_none(),
+            "exercise the original teardown hole"
+        );
+
+        app.model_enabled = false;
+        app.poll_model_layer(&ctx);
+
+        assert!(raster_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.model_layers.is_empty());
+        assert!(app.model_layer_build_rx.is_none());
+        assert!(app.model_lut_rx.is_none());
+        assert!(app.model_lut.is_none());
+        assert!(!app.upper_air_rx.in_flight());
+        assert!(app.upper_air_layer.is_none());
+        assert!(app.grid_composite_rx.is_none());
+        assert!(app.grid_composite_pending_field.is_none());
+        assert!(app.oa_rx.is_none());
+        assert!(app.oa_cape_rx.is_none());
+        assert!(app.oa_comp_rx.is_none());
+        assert_eq!(app.oa_comp_total, 0);
+        assert!(!app.formula_lab_window_open);
     }
 
     #[test]
@@ -66446,6 +68295,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(100, 100),
         });
 
@@ -74196,6 +76046,77 @@ mod tests {
     }
 
     #[test]
+    fn model_layer_render_resolution_is_adaptive_and_hard_bounded() {
+        let focused = model_layer_render_dimensions(1_920.0, 1_080.0, 115.0);
+        let regional = model_layer_render_dimensions(1_920.0, 1_080.0, 50.0);
+        let wide = model_layer_render_dimensions(1_920.0, 1_080.0, 20.0);
+
+        assert!(focused.0 * focused.1 <= MODEL_LAYER_FOCUSED_PIXEL_BUDGET);
+        assert!(regional.0 * regional.1 <= MODEL_LAYER_REGIONAL_PIXEL_BUDGET);
+        assert!(wide.0 * wide.1 <= MODEL_LAYER_WIDE_PIXEL_BUDGET);
+        assert!(focused.0 >= regional.0 && regional.0 >= wide.0);
+        assert!(focused.1 >= regional.1 && regional.1 >= wide.1);
+        for (width, height) in [focused, regional, wide] {
+            assert!(width <= MODEL_LAYER_RENDER_MAX_EDGE);
+            assert!(height <= MODEL_LAYER_RENDER_MAX_EDGE);
+            assert!(
+                ((width as f64 / height as f64) - (16.0 / 9.0)).abs() < 0.01,
+                "bounded raster must preserve the map aspect: {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_model_raster_sampling_preserves_the_full_geographic_extent() {
+        let logical_width = 1_920.0;
+        let logical_height = 1_080.0;
+        let km_per_point = 4.0;
+        let (width, height) = model_layer_render_dimensions(logical_width, logical_height, 20.0);
+        assert!(
+            width < logical_width as usize,
+            "test must exercise downsampling"
+        );
+
+        let (left, top) = model_layer_sample_enu_km(
+            0,
+            0,
+            width,
+            height,
+            logical_width,
+            logical_height,
+            km_per_point,
+        );
+        let (right, bottom) = model_layer_sample_enu_km(
+            width - 1,
+            height - 1,
+            width,
+            height,
+            logical_width,
+            logical_height,
+            km_per_point,
+        );
+        let half_cell_x = logical_width / width as f64 * 0.5 * km_per_point;
+        let half_cell_y = logical_height / height as f64 * 0.5 * km_per_point;
+
+        assert!((left - half_cell_x + logical_width * 0.5 * km_per_point).abs() < 1e-9);
+        assert!((right + half_cell_x - logical_width * 0.5 * km_per_point).abs() < 1e-9);
+        assert!((top + half_cell_y - logical_height * 0.5 * km_per_point).abs() < 1e-9);
+        assert!((bottom - half_cell_y + logical_height * 0.5 * km_per_point).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_raster_worker_admission_is_globally_bounded() {
+        assert_eq!(model_layer_render_worker_limit(0), 1);
+        assert_eq!(model_layer_render_worker_limit(4), 1);
+        assert_eq!(model_layer_render_worker_limit(5), 2);
+        assert_eq!(model_layer_render_worker_limit(64), 2);
+        assert!(model_layer_render_worker_available(0, 2));
+        assert!(!model_layer_render_worker_available(1, 2));
+        assert!(model_layer_render_worker_available(1, 16));
+        assert!(!model_layer_render_worker_available(2, 16));
+    }
+
+    #[test]
     fn map_projection_equalizes_local_lat_lon_kilometers() {
         let rect = test_map_rect();
         let mut app = test_viewer_app_with_hazards(Vec::new());
@@ -75214,6 +77135,7 @@ mod tests {
             pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
+            map_scroll_settle_until: None,
             cross_section_armed: false,
             cross_section_view_open: false,
             context_menu_lonlat: None,
@@ -75232,6 +77154,7 @@ mod tests {
             download_panel: explicit_model_download_panel(default_download_spec("hrrr")),
             sat: None,
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
+            sat_storage_usage: None,
             sat_player: rw_ui::SatPlayerPanel::new(),
             sat_run_listings: Vec::new(),
             show_satellite: false,
@@ -75270,6 +77193,11 @@ mod tests {
             sat_layer_build_rx: None,
             sat_layer_texture: None,
             sat_layer_render_rx: None,
+            sat_layer_render_cancel: None,
+            sat_layer_render_generation: None,
+            sat_layer_render_view: None,
+            sat_layer_render_retry_after: None,
+            sat_layer_render_failures: 0,
             sat_layer_generation: 0,
             sat_lut_cache: Vec::new(),
             sat_last_frame: None,
@@ -75462,7 +77390,8 @@ mod tests {
             style_registry: styles::StyleRegistry::default(),
             styles_newer_schema: false,
             hidden_hazard_families: default_hidden_hazard_families(),
-            display_live_chunk_updates: false,
+            display_live_chunk_updates: true,
+            live_sweep: LiveSweepRuntime::default(),
             live_refresh_skip_reason: None,
             live_hazard_auto_refresh: false,
             show_performance_stats: false,
@@ -75977,6 +77906,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         };
         app.texture_key = Some(retained_texture_key.clone());
@@ -78083,7 +80013,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_lab_is_a_first_class_viewer_that_keeps_the_shared_backend_enabled() {
+    fn formula_lab_is_first_class_but_model_master_off_closes_its_backend() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
         assert_eq!(
@@ -78098,19 +80028,19 @@ mod tests {
             dock::ViewerMode::Floating
         );
 
-        // The window itself is explicit intent to keep Models' single shared
-        // worker owner alive, even if the model master switch was previously
-        // off. No second ModelDataDock is created by viewer state.
+        // The explicit Model master switch outranks a previously-open viewer:
+        // OFF must be a pure-radar ownership boundary, not immediately flip
+        // itself back on during the worker poll.
         app.model_enabled = false;
         app.poll_model_layer(&ctx);
-        assert!(app.model_enabled);
+        assert!(!app.model_enabled);
         assert!(app.model_dock.is_none());
+        assert!(!app.formula_lab_window_open);
 
         app.workspace
             .prefer_docked
             .insert(dock::WorkspacePane::FormulaLab);
-        app.toggle_viewer(dock::WorkspacePane::FormulaLab);
-        assert!(!app.viewer_open(dock::WorkspacePane::FormulaLab));
+        app.model_enabled = true;
         app.toggle_viewer(dock::WorkspacePane::FormulaLab);
         assert!(app.workspace.is_docked(dock::WorkspacePane::FormulaLab));
     }
@@ -79328,6 +81258,7 @@ mod tests {
             "cma-geps",
             "rdps",
             "hrdps",
+            "hrdps-west",
             "reps",
             "icon-eu",
             "icon-d2",
@@ -79335,6 +81266,7 @@ mod tests {
             "geps",
             "wrf-cptec-7km",
             "brams-cptec-8km",
+            "eta-cptec-8km",
             "gdas",
             "gefs",
             "aigfs",
@@ -79474,6 +81406,8 @@ mod tests {
             (rustwx_core::ModelId::Geps, 0, "3,6,9,12"),
             (rustwx_core::ModelId::IconRu, 0, "3,6,9,12"),
             (rustwx_core::ModelId::BramsCptec8km, 0, "1-4"),
+            (rustwx_core::ModelId::HrdpsWest, 0, "0-3"),
+            (rustwx_core::ModelId::EtaCptec8km, 0, "0-3"),
         ] {
             assert_eq!(
                 initial_model_download_hours(model, cycle),
@@ -79483,6 +81417,8 @@ mod tests {
         }
         assert!(model_download_cadence_hint(rustwx_core::ModelId::Gefs, 0).contains("840"));
         assert!(model_download_cadence_hint(rustwx_core::ModelId::Aigefs, 0).contains("006"));
+        assert!(model_download_cadence_hint(rustwx_core::ModelId::HrdpsWest, 0).contains("048"));
+        assert!(model_download_cadence_hint(rustwx_core::ModelId::EtaCptec8km, 0).contains("264"));
     }
 
     #[test]
@@ -79991,6 +81927,7 @@ mod tests {
             smoothing: SmoothingMode::Native,
             dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
+            sweep_reveal: None,
             viewport: test_viewport_key(720, 480),
         }
     }

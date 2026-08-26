@@ -136,8 +136,10 @@ pub enum RepaintDecision {
 /// repaint now if the pass accepted anything, otherwise schedule a short
 /// follow-up poll only while a result is still awaited.
 ///
-/// The prewarm drain passes `awaiting_result = false` — prewarm results are
-/// opportunistic cache fills and never schedule a follow-up poll.
+/// The prewarm drain may pass `awaiting_result = true` while app-side request
+/// accounting still owns a slot. That guarantees a completed stale request is
+/// eventually drained and retired even if the UI becomes idle after changing
+/// render context.
 pub fn post_drain_repaint(saw_message: bool, awaiting_result: bool) -> RepaintDecision {
     if saw_message {
         RepaintDecision::Now

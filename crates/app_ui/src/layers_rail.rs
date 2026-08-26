@@ -33,7 +33,7 @@ fn model_map_layer_visibility_hover(grid_composite: bool) -> &'static str {
     if grid_composite {
         "Show this gridded radar/composite layer on the map"
     } else {
-        "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)"
+        "Show on map (unchecked: hidden and excluded from the inspector; Alt+click soundings still use the selected model field)"
     }
 }
 
@@ -368,6 +368,7 @@ impl ViewerApp {
         for slot in &mut self.model_layers {
             let id = slot.id;
             let layer = &mut slot.layer;
+            let was_visible = layer.visible;
             let grid_source =
                 grid_composites::GridCompositeSource::from_variable_slug(&layer.field.key.var);
             // Raw wrf_* store fields show their friendly catalog label in the
@@ -549,6 +550,11 @@ impl ViewerApp {
             if open_window {
                 open_model_window = true;
             }
+            if was_visible && !layer.visible {
+                // Hiding is a hard presentation/work boundary: stop a
+                // regional raster already running for this slot immediately.
+                slot.cancel_render();
+            }
             if remove_this {
                 remove_layer = Some(id);
             }
@@ -570,6 +576,7 @@ impl ViewerApp {
                 _ => None,
             };
             if let Some(slot) = self.model_layers.iter_mut().find(|slot| slot.id == id) {
+                slot.cancel_render();
                 match action {
                     ModelColorAction::Auto => {
                         slot.layer.custom_color_family = None;
@@ -3931,6 +3938,13 @@ mod tests {
             model_map_layer_opacity_hover(true),
             "Gridded radar/composite layer opacity"
         );
+    }
+
+    #[test]
+    fn hidden_model_layer_hover_matches_inspector_visibility() {
+        let visibility = model_map_layer_visibility_hover(false);
+        assert!(visibility.contains("excluded from the inspector"));
+        assert!(visibility.contains("Alt+click soundings"));
     }
 
     #[test]

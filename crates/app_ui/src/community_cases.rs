@@ -1081,6 +1081,10 @@ fn build_artifact_publication(
         },
         source_provenance: vec![SourceProvenance {
             provider: case.provider.clone(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: parse_token_list(&case.roles_csv),
             products: parse_token_list(&case.products_csv),
         }],

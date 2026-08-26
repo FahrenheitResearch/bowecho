@@ -30,11 +30,12 @@ use rw_community_protocol::{
     FinalizeRunGenerationRequest, MAX_RUN_GENERATION_MISSING_PAGE, MAX_RUN_GENERATION_OWNER_PAGE,
     PublicationGrant, PublishedRunGeneration, REVOKE_RUN_GENERATION_SCHEMA,
     RUN_GENERATION_CAPABILITIES_PATH, RUN_GENERATION_CHUNK_SCHEMA_V1, RUN_GENERATION_FILE_SCHEMA,
-    RUN_GENERATION_REPLICATION_SCHEMA, RevokeRunGenerationRequest, RunGenerationFile,
-    RunGenerationFileChunk, RunGenerationFileKind, RunGenerationLimits, RunGenerationMissingPage,
-    RunGenerationOwnerCapabilities, RunGenerationOwnerListPage, RunGenerationOwnerRecord,
-    RunGenerationOwnerRecordState, RunGenerationReplicationManifest, RunGenerationTombstone,
-    RunGenerationUploadStatus, SourceProvenance, generation_content_sha256,
+    RUN_GENERATION_REPLICATION_SCHEMA, RUN_GENERATION_REPLICATION_SCHEMA_V2,
+    RevokeRunGenerationRequest, RunGenerationFile, RunGenerationFileChunk, RunGenerationFileKind,
+    RunGenerationLimits, RunGenerationMissingPage, RunGenerationOwnerCapabilities,
+    RunGenerationOwnerListPage, RunGenerationOwnerRecord, RunGenerationOwnerRecordState,
+    RunGenerationReplicationManifest, RunGenerationTombstone, RunGenerationUploadStatus,
+    SourceProvenance, generation_content_sha256,
 };
 use rw_query::RunSnapshot;
 use rw_store::atomic::atomic_write_bytes;
@@ -550,6 +551,18 @@ pub(crate) struct GenerationPublicationJob {
     pub updated_unix: i64,
 }
 
+fn run_generation_replication_schema(
+    provenance: &[SourceProvenance],
+) -> Result<&'static str, PublicationError> {
+    Ok(
+        if crate::community_cache::source_provenance_uses_structured_identity(provenance)? {
+            RUN_GENERATION_REPLICATION_SCHEMA_V2
+        } else {
+            RUN_GENERATION_REPLICATION_SCHEMA
+        },
+    )
+}
+
 impl GenerationPublicationJob {
     fn confirmed_unix(&self) -> Option<i64> {
         match self.status {
@@ -572,7 +585,7 @@ impl GenerationPublicationJob {
             .checked_add(self.retention_seconds)
             .ok_or(PublicationError::Retention)?;
         let manifest = RunGenerationReplicationManifest {
-            schema: RUN_GENERATION_REPLICATION_SCHEMA.to_owned(),
+            schema: run_generation_replication_schema(&self.source_provenance)?.to_owned(),
             generation_id: self.job_id.clone(),
             model: self.model.clone(),
             run: self.run.clone(),
@@ -1129,7 +1142,12 @@ impl GenerationPublicationStore {
             resolve_run_directory(&request.store_root, &request.model, &request.run)?;
         let _source_lock = RunLock::acquire(&run_dir, SOURCE_LOCK_TIMEOUT)?;
         require_deep_valid(&run_dir)?;
-        let source_snapshot = RunSnapshot::open(&store_root, &request.model, &request.run)?;
+        let source_snapshot = RunSnapshot::open_with_limits(
+            &store_root,
+            &request.model,
+            &request.run,
+            crate::model_data::bowecho_query_limits(),
+        )?;
         let source_snapshot_id = source_snapshot.descriptor().snapshot_id.clone();
         let grid_hash = source_snapshot.descriptor().grid_hash.clone();
         let source_provenance = source_snapshot
@@ -1138,6 +1156,10 @@ impl GenerationPublicationStore {
             .iter()
             .map(|source| SourceProvenance {
                 provider: source.provider.clone(),
+                forecast_producer: source.forecast_producer.clone(),
+                licensing_publisher: source.licensing_publisher.clone(),
+                transport_provider: source.transport_provider.clone(),
+                transport_is_mirror: source.transport_is_mirror,
                 roles: source.roles.clone(),
                 products: source.products.clone(),
             })
@@ -1179,8 +1201,12 @@ impl GenerationPublicationStore {
             TemporaryRun::create(&self.root.join("staging"), &request.model, &request.run)?;
         let (files, total_bytes) = self.freeze_files(&run_dir, &temporary.run_dir, &file_specs)?;
         require_deep_valid(&temporary.run_dir)?;
-        let staged_snapshot =
-            RunSnapshot::open(&temporary.store_root, &request.model, &request.run)?;
+        let staged_snapshot = RunSnapshot::open_with_limits(
+            &temporary.store_root,
+            &request.model,
+            &request.run,
+            crate::model_data::bowecho_query_limits(),
+        )?;
         if staged_snapshot.descriptor().grid_hash != grid_hash
             || staged_snapshot.descriptor().source_provenance
                 != source_snapshot.descriptor().source_provenance
@@ -1198,13 +1224,18 @@ impl GenerationPublicationStore {
                 return Err(PublicationError::InvalidGeneration);
             }
         }
-        let final_snapshot = RunSnapshot::open(&store_root, &request.model, &request.run)?;
+        let final_snapshot = RunSnapshot::open_with_limits(
+            &store_root,
+            &request.model,
+            &request.run,
+            crate::model_data::bowecho_query_limits(),
+        )?;
         if final_snapshot.descriptor().snapshot_id != source_snapshot_id {
             return Err(PublicationError::InvalidGeneration);
         }
 
         let provisional = RunGenerationReplicationManifest {
-            schema: RUN_GENERATION_REPLICATION_SCHEMA.to_owned(),
+            schema: run_generation_replication_schema(&source_provenance)?.to_owned(),
             generation_id: "pending".to_owned(),
             model: request.model.clone(),
             run: request.run.clone(),
@@ -2299,7 +2330,7 @@ fn lock_required_notices(
     }
     let has_ecmwf = provenance
         .iter()
-        .any(|source| source.provider == "ecmwf-open-data");
+        .any(|source| source.licensing_publisher_identity() == "ecmwf-open-data");
     if has_ecmwf {
         attributions.retain(|notice| notice.provider != "ecmwf-open-data");
         attributions.push(AttributionNotice::ecmwf_open_data());
@@ -3403,7 +3434,114 @@ mod tests {
         }
     }
 
+    fn legacy_source(provider: &str) -> SourceProvenance {
+        SourceProvenance {
+            provider: provider.into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
+            roles: vec!["owner-processed".into()],
+            products: vec!["rw-store".into()],
+        }
+    }
+
+    #[test]
+    fn replication_schema_rejects_partial_or_mixed_source_identity() {
+        let legacy = legacy_source(crate::wrf_source::PRIVATE_WRF_PROVIDER);
+        assert_eq!(
+            run_generation_replication_schema(std::slice::from_ref(&legacy)).unwrap(),
+            RUN_GENERATION_REPLICATION_SCHEMA
+        );
+
+        let mut structured = legacy.clone();
+        structured.forecast_producer = Some("wrf".into());
+        structured.licensing_publisher = Some("owner".into());
+        structured.transport_provider = Some("amazon-web-services".into());
+        structured.transport_is_mirror = true;
+        assert_eq!(
+            run_generation_replication_schema(std::slice::from_ref(&structured)).unwrap(),
+            RUN_GENERATION_REPLICATION_SCHEMA_V2
+        );
+        assert!(matches!(
+            run_generation_replication_schema(&[legacy.clone(), structured.clone()]),
+            Err(PublicationError::Protocol(
+                rw_community_protocol::ProtocolError::InvalidField {
+                    field: "source_provenance",
+                    ..
+                }
+            ))
+        ));
+
+        structured.transport_provider = None;
+        assert!(matches!(
+            run_generation_replication_schema(&[structured]),
+            Err(PublicationError::Protocol(
+                rw_community_protocol::ProtocolError::InvalidField {
+                    field: "source_provenance",
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn structured_mirror_notices_follow_the_licensing_publisher() {
+        let mirrored = SourceProvenance {
+            provider: "public-cloud-mirror".into(),
+            forecast_producer: Some("ecmwf".into()),
+            licensing_publisher: Some("ecmwf-open-data".into()),
+            transport_provider: Some("amazon-web-services".into()),
+            transport_is_mirror: true,
+            roles: vec!["pressure".into()],
+            products: vec!["ifs".into()],
+        };
+        let (attributions, modifications) =
+            lock_required_notices(&[mirrored], vec![attribution()], Vec::new()).unwrap();
+        assert_eq!(
+            attributions
+                .iter()
+                .filter(|notice| notice.provider == "ecmwf-open-data")
+                .count(),
+            1
+        );
+        assert_eq!(modifications, vec![ECMWF_MODIFICATION_NOTICE.to_owned()]);
+
+        let acquisition_lane_only = SourceProvenance {
+            provider: "ecmwf-open-data".into(),
+            forecast_producer: Some("noaa-ncep".into()),
+            licensing_publisher: Some("noaa".into()),
+            transport_provider: Some("ecmwf-open-data".into()),
+            transport_is_mirror: true,
+            roles: vec!["surface".into()],
+            products: vec!["gfs".into()],
+        };
+        let (attributions, modifications) =
+            lock_required_notices(&[acquisition_lane_only], vec![attribution()], Vec::new())
+                .unwrap();
+        assert!(
+            attributions
+                .iter()
+                .all(|notice| notice.provider != "ecmwf-open-data")
+        );
+        assert!(modifications.is_empty());
+    }
+
     fn create_wrf_run(root: &Path, run: &str, provider: &str) {
+        create_wrf_run_with_provenance(
+            root,
+            run,
+            RwsSourceProvenance::new(
+                provider,
+                vec!["owner-processed".into()],
+                vec!["rw-store".into()],
+            )
+            .unwrap(),
+        );
+    }
+
+    fn create_wrf_run_with_provenance(root: &Path, run: &str, provenance: RwsSourceProvenance) {
+        let provider = provenance.provider.clone();
         let shape = GridShape::new(2, 2).unwrap();
         let grid = LatLonGrid::new(
             shape,
@@ -3422,16 +3560,7 @@ mod tests {
             "generation-publication-test",
         )
         .unwrap();
-        writer
-            .set_source_provenance(vec![
-                RwsSourceProvenance::new(
-                    provider,
-                    vec!["owner-processed".into()],
-                    vec!["rw-store".into()],
-                )
-                .unwrap(),
-            ])
-            .unwrap();
+        writer.set_source_provenance(vec![provenance]).unwrap();
         writer
             .add_field_2d(
                 "temperature_2m",
@@ -3602,13 +3731,95 @@ mod tests {
                 1_700_000_200,
             )
             .unwrap();
+        let legacy_manifest = confirmed
+            .replication_manifest(&settings.policy.protocol_limits())
+            .unwrap();
+        assert_eq!(
+            legacy_manifest.publication.data_origin,
+            DataOrigin::PrivateWrf
+        );
+        assert_eq!(legacy_manifest.schema, RUN_GENERATION_REPLICATION_SCHEMA);
+
+        let mut structured_job = confirmed.clone();
+        let source = &mut structured_job.source_provenance[0];
+        source.forecast_producer = Some("wrf".into());
+        source.licensing_publisher = Some("owner".into());
+        source.transport_provider = Some("amazon-web-services".into());
+        source.transport_is_mirror = true;
+        let structured_manifest = structured_job
+            .replication_manifest(&settings.policy.protocol_limits())
+            .unwrap();
+        assert_eq!(
+            structured_manifest.schema,
+            RUN_GENERATION_REPLICATION_SCHEMA_V2
+        );
+
+        structured_job
+            .source_provenance
+            .push(legacy_source(crate::wrf_source::PRIVATE_WRF_PROVIDER));
+        assert!(matches!(
+            structured_job.replication_manifest(&settings.policy.protocol_limits()),
+            Err(PublicationError::Protocol(
+                rw_community_protocol::ProtocolError::InvalidField {
+                    field: "source_provenance",
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn structured_mirror_prepare_and_replication_use_v2_provenance() {
+        let store = tempfile::tempdir().unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        create_wrf_run_with_provenance(
+            store.path(),
+            "local_20231114221320_d01",
+            RwsSourceProvenance::new_structured(
+                crate::wrf_source::PRIVATE_WRF_PROVIDER,
+                "wrf",
+                "owner",
+                "amazon-web-services",
+                true,
+                vec!["owner-processed".into()],
+                vec!["rw-store".into()],
+            )
+            .unwrap(),
+        );
+        let settings = enabled_settings(64 * 1024 * 1024);
+        let publication =
+            GenerationPublicationStore::open(spool.path().join("publication"), &settings).unwrap();
+        let prepared = publication
+            .prepare(prepare_request(
+                store.path(),
+                "local_20231114221320_d01",
+                &"1".repeat(64),
+                OwnerGenerationKind::PrivateWrf,
+            ))
+            .unwrap();
+        assert!(prepared.source_provenance[0].transport_is_mirror);
+        assert_eq!(
+            run_generation_replication_schema(&prepared.source_provenance).unwrap(),
+            RUN_GENERATION_REPLICATION_SCHEMA_V2,
+            "the provisional manifest and every later replication manifest share this selector"
+        );
+        let confirmed = publication
+            .confirm(
+                &prepared.job_id,
+                PublicationConfirmations {
+                    owner_publication: true,
+                    redistribution_rights: true,
+                    operator_connection_metadata: true,
+                },
+                1_700_000_200,
+            )
+            .unwrap();
         assert_eq!(
             confirmed
                 .replication_manifest(&settings.policy.protocol_limits())
                 .unwrap()
-                .publication
-                .data_origin,
-            DataOrigin::PrivateWrf
+                .schema,
+            RUN_GENERATION_REPLICATION_SCHEMA_V2
         );
     }
 
@@ -3837,6 +4048,10 @@ mod tests {
             kind: OwnerGenerationKind::PrivateWrf,
             source_provenance: vec![SourceProvenance {
                 provider: crate::wrf_source::PRIVATE_WRF_PROVIDER.into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["owner-processed".into()],
                 products: vec!["rw-store".into()],
             }],

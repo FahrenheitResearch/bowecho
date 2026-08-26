@@ -3386,17 +3386,470 @@ fn screen_points_bbox(points: &[egui::Pos2]) -> egui::Rect {
     rect
 }
 
-/// The legacy per-record fill shape: convex fast path (feathered by epaint)
-/// or the robust mesh tessellation.
-fn single_hazard_fill_shape(candidate: &HazardFillCandidate) -> Option<egui::Shape> {
+// The exact same-family union is intentionally more expensive than drawing
+// each warning independently, but regional/national views must never turn it
+// into unbounded per-frame work or retain an arbitrarily large epaint mesh in
+// the view cache. These are whole-call budgets, not per-warning limits.
+const HAZARD_FILL_COMPONENT_PAIR_BUDGET: usize = 65_536;
+const HAZARD_FILL_SOURCE_VERTEX_BUDGET: usize = 8_192;
+const HAZARD_FILL_EXACT_EDGE_PAIR_BUDGET: usize = 131_072;
+const HAZARD_FILL_EXACT_ACTIVE_EDGE_VISIT_BUDGET: usize = 262_144;
+const HAZARD_FILL_EXACT_OUTPUT_VERTEX_BUDGET: usize = 131_072;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ScanlineFillWork {
+    edge_pair_checks: usize,
+    active_edge_visits: usize,
+    output_vertices: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanlineFillLimit {
+    EdgePairChecks,
+    ActiveEdgeVisits,
+    OutputVertices,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScanlineFillAbort {
+    limit: ScanlineFillLimit,
+    work: ScanlineFillWork,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HazardFillBudgets {
+    component_pairs: usize,
+    source_vertices: usize,
+    edge_pairs: usize,
+    active_edge_visits: usize,
+    output_vertices: usize,
+}
+
+impl Default for HazardFillBudgets {
+    fn default() -> Self {
+        Self {
+            component_pairs: HAZARD_FILL_COMPONENT_PAIR_BUDGET,
+            source_vertices: HAZARD_FILL_SOURCE_VERTEX_BUDGET,
+            edge_pairs: HAZARD_FILL_EXACT_EDGE_PAIR_BUDGET,
+            active_edge_visits: HAZARD_FILL_EXACT_ACTIVE_EDGE_VISIT_BUDGET,
+            output_vertices: HAZARD_FILL_EXACT_OUTPUT_VERTEX_BUDGET,
+        }
+    }
+}
+
+impl HazardFillBudgets {
+    fn consume_scanline(&mut self, work: ScanlineFillWork) {
+        self.edge_pairs = self.edge_pairs.saturating_sub(work.edge_pair_checks);
+        self.active_edge_visits = self
+            .active_edge_visits
+            .saturating_sub(work.active_edge_visits);
+        self.output_vertices = self.output_vertices.saturating_sub(work.output_vertices);
+    }
+}
+
+impl ScanlineFillLimit {
+    fn label(self) -> &'static str {
+        match self {
+            Self::EdgePairChecks => "edge-pair-budget",
+            Self::ActiveEdgeVisits => "active-edge-visit-budget",
+            Self::OutputVertices => "output-vertex-budget",
+        }
+    }
+}
+
+fn hazard_fill_perf_trace(reason: &str, family: &str, member_count: usize, source_vertices: usize) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = ENABLED.get_or_init(|| {
+        std::env::var("BOWECHO_HAZARD_PERF").is_ok_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+    });
+    if *enabled {
+        static EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let event = EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if event < 64 || event.is_multiple_of(256) {
+            eprintln!(
+                "bowecho_hazard_perf event={event} fallback={reason} family={family:?} members={member_count} source_vertices={source_vertices}"
+            );
+        }
+    }
+}
+
+/// Return transitive screen-bbox overlap components using an x sweep. The old
+/// component builder rescanned every prior component for every warning, which
+/// is quadratic for the common regional case of many spatially separated
+/// polygons, and repeatedly copied the growing member vectors of dense or
+/// transitively bridged components. This sweep keeps live rectangles in an
+/// ordered set and joins them with a size-weighted disjoint-set forest. Every
+/// possible bbox comparison consumes the whole-call budget; sorting, expiry,
+/// union, and final collection are all O(n log n) or better with O(n) storage.
+/// `None` means the exact component graph could not be completed in budget.
+fn hazard_fill_overlap_components(
+    bboxes: &[egui::Rect],
+    pair_budget: usize,
+) -> Option<(Vec<Vec<usize>>, usize)> {
+    let mut order = (0..bboxes.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        bboxes[left]
+            .min
+            .x
+            .total_cmp(&bboxes[right].min.x)
+            .then_with(|| bboxes[left].max.x.total_cmp(&bboxes[right].max.x))
+            .then_with(|| left.cmp(&right))
+    });
+
+    let mut expiry_order = (0..bboxes.len()).collect::<Vec<_>>();
+    expiry_order.sort_by(|&left, &right| {
+        bboxes[left]
+            .max
+            .x
+            .total_cmp(&bboxes[right].max.x)
+            .then_with(|| left.cmp(&right))
+    });
+
+    let mut parent = (0..bboxes.len()).collect::<Vec<_>>();
+    let mut size = vec![1usize; bboxes.len()];
+    let find = |parent: &mut [usize], mut node: usize| {
+        let mut root = node;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        while parent[node] != node {
+            let next = parent[node];
+            parent[node] = root;
+            node = next;
+        }
+        root
+    };
+
+    let mut active = std::collections::BTreeSet::<usize>::new();
+    let mut expiry_cursor = 0usize;
+    let mut pair_checks = 0usize;
+    for local in order {
+        let min_x = bboxes[local].min.x;
+        while expiry_cursor < expiry_order.len()
+            && bboxes[expiry_order[expiry_cursor]].max.x < min_x
+        {
+            active.remove(&expiry_order[expiry_cursor]);
+            expiry_cursor += 1;
+        }
+
+        for &other in &active {
+            if pair_checks >= pair_budget {
+                return None;
+            }
+            pair_checks += 1;
+            if bboxes[local].intersects(bboxes[other]) {
+                let mut left = find(&mut parent, local);
+                let mut right = find(&mut parent, other);
+                if left != right {
+                    if size[left] < size[right] || (size[left] == size[right] && left > right) {
+                        std::mem::swap(&mut left, &mut right);
+                    }
+                    parent[right] = left;
+                    size[left] = size[left].saturating_add(size[right]);
+                }
+            }
+        }
+        active.insert(local);
+    }
+
+    let mut components_by_root = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for local in 0..bboxes.len() {
+        let root = find(&mut parent, local);
+        components_by_root.entry(root).or_default().push(local);
+    }
+    let mut components = components_by_root.into_values().collect::<Vec<_>>();
+    components.sort_by_key(|component| component[0]);
+    Some((components, pair_checks))
+}
+
+/// Append one already-source-budgeted warning fill. Non-convex rings always
+/// use the bounded exact scanline path here. In particular this helper never
+/// calls `filled_polygon_mesh`, whose public compatibility path is allowed an
+/// unlimited scanline fallback for non-hazard callers. If any whole-call
+/// budget is exhausted, this warning becomes outline-only.
+fn append_bounded_single_hazard_fill_shape(
+    candidate: &HazardFillCandidate,
+    fill_shapes: &mut Vec<egui::Shape>,
+    budgets: &mut HazardFillBudgets,
+) -> Result<(), ScanlineFillLimit> {
+    if candidate.fill == egui::Color32::TRANSPARENT || candidate.points.len() < 3 {
+        return Ok(());
+    }
     if is_convex_screen_polygon(&candidate.points) {
-        Some(egui::Shape::convex_polygon(
+        if candidate.points.len() > budgets.output_vertices {
+            budgets.output_vertices = 0;
+            return Err(ScanlineFillLimit::OutputVertices);
+        }
+        budgets.output_vertices -= candidate.points.len();
+        fill_shapes.push(egui::Shape::convex_polygon(
             candidate.points.clone(),
             candidate.fill,
             egui::Stroke::NONE,
-        ))
-    } else {
-        filled_polygon_mesh(&candidate.points, candidate.fill).map(egui::Shape::mesh)
+        ));
+        return Ok(());
+    }
+
+    let result = scanline_fill_meshes_with_work_limit(
+        std::slice::from_ref(&candidate.points),
+        candidate.fill,
+        SCANLINE_FILL_VERTEX_LIMIT,
+        budgets.edge_pairs,
+        budgets.active_edge_visits,
+        budgets.output_vertices,
+    );
+    match result {
+        Ok((meshes, work)) => {
+            budgets.consume_scanline(work);
+            fill_shapes.extend(meshes.into_iter().map(egui::Shape::mesh));
+            Ok(())
+        }
+        Err(abort) => {
+            budgets.consume_scanline(abort.work);
+            Err(abort.limit)
+        }
+    }
+}
+
+#[cfg(test)]
+mod hazard_fill_budget_tests {
+    use super::*;
+
+    #[test]
+    fn overlap_components_are_transitive_and_deterministic() {
+        let bboxes = [
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(2.0, 2.0)),
+            egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(3.0, 2.0)),
+            egui::Rect::from_min_max(egui::pos2(2.5, 0.0), egui::pos2(4.0, 2.0)),
+            egui::Rect::from_min_max(egui::pos2(10.0, 0.0), egui::pos2(11.0, 1.0)),
+        ];
+        let (components, pair_checks) =
+            hazard_fill_overlap_components(&bboxes, 16).expect("within budget");
+        assert_eq!(components, vec![vec![0, 1, 2], vec![3]]);
+        assert!(pair_checks <= 3);
+    }
+
+    #[test]
+    fn overlap_components_merge_two_live_components_through_a_bridge() {
+        let bboxes = [
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(4.0, 1.0)),
+            egui::Rect::from_min_max(egui::pos2(0.0, 3.0), egui::pos2(4.0, 4.0)),
+            egui::Rect::from_min_max(egui::pos2(3.0, 0.5), egui::pos2(5.0, 3.5)),
+        ];
+        let (components, pair_checks) =
+            hazard_fill_overlap_components(&bboxes, 3).expect("bridge stays in budget");
+        assert_eq!(components, vec![vec![0, 1, 2]]);
+        assert_eq!(pair_checks, 3);
+    }
+
+    #[test]
+    fn sparse_regional_components_do_not_take_quadratic_pair_work() {
+        let bboxes = (0..2_048)
+            .map(|index| {
+                let x = index as f32 * 3.0;
+                egui::Rect::from_min_max(egui::pos2(x, 0.0), egui::pos2(x + 1.0, 1.0))
+            })
+            .collect::<Vec<_>>();
+        let (components, pair_checks) =
+            hazard_fill_overlap_components(&bboxes, 8).expect("sparse sweep stays cheap");
+        assert_eq!(components.len(), bboxes.len());
+        assert_eq!(pair_checks, 0);
+    }
+
+    #[test]
+    fn dense_component_discovery_stops_at_the_budget() {
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0));
+        let bboxes = vec![bbox; 256];
+        assert!(hazard_fill_overlap_components(&bboxes, 128).is_none());
+    }
+
+    #[test]
+    fn dense_component_discovery_is_exact_when_budgeted() {
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0));
+        let bboxes = vec![bbox; 64];
+        let expected_pairs = bboxes.len() * (bboxes.len() - 1) / 2;
+        let (components, pair_checks) =
+            hazard_fill_overlap_components(&bboxes, expected_pairs).expect("exact dense graph");
+        assert_eq!(components, vec![(0..64).collect::<Vec<_>>()]);
+        assert_eq!(pair_checks, expected_pairs);
+    }
+
+    #[test]
+    fn scanline_limits_abort_before_unbounded_work_or_output() {
+        let rings = vec![
+            vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(10.0, 0.0),
+                egui::pos2(10.0, 10.0),
+                egui::pos2(0.0, 10.0),
+            ],
+            vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(10.0, 0.0),
+                egui::pos2(10.0, 10.0),
+                egui::pos2(0.0, 10.0),
+            ],
+        ];
+        let edge_abort = scanline_fill_meshes_with_work_limit(
+            &rings,
+            egui::Color32::WHITE,
+            SCANLINE_FILL_VERTEX_LIMIT,
+            0,
+            usize::MAX,
+            usize::MAX,
+        )
+        .expect_err("zero edge-pair budget must abort");
+        assert_eq!(edge_abort.limit, ScanlineFillLimit::EdgePairChecks);
+        assert_eq!(edge_abort.work.edge_pair_checks, 0);
+
+        let active_abort = scanline_fill_meshes_with_work_limit(
+            &rings,
+            egui::Color32::WHITE,
+            SCANLINE_FILL_VERTEX_LIMIT,
+            usize::MAX,
+            0,
+            usize::MAX,
+        )
+        .expect_err("zero active-edge budget must abort");
+        assert_eq!(active_abort.limit, ScanlineFillLimit::ActiveEdgeVisits);
+        assert!(active_abort.work.edge_pair_checks > 0);
+        assert_eq!(active_abort.work.active_edge_visits, 0);
+
+        let output_abort = scanline_fill_meshes_with_work_limit(
+            &rings,
+            egui::Color32::WHITE,
+            SCANLINE_FILL_VERTEX_LIMIT,
+            usize::MAX,
+            usize::MAX,
+            0,
+        )
+        .expect_err("zero output budget must abort");
+        assert_eq!(output_abort.limit, ScanlineFillLimit::OutputVertices);
+        assert_eq!(output_abort.work.output_vertices, 0);
+
+        let staggered = vec![
+            rings[0].clone(),
+            vec![
+                egui::pos2(5.0, 5.0),
+                egui::pos2(15.0, 5.0),
+                egui::pos2(15.0, 15.0),
+                egui::pos2(5.0, 15.0),
+            ],
+        ];
+        let partial_output_abort = scanline_fill_meshes_with_work_limit(
+            &staggered,
+            egui::Color32::WHITE,
+            SCANLINE_FILL_VERTEX_LIMIT,
+            usize::MAX,
+            usize::MAX,
+            7,
+        )
+        .expect_err("a second trapezoid must not cross the seven-vertex cap");
+        assert_eq!(
+            partial_output_abort.limit,
+            ScanlineFillLimit::OutputVertices
+        );
+        assert_eq!(partial_output_abort.work.output_vertices, 4);
+        assert!(partial_output_abort.work.output_vertices <= 7);
+    }
+
+    #[test]
+    fn pathological_single_ring_never_reenters_unlimited_fallback() {
+        let candidate = HazardFillCandidate {
+            family: "tornado".to_owned(),
+            fill: egui::Color32::WHITE,
+            points: vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(10.0, 10.0),
+                egui::pos2(0.0, 10.0),
+                egui::pos2(10.0, 0.0),
+            ],
+        };
+        assert!(!is_convex_screen_polygon(&candidate.points));
+        let mut shapes = Vec::new();
+        let mut budgets = HazardFillBudgets {
+            edge_pairs: 0,
+            ..HazardFillBudgets::default()
+        };
+        let limit = append_bounded_single_hazard_fill_shape(&candidate, &mut shapes, &mut budgets)
+            .expect_err("the bounded scanline path must stop");
+        assert_eq!(limit, ScanlineFillLimit::EdgePairChecks);
+        assert!(shapes.is_empty(), "budget fallback must be outline-only");
+    }
+
+    #[test]
+    fn aborted_single_ring_charges_work_to_the_whole_call() {
+        let candidate = HazardFillCandidate {
+            family: "tornado".to_owned(),
+            fill: egui::Color32::WHITE,
+            points: vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(10.0, 10.0),
+                egui::pos2(0.0, 10.0),
+                egui::pos2(10.0, 0.0),
+            ],
+        };
+        let mut shapes = Vec::new();
+        let mut budgets = HazardFillBudgets {
+            edge_pairs: 10,
+            active_edge_visits: 0,
+            ..HazardFillBudgets::default()
+        };
+        let limit = append_bounded_single_hazard_fill_shape(&candidate, &mut shapes, &mut budgets)
+            .expect_err("active-edge budget must stop the fill");
+        assert_eq!(limit, ScanlineFillLimit::ActiveEdgeVisits);
+        assert!(
+            budgets.edge_pairs < 10,
+            "edge-pair work completed before the abort must remain charged"
+        );
+        assert_eq!(budgets.active_edge_visits, 0);
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn convex_single_ring_honors_the_whole_call_output_cap() {
+        let candidate = HazardFillCandidate {
+            family: "tornado".to_owned(),
+            fill: egui::Color32::WHITE,
+            points: vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(10.0, 0.0),
+                egui::pos2(0.0, 10.0),
+            ],
+        };
+        let mut shapes = Vec::new();
+        let mut budgets = HazardFillBudgets {
+            output_vertices: 2,
+            ..HazardFillBudgets::default()
+        };
+        let limit = append_bounded_single_hazard_fill_shape(&candidate, &mut shapes, &mut budgets)
+            .expect_err("three input vertices exceed the remaining cap");
+        assert_eq!(limit, ScanlineFillLimit::OutputVertices);
+        assert_eq!(budgets.output_vertices, 0);
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn whole_group_component_budget_fallback_is_outline_only() {
+        let candidates = (0..400)
+            .map(|_| HazardFillCandidate {
+                family: "severe thunderstorm".to_owned(),
+                fill: egui::Color32::WHITE,
+                points: vec![
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(10.0, 0.0),
+                    egui::pos2(0.0, 10.0),
+                ],
+            })
+            .collect();
+        let mut shapes = Vec::new();
+        append_flattened_hazard_fill_shapes(candidates, &mut shapes);
+        assert!(
+            shapes.is_empty(),
+            "an unproven overlap graph must not restore stacked fills"
+        );
     }
 }
 
@@ -3408,73 +3861,124 @@ fn single_hazard_fill_shape(candidate: &HazardFillCandidate) -> Option<egui::Sha
 /// hazards deliberately drawn over each other. Within a group only records
 /// whose fills can touch (transitively bbox-overlapping components) share an
 /// exact scanline union; isolated records keep the legacy single-ring path.
-/// Dense unions may be emitted as several non-overlapping mesh chunks, but
-/// their interiors still tile the union exactly once, so chunking never
-/// restores the old same-family alpha stacking.
+/// Normal unions may be emitted as several non-overlapping mesh chunks, but
+/// their interiors still tile the union exactly once. A component that cannot
+/// be proven and tessellated inside the whole-call budgets becomes
+/// outline-only. It must never fall back to stacked per-record fills or to an
+/// unlimited single-ring scanline path.
 pub(crate) fn append_flattened_hazard_fill_shapes(
     candidates: Vec<HazardFillCandidate>,
     fill_shapes: &mut Vec<egui::Shape>,
 ) {
     let mut groups: Vec<((&str, egui::Color32), Vec<usize>)> = Vec::new();
+    let mut group_lookup = std::collections::HashMap::<(&str, egui::Color32), usize>::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let key = (candidate.family.as_str(), candidate.fill);
-        if let Some((_, members)) = groups.iter_mut().find(|(existing, _)| *existing == key) {
-            members.push(index);
+        if let Some(&group_index) = group_lookup.get(&key) {
+            groups[group_index].1.push(index);
         } else {
+            group_lookup.insert(key, groups.len());
             groups.push((key, vec![index]));
         }
     }
-    for (_, members) in groups {
+
+    let mut budgets = HazardFillBudgets::default();
+
+    for ((family, _), members) in groups {
+        let source_vertices = members.iter().fold(0usize, |total, &member| {
+            total.saturating_add(candidates[member].points.len())
+        });
+        if source_vertices > budgets.source_vertices {
+            hazard_fill_perf_trace(
+                "source-vertex-budget",
+                family,
+                members.len(),
+                source_vertices,
+            );
+            continue;
+        }
+        budgets.source_vertices -= source_vertices;
+
         let bboxes = members
             .iter()
             .map(|&member| screen_points_bbox(&candidates[member].points))
             .collect::<Vec<_>>();
-        // Transitive bbox-overlap components within the group (indices into
-        // `members`).
-        let mut components: Vec<Vec<usize>> = Vec::new();
-        for local in 0..members.len() {
-            let mut merged = vec![local];
-            let mut keep = Vec::with_capacity(components.len());
-            for component in components.drain(..) {
-                if component
-                    .iter()
-                    .any(|&other| bboxes[local].intersects(bboxes[other]))
-                {
-                    merged.extend(component);
-                } else {
-                    keep.push(component);
-                }
-            }
-            keep.push(merged);
-            components = keep;
-        }
-        for mut component in components {
-            component.sort_unstable();
+        let Some((components, pair_checks)) =
+            hazard_fill_overlap_components(&bboxes, budgets.component_pairs)
+        else {
+            hazard_fill_perf_trace(
+                "component-pair-budget",
+                family,
+                members.len(),
+                source_vertices,
+            );
+            budgets.component_pairs = 0;
+            continue;
+        };
+        budgets.component_pairs = budgets.component_pairs.saturating_sub(pair_checks);
+
+        for component in components {
             if component.len() == 1 {
-                for &local in &component {
-                    if let Some(shape) = single_hazard_fill_shape(&candidates[members[local]]) {
-                        fill_shapes.push(shape);
-                    }
+                let candidate = &candidates[members[component[0]]];
+                if let Err(limit) =
+                    append_bounded_single_hazard_fill_shape(candidate, fill_shapes, &mut budgets)
+                {
+                    hazard_fill_perf_trace(limit.label(), family, 1, candidate.points.len());
                 }
                 continue;
             }
+
+            let component_source_vertices = component
+                .iter()
+                .map(|&local| candidates[members[local]].points.len())
+                .sum::<usize>();
+            if budgets.edge_pairs == 0
+                || budgets.active_edge_visits == 0
+                || budgets.output_vertices < 4
+            {
+                hazard_fill_perf_trace(
+                    "whole-call-exact-budget",
+                    family,
+                    component.len(),
+                    component_source_vertices,
+                );
+                continue;
+            }
+
             let rings = component
                 .iter()
                 .map(|&local| candidates[members[local]].points.clone())
                 .collect::<Vec<_>>();
             let fill = candidates[members[component[0]]].fill;
-            let meshes = scanline_fill_meshes(&rings, fill);
-            if !meshes.is_empty() {
-                fill_shapes.extend(meshes.into_iter().map(egui::Shape::mesh));
-            } else {
-                // Degenerate rings with no non-zero-height interior retain the
-                // legacy path. This is not the dense-work valve: every valid
-                // dense component above is flattened, including components
-                // over HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET.
-                for &local in &component {
-                    if let Some(shape) = single_hazard_fill_shape(&candidates[members[local]]) {
-                        fill_shapes.push(shape);
-                    }
+            match scanline_fill_meshes_with_work_limit(
+                &rings,
+                fill,
+                SCANLINE_FILL_VERTEX_LIMIT,
+                budgets.edge_pairs,
+                budgets.active_edge_visits,
+                budgets.output_vertices,
+            ) {
+                Ok((meshes, work)) if !meshes.is_empty() => {
+                    budgets.consume_scanline(work);
+                    fill_shapes.extend(meshes.into_iter().map(egui::Shape::mesh));
+                }
+                Ok((_meshes, work)) => {
+                    budgets.consume_scanline(work);
+                    hazard_fill_perf_trace(
+                        "degenerate-union",
+                        family,
+                        component.len(),
+                        component_source_vertices,
+                    );
+                }
+                Err(abort) => {
+                    budgets.consume_scanline(abort.work);
+                    hazard_fill_perf_trace(
+                        abort.limit.label(),
+                        family,
+                        component.len(),
+                        component_source_vertices,
+                    );
                 }
             }
         }
@@ -3866,22 +4370,34 @@ fn append_scanline_edge_crossing_events(
     edges: &[ScanlineFillEdge],
     edge_bounds: &[[f32; 4]],
     events: &mut Vec<f32>,
-) {
+    pair_limit: usize,
+) -> Result<usize, usize> {
+    let mut pair_checks = 0usize;
     let mut append_pair = |first: usize, second: usize| {
+        if pair_checks >= pair_limit {
+            return Err(pair_checks);
+        }
+        pair_checks += 1;
         if scanline_edge_bounds_overlap(edge_bounds[first], edge_bounds[second])
             && let Some(y) = scanline_edge_crossing_y(&edges[first], &edges[second])
         {
             events.push(y);
         }
+        Ok(())
     };
 
-    if edges.len() <= HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET {
+    let complete_pair_count = edges.len().saturating_mul(edges.len().saturating_sub(1)) / 2;
+    // Use the straightforward walk only when this call can actually finish
+    // it inside the remaining whole-call allowance. A medium component near
+    // the old static threshold can already contain half a million pairs; the
+    // bbox sweep is both exact and dramatically cheaper for ordinary rings.
+    if edges.len() <= HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET && complete_pair_count <= pair_limit {
         for first in 0..edges.len() {
             for second in (first + 1)..edges.len() {
-                append_pair(first, second);
+                append_pair(first, second)?;
             }
         }
-        return;
+        return Ok(pair_checks);
     }
 
     let mut order = (0..edges.len()).collect::<Vec<_>>();
@@ -3896,9 +4412,10 @@ fn append_scanline_edge_crossing_events(
             if edge_bounds[second][0] > edge_bounds[first][2] {
                 break;
             }
-            append_pair(first, second);
+            append_pair(first, second)?;
         }
     }
+    Ok(pair_checks)
 }
 
 /// Exact fill tessellation for possibly-degenerate screen rings: even-odd
@@ -3909,11 +4426,14 @@ fn append_scanline_edge_crossing_events(
 /// fill never double-blends no matter how the rings overlap or self-cross.
 /// This is both the self-intersecting-ring fill and the same-family hazard
 /// overlap flattener.
-fn scanline_fill_meshes_with_limit(
+fn scanline_fill_meshes_with_work_limit(
     rings: &[Vec<egui::Pos2>],
     fill: egui::Color32,
     vertex_limit: usize,
-) -> Vec<egui::epaint::Mesh> {
+    edge_pair_limit: usize,
+    active_edge_visit_limit: usize,
+    output_vertex_limit: usize,
+) -> Result<(Vec<egui::epaint::Mesh>, ScanlineFillWork), ScanlineFillAbort> {
     let mut edges = Vec::new();
     for (ring_index, ring) in rings.iter().enumerate() {
         if ring.len() < 3 {
@@ -3934,7 +4454,7 @@ fn scanline_fill_meshes_with_limit(
         }
     }
     if edges.is_empty() {
-        return Vec::new();
+        return Ok((Vec::new(), ScanlineFillWork::default()));
     }
 
     let edge_bounds = edges.iter().map(scanline_edge_bounds).collect::<Vec<_>>();
@@ -3944,7 +4464,23 @@ fn scanline_fill_meshes_with_limit(
         events.push(edge.y0);
         events.push(edge.y1);
     }
-    append_scanline_edge_crossing_events(&edges, &edge_bounds, &mut events);
+    let edge_pair_checks = match append_scanline_edge_crossing_events(
+        &edges,
+        &edge_bounds,
+        &mut events,
+        edge_pair_limit,
+    ) {
+        Ok(checks) => checks,
+        Err(checks) => {
+            return Err(ScanlineFillAbort {
+                limit: ScanlineFillLimit::EdgePairChecks,
+                work: ScanlineFillWork {
+                    edge_pair_checks: checks,
+                    ..ScanlineFillWork::default()
+                },
+            });
+        }
+    };
     events.sort_by(f32::total_cmp);
     events.dedup();
 
@@ -3969,10 +4505,13 @@ fn scanline_fill_meshes_with_limit(
     let mut crossings_by_ring = (0..rings.len())
         .map(|_| Vec::<(f32, usize)>::new())
         .collect::<Vec<_>>();
+    let mut touched_rings = Vec::<usize>::new();
     let mut intervals = Vec::<(usize, usize)>::new();
     let mut meshes = Vec::<egui::epaint::Mesh>::new();
     let mut mesh = egui::epaint::Mesh::default();
     let vertex_limit = vertex_limit.max(4);
+    let mut active_edge_visits = 0usize;
+    let mut output_vertices = 0usize;
     for band in events.windows(2) {
         let (y0, y1) = (band[0], band[1]);
         let midline = 0.5 * (y0 + y1);
@@ -3987,19 +4526,33 @@ fn scanline_fill_meshes_with_limit(
             active_edges.remove(&ends[end_cursor]);
             end_cursor += 1;
         }
-        for crossings in &mut crossings_by_ring {
-            crossings.clear();
-        }
+        touched_rings.clear();
         for &edge_index in &active_edges {
+            if active_edge_visits >= active_edge_visit_limit {
+                return Err(ScanlineFillAbort {
+                    limit: ScanlineFillLimit::ActiveEdgeVisits,
+                    work: ScanlineFillWork {
+                        edge_pair_checks,
+                        active_edge_visits,
+                        output_vertices,
+                    },
+                });
+            }
+            active_edge_visits += 1;
             let edge = &edges[edge_index];
+            if crossings_by_ring[edge.ring].is_empty() {
+                touched_rings.push(edge.ring);
+            }
             crossings_by_ring[edge.ring].push((x_at(edge, midline), edge_index));
         }
         intervals.clear();
-        for crossings in &mut crossings_by_ring {
+        for &ring_index in &touched_rings {
+            let crossings = &mut crossings_by_ring[ring_index];
             crossings.sort_by(|left, right| left.0.total_cmp(&right.0));
             for pair in crossings.as_chunks::<2>().0 {
                 intervals.push((pair[0].1, pair[1].1));
             }
+            crossings.clear();
         }
         intervals.sort_by(|left, right| {
             x_at(&edges[left.0], midline).total_cmp(&x_at(&edges[right.0], midline))
@@ -4017,6 +4570,17 @@ fn scanline_fill_meshes_with_limit(
             }
         }
         for (left, right) in merged {
+            if output_vertices.saturating_add(4) > output_vertex_limit {
+                return Err(ScanlineFillAbort {
+                    limit: ScanlineFillLimit::OutputVertices,
+                    work: ScanlineFillWork {
+                        edge_pair_checks,
+                        active_edge_visits,
+                        output_vertices,
+                    },
+                });
+            }
+            output_vertices += 4;
             let left_edge = &edges[left];
             let right_edge = &edges[right];
             if mesh.vertices.len().saturating_add(4) > vertex_limit && !mesh.indices.is_empty() {
@@ -4034,7 +4598,31 @@ fn scanline_fill_meshes_with_limit(
     if !mesh.indices.is_empty() {
         meshes.push(mesh);
     }
-    meshes
+    Ok((
+        meshes,
+        ScanlineFillWork {
+            edge_pair_checks,
+            active_edge_visits,
+            output_vertices,
+        },
+    ))
+}
+
+fn scanline_fill_meshes_with_limit(
+    rings: &[Vec<egui::Pos2>],
+    fill: egui::Color32,
+    vertex_limit: usize,
+) -> Vec<egui::epaint::Mesh> {
+    scanline_fill_meshes_with_work_limit(
+        rings,
+        fill,
+        vertex_limit,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )
+    .map(|(meshes, _)| meshes)
+    .unwrap_or_default()
 }
 
 /// Exact scanline union emitted in bounded, mutually non-overlapping mesh

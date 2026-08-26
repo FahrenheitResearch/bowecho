@@ -38,16 +38,16 @@ use ui_core::render_service::{
 use crate::sites_ui::{NearestOverlayTarget, nearest_overlay_dispatch};
 use crate::{
     ACTIVE_LOAD_POLL_MS, ArchiveHistoryLoadContext, ArchiveWindow, AsyncLoadResult,
-    AsyncLoadUpdate, AsyncRenderResult, DEFAULT_RADAR_RANGE_KM, DealiasEngine, DecodedLoad,
-    DecodedLoadBatch, DisplayProduct, EngineId, EngineRole, FeedSource, FrameHistoryEntry,
-    FrameStatus, InstallSelection, IntlFrameResult, LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG,
-    LatestLoadMode, Liveness, LoadTimings, LoopEngine, LowSweepCutKey, MAX_HISTORY_FRAME_LIMIT,
-    MAX_RADAR_OVERLAY_LAYERS, RENDER_RESULT_POLL_MS, RenderRecycleBuffer, RenderRequest,
-    RenderWorkerCacheMode, RenderWorkerCachePolicy, RenderWorkerGeometryCache,
-    RenderWorkerMomentCache, RenderWorkerSampleCache, RenderWorkerViewportSignature,
-    RenderedTexture, SelectionPolicy, TextureKey, ViewerApp, archive_browser,
-    archive_object_scan_time_utc, best_cut_for_product, cache_dir, cut_start_time_utc,
-    displayable_cuts_for_product, effective_worker_threads, fetch_intl_frame,
+    AsyncLoadUpdate, AsyncRenderResult, CachedSweepUnderlayRaster, DEFAULT_RADAR_RANGE_KM,
+    DealiasEngine, DecodedLoad, DecodedLoadBatch, DisplayProduct, EngineId, EngineRole, FeedSource,
+    FrameHistoryEntry, FrameStatus, InstallSelection, IntlFrameResult,
+    LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG, LatestLoadMode, Liveness, LoadTimings, LoopEngine,
+    LowSweepCutKey, MAX_HISTORY_FRAME_LIMIT, MAX_RADAR_OVERLAY_LAYERS, RENDER_RESULT_POLL_MS,
+    RenderRecycleBuffer, RenderRequest, RenderWorkerCacheMode, RenderWorkerCachePolicy,
+    RenderWorkerGeometryCache, RenderWorkerMomentCache, RenderWorkerSampleCache,
+    RenderWorkerViewportSignature, RenderedTexture, SelectionPolicy, TextureKey, ViewerApp,
+    archive_browser, archive_object_scan_time_utc, best_cut_for_product, cache_dir,
+    cut_start_time_utc, displayable_cuts_for_product, effective_worker_threads, fetch_intl_frame,
     is_displayable_on_cut, limit_archive_objects_for_event_loop,
     load_archive_history_objects_parallel, normalized_history_limit,
     previous_dealias_reference_volume, radar_color_image_from_rgba, radar_texture_options,
@@ -255,6 +255,7 @@ pub(crate) fn overlay_pool_render_job(
     let mut sample_caches: Vec<RenderWorkerSampleCache> = Vec::new();
     let mut geometry_caches: Vec<RenderWorkerGeometryCache> = Vec::new();
     let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
+    let mut sweep_underlay_caches: Vec<CachedSweepUnderlayRaster> = Vec::new();
     move |request: RenderRequest| {
         let requested_buffer_signature = RenderWorkerViewportSignature::new(
             Arc::as_ptr(&request.volume) as usize,
@@ -298,6 +299,7 @@ pub(crate) fn overlay_pool_render_job(
             &mut sample_caches,
             &mut geometry_caches,
             &mut last_direct_viewports,
+            &mut sweep_underlay_caches,
             cache_policy,
         );
         AsyncRenderResult { key, lane, result }
@@ -1490,6 +1492,7 @@ impl ViewerApp {
                 smoothing,
                 dealias_engine: self.dealias_engine,
                 gate_filter_decidbz: self.gate_filter_key(),
+                sweep_reveal: None,
                 viewport: viewport_key,
             };
             if layer.texture_key.as_ref() == Some(&key) {
@@ -1528,6 +1531,7 @@ impl ViewerApp {
                     lane: LaneId::Overlay(layer.engine.id.0),
                     volume,
                     previous_volume,
+                    sweep_reveal: None,
                     dealias_env,
                     cut,
                     product,

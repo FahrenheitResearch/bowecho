@@ -20,6 +20,7 @@ mod rhi;
 mod shear;
 mod smooth;
 mod swath;
+mod sweep_reveal;
 mod tracking;
 pub mod tracks;
 mod volumetric;
@@ -62,6 +63,10 @@ pub use shear::{
 };
 pub use smooth::smooth_moment_grid;
 pub use swath::{SwathAggregation, base_tilt_cut, max_value_swath};
+pub use sweep_reveal::{
+    azimuth_is_revealed, composite_sweep_reveal_rgba, composite_sweep_reveal_rgba_into,
+    mask_sweep_reveal_rgba_in_place,
+};
 use thiserror::Error;
 pub use tracking::{StormTrack, StormTracker, TIME_GATE_S};
 pub use volumetric::{

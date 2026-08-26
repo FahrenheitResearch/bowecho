@@ -5,6 +5,67 @@
 
 use crate::*;
 
+/// Total cached projected/tessellated hazard geometry, across panes and view
+/// keys. 64 MiB leaves room for millions of path points or several million
+/// mesh elements, while preventing eight dense warning-day entries from each
+/// retaining an independently large allocation.
+const HAZARD_SHAPE_CACHE_GEOMETRY_BUDGET: usize = 64 * 1024 * 1024;
+
+/// Estimated geometry bytes for one egui shape, including recursively nested
+/// `Shape::Vec` children and the variable-sized geometry payloads. Fixed-size
+/// variants are fully represented by `size_of::<Shape>()`.
+fn egui_shape_geometry_weight(shape: &egui::Shape) -> usize {
+    let payload = match shape {
+        egui::Shape::Vec(shapes) => shapes.iter().fold(0usize, |weight, shape| {
+            weight.saturating_add(egui_shape_geometry_weight(shape))
+        }),
+        egui::Shape::Path(path) => std::mem::size_of_val(path.points.as_slice()),
+        egui::Shape::Mesh(mesh) => mesh.bytes_used(),
+        egui::Shape::Text(text) => {
+            // Hazard labels are stored separately, but keep the estimator
+            // sound if a future overlay caches tessellated text shapes.
+            std::mem::size_of_val(text.galley.as_ref())
+                .saturating_add(
+                    text.galley
+                        .num_vertices
+                        .saturating_mul(std::mem::size_of::<egui::epaint::Vertex>()),
+                )
+                .saturating_add(
+                    text.galley
+                        .num_indices
+                        .saturating_mul(std::mem::size_of::<u32>()),
+                )
+                .saturating_add(text.galley.job.text.len())
+        }
+        egui::Shape::Noop
+        | egui::Shape::Circle(_)
+        | egui::Shape::Ellipse(_)
+        | egui::Shape::LineSegment { .. }
+        | egui::Shape::Rect(_)
+        | egui::Shape::QuadraticBezier(_)
+        | egui::Shape::CubicBezier(_)
+        | egui::Shape::Callback(_) => 0,
+    };
+    std::mem::size_of::<egui::Shape>().saturating_add(payload)
+}
+
+fn hazard_overlay_geometry_weight(overlay: &HazardOverlayShapes) -> usize {
+    let shape_weight = overlay
+        .fill_shapes
+        .iter()
+        .chain(&overlay.outline_shapes)
+        .fold(0usize, |weight, shape| {
+            weight.saturating_add(egui_shape_geometry_weight(shape))
+        });
+    let label_weight = overlay.labels.iter().fold(
+        std::mem::size_of_val(overlay.labels.as_slice()),
+        |weight, (_, text, _, _)| weight.saturating_add(text.len()),
+    );
+    std::mem::size_of::<HazardOverlayShapes>()
+        .saturating_add(shape_weight)
+        .saturating_add(label_weight)
+}
+
 impl ViewerApp {
     pub(crate) fn hazard_panel(&mut self, ui: &mut egui::Ui) {
         let rendered_section = self.sidebar_section_render.map(|render| render.section);
@@ -2042,13 +2103,18 @@ impl ViewerApp {
         let key = hasher.finish();
         let mut cache = self.hazard_shape_cache.borrow_mut();
         cache
-            .get_or_insert_with(key, || {
-                Arc::new(self.build_hazard_overlay_shapes_with_fills(
-                    rect,
-                    frame_time,
-                    fills_enabled,
-                ))
-            })
+            .get_or_insert_with_weight(
+                key,
+                HAZARD_SHAPE_CACHE_GEOMETRY_BUDGET,
+                || {
+                    Arc::new(self.build_hazard_overlay_shapes_with_fills(
+                        rect,
+                        frame_time,
+                        fills_enabled,
+                    ))
+                },
+                |overlay| hazard_overlay_geometry_weight(overlay.as_ref()),
+            )
             .clone()
     }
 
@@ -2063,10 +2129,10 @@ impl ViewerApp {
     }
 
     /// `fills_enabled == false` skips fill collection and the same-family
-    /// scanline union entirely, keeping outlines and labels. That union is
-    /// quadratic in the visible same-family record count, which is what
-    /// stalls a far-zoom pan on a dense warning day, so it is deferred while
-    /// the map is under the pointer and paid once on the settled frame.
+    /// scanline union entirely, keeping outlines and labels. The exact union
+    /// is sweep- and work-budget-bounded, but remains the most expensive part
+    /// of dense far-zoom warning geometry, so it is deferred while the map is
+    /// under the pointer and paid once on the settled frame.
     pub(crate) fn build_hazard_overlay_shapes_with_fills(
         &self,
         rect: egui::Rect,
@@ -2712,6 +2778,42 @@ fn hazard_alert_row_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hazard_geometry_weight_recurses_through_nested_shape_vectors() {
+        let path = egui::Shape::line(
+            vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 1.0),
+                egui::pos2(2.0, 0.0),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::WHITE),
+        );
+        let path_weight = egui_shape_geometry_weight(&path);
+        assert_eq!(
+            path_weight,
+            std::mem::size_of::<egui::Shape>() + 3 * std::mem::size_of::<egui::Pos2>()
+        );
+
+        let nested = egui::Shape::Vec(vec![
+            egui::Shape::Noop,
+            egui::Shape::Vec(vec![path.clone()]),
+        ]);
+        assert_eq!(
+            egui_shape_geometry_weight(&nested),
+            path_weight + 3 * std::mem::size_of::<egui::Shape>()
+        );
+
+        let overlay = HazardOverlayShapes {
+            fill_shapes: vec![nested],
+            outline_shapes: vec![path],
+            labels: vec![(egui::Pos2::ZERO, "TOR 0042".to_owned(), false, 0)],
+        };
+        assert!(
+            hazard_overlay_geometry_weight(&overlay) > 2 * path_weight + "TOR 0042".len(),
+            "top-level shape and label containers must also count"
+        );
+    }
 
     fn popup_test_record(
         event_id: &str,

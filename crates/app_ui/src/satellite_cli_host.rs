@@ -35,7 +35,7 @@ pub(crate) const SATELLITE_CATALOG_SCHEMA_VERSION: &str = "bowecho.satellite.cat
 pub(crate) const SATELLITE_FETCH_SCHEMA_VERSION: &str = "bowecho.satellite.fetch.v1";
 pub(crate) const SATELLITE_ARTIFACT_SCHEMA_VERSION: &str = "bowecho.satellite.artifacts.v1";
 pub(crate) const SATELLITE_VERIFY_SCHEMA_VERSION: &str = "bowecho.satellite.verify.v1";
-const RUSTY_WEATHER_COMMIT: &str = "c8284329311ae7f1ca8f5524f415a18cd97d71e2";
+const RUSTY_WEATHER_COMMIT: &str = "68b74857780e436843cbf599c25ebccb886f7b8a";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

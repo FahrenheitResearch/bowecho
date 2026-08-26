@@ -1337,6 +1337,10 @@ mod tests {
             },
             source_provenance: vec![rw_community_protocol::SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["pressure".into()],
                 products: vec!["wrfprs".into()],
             }],
