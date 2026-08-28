@@ -1039,11 +1039,14 @@ mod tests {
     fn latest_lookup_timeout_returns_failure_and_drops_the_late_result() {
         let request = spec();
         let busy = Arc::new(AtomicBool::new(true));
+        let (release_tx, release_rx) = sync_channel(0);
         let response = latest_response_bounded_with(
             request.clone(),
             Duration::from_millis(10),
-            |_| {
-                std::thread::sleep(Duration::from_millis(75));
+            move |_| {
+                release_rx
+                    .recv()
+                    .expect("test releases the timed-out lookup");
                 Ok(("20990101".to_owned(), 0, "nomads".to_owned()))
             },
             Arc::clone(&busy),
@@ -1063,6 +1066,9 @@ mod tests {
             busy.load(Ordering::Acquire),
             "the worker remains occupied until the timed-out inner lookup exits"
         );
+        release_tx
+            .send(())
+            .expect("timed-out lookup is still waiting for release");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while busy.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
