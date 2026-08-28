@@ -331,7 +331,7 @@ impl ProgressiveRaster {
 
 enum NativeTileSource {
     Local(NativeSatMapSource),
-    Remote(RemoteSatMapSource),
+    Remote(Box<RemoteSatMapSource>),
 }
 
 impl NativeTileRenderer {
@@ -345,7 +345,7 @@ impl NativeTileRenderer {
 
     pub(crate) fn new_remote(source: RemoteSatMapSource) -> Self {
         Self {
-            source: NativeTileSource::Remote(source),
+            source: NativeTileSource::Remote(Box::new(source)),
             cache: Mutex::new(TileCache::default()),
             prepared_local: Mutex::new(None),
         }

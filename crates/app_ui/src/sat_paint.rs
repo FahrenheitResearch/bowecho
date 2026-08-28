@@ -3006,7 +3006,7 @@ fn draw_satellite_loading_notice(painter: &egui::Painter, rect: egui::Rect, text
     painter.rect_stroke(
         card,
         5.0,
-        egui::Stroke::new(1.25, color),
+        egui::Stroke::new(1.25_f32, color),
         egui::StrokeKind::Inside,
     );
     painter.galley(card.min + egui::vec2(10.0, 6.0), galley, color);
@@ -3060,7 +3060,7 @@ fn draw_satellite_stale_notice(
     painter.rect_stroke(
         card,
         5.0,
-        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 214, 92)),
+        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 214, 92)),
         egui::StrokeKind::Inside,
     );
     painter.galley(

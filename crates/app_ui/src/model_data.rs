@@ -4228,10 +4228,6 @@ impl ModelDataDock {
         }
     }
 
-    pub fn formula_lab_busy(&self) -> bool {
-        self.formula_lab.busy()
-    }
-
     pub fn request_formula_lab_open(&mut self) {
         self.formula_lab_open_requested = true;
     }

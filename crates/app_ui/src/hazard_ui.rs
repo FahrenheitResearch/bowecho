@@ -2787,7 +2787,7 @@ mod tests {
                 egui::pos2(1.0, 1.0),
                 egui::pos2(2.0, 0.0),
             ],
-            egui::Stroke::new(1.0, egui::Color32::WHITE),
+            egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
         );
         let path_weight = egui_shape_geometry_weight(&path);
         assert_eq!(

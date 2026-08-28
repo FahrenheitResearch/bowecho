@@ -2679,16 +2679,15 @@ fn fetch_remote_scan(
     })
 }
 
+type RemoteRunBindings = (
+    HashMap<(String, String), RemoteRunBinding>,
+    Vec<SatRunListing>,
+);
+
 fn build_remote_run_bindings(
     catalog: Arc<RemoteSatelliteCatalog>,
     frames: Arc<RemoteSatelliteFrames>,
-) -> Result<
-    (
-        HashMap<(String, String), RemoteRunBinding>,
-        Vec<SatRunListing>,
-    ),
-    String,
-> {
+) -> Result<RemoteRunBindings, String> {
     let platform_title = catalog
         .platforms
         .iter()
@@ -2964,16 +2963,16 @@ fn load_frame_for_map(
         }
     }
 
-    if let Some(remote) = state.remote.as_ref() {
-        if let Some(source) = remote.map_source(key, hhmm)? {
-            return Ok(SatMapFrame {
-                key: key.clone(),
-                hhmm,
-                native: None,
-                remote: Some(source),
-                preview: None,
-            });
-        }
+    if let Some(remote) = state.remote.as_ref()
+        && let Some(source) = remote.map_source(key, hhmm)?
+    {
+        return Ok(SatMapFrame {
+            key: key.clone(),
+            hhmm,
+            native: None,
+            remote: Some(source),
+            preview: None,
+        });
     }
 
     if strict_native_product_requested(key, requested_native_product) {
@@ -8874,6 +8873,7 @@ fn stored_from_recent(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     store_root: PathBuf,
     remote: Option<RemoteSatelliteClient>,
@@ -8894,10 +8894,10 @@ fn worker_loop(
         notify();
         ok
     };
-    if let Some(note) = remote_init_note {
-        if !send(SatResponse::Note(note)) {
-            return;
-        }
+    if let Some(note) = remote_init_note
+        && !send(SatResponse::Note(note))
+    {
+        return;
     }
     // Report a card-ticketed one-shot ingest's outcome on the side channel
     // (no-op for unticketed requests — the regular panel buttons).
@@ -8971,7 +8971,7 @@ fn worker_loop(
                 // component under the product label.
                 if local
                     .iter()
-                    .any(|run| run.key == carrier && run.frames.iter().any(|frame| *frame == hhmm))
+                    .any(|run| run.key == carrier && run.frames.contains(&hhmm))
                     && native_product_frame_is_newest(&local, &carrier, hhmm)
                     && resolve_native_map_source(&store_root, &carrier, hhmm, Some(&product.slug()))
                         .is_some()

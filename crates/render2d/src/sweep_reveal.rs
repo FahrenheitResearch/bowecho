@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn transparent_incoming_pixel_does_not_fall_back_to_old_echo() {
         let mut incoming = solid(INCOMING);
-        incoming[(0 * 3 + 1) * 4..(0 * 3 + 1) * 4 + 4].fill(0);
+        incoming[4..8].fill(0);
         let previous = solid(PREVIOUS);
         let rgba = composite_sweep_reveal_rgba(&incoming, &previous, options(0.0), 0.0, 90.0)
             .expect("transparent reveal");

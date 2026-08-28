@@ -62570,6 +62570,10 @@ mod tests {
     #[test]
     fn satellite_timeline_follow_queues_nearest_map_frame_after_scan_index() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sat_panel = rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec {
+            layer: "c13".to_owned(),
+            ..rw_ui::SatFollowSpec::default()
+        });
         let target = Utc.with_ymd_and_hms(2026, 6, 15, 17, 56, 0).unwrap();
         let volume = Arc::new(test_volume_with_site_time("KTLX", target));
         app.volume = Some(Arc::clone(&volume));

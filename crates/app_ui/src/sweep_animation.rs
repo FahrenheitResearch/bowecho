@@ -563,10 +563,11 @@ mod tests {
     }
 
     fn volume_of(cuts: Vec<ElevationCut>) -> RadarVolume {
-        let mut volume = RadarVolume::default();
-        volume.site = RadarSite::new("KTLX");
-        volume.cuts = cuts;
-        volume
+        RadarVolume {
+            site: RadarSite::new("KTLX"),
+            cuts,
+            ..RadarVolume::default()
+        }
     }
 
     #[test]

@@ -1380,8 +1380,8 @@ impl CommunityCacheClient {
             validate_remote_model_plane_request(catalog, time, variable_name, level_hpa)?;
         let expected_size = remote_model_plane_expected_size(
             &catalog.run,
-            variable.name.as_bytes().len(),
-            variable.units.as_bytes().len(),
+            variable.name.len(),
+            variable.units.len(),
         )?;
         if expected_size > self.limits.max_decoded_bytes {
             return Err(CommunityCacheError::Response);
@@ -3387,11 +3387,8 @@ fn decode_remote_model_plane_body(
     time: &RemoteTimePoint,
     variable: &RemoteVariableCapability,
 ) -> Result<Vec<f32>, CommunityCacheError> {
-    let expected_size = remote_model_plane_expected_size(
-        run,
-        variable.name.as_bytes().len(),
-        variable.units.as_bytes().len(),
-    )?;
+    let expected_size =
+        remote_model_plane_expected_size(run, variable.name.len(), variable.units.len())?;
     if bytes.len() as u64 != expected_size
         || bytes.len() < REMOTE_MODEL_PLANE_HEADER_BYTES
         || &bytes[..8] != REMOTE_MODEL_PLANE_MAGIC
