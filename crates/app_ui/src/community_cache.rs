@@ -3456,12 +3456,8 @@ fn decode_remote_model_plane_body(
     values
         .try_reserve_exact(cells)
         .map_err(|_| CommunityCacheError::Quota)?;
-    for chunk in bytes[values_start..].chunks_exact(size_of::<f32>()) {
-        values.push(f32::from_le_bytes(
-            chunk
-                .try_into()
-                .map_err(|_| CommunityCacheError::Response)?,
-        ));
+    for chunk in bytes[values_start..].as_chunks::<{ size_of::<f32>() }>().0 {
+        values.push(f32::from_le_bytes(*chunk));
     }
     if values.len() != cells {
         return Err(CommunityCacheError::Response);
