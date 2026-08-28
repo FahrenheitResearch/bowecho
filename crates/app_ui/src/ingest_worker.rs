@@ -1063,8 +1063,14 @@ mod tests {
             busy.load(Ordering::Acquire),
             "the worker remains occupied until the timed-out inner lookup exits"
         );
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!busy.load(Ordering::Acquire));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while busy.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !busy.load(Ordering::Acquire),
+            "the busy flag clears after the detached lookup exits"
+        );
     }
 
     /// Field repro: GFS Latest/Download did nothing with no error. Drives
