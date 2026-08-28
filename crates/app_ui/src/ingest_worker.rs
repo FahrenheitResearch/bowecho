@@ -27,7 +27,7 @@ use std::time::Duration;
 use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_models::supported_forecast_hours;
 use rw_ingest::ingest_profile::IngestProfile;
-use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
+use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate_for_hours};
 use rw_ingest::{IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle};
 use rw_ui::{AvailabilityView, DownloadSpec, DownloadStage, EstimateView, HourDoneView};
 
@@ -431,13 +431,13 @@ fn compute_estimate(
     let model_slug = model.as_str().replace('-', "_");
     let paths = default_calibration_paths(store_root, &model_slug);
     let calibration = if paths.is_empty() {
-        Calibration::builtin_default()
+        Calibration::builtin_for_model(model)
     } else {
         Calibration::from_hour_files(&paths, model)
-            .unwrap_or_else(|_| Calibration::builtin_default())
+            .unwrap_or_else(|_| Calibration::builtin_for_model(model))
     };
     let hour_count = hours.len() as u16;
-    let estimate = estimate(&profile, model, hour_count, &calibration);
+    let estimate = estimate_for_hours(&profile, model, &hours, &calibration);
     Ok(EstimateView {
         profile_summary: profile.describe(),
         hour_count,
@@ -561,13 +561,6 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
             return view;
         }
     };
-    let products = match probe_products(model, &profile) {
-        Ok(products) => products,
-        Err(message) => {
-            view.note = Some(message);
-            return view;
-        }
-    };
     let source = match source_override(spec) {
         Ok(source) => source,
         Err(message) => {
@@ -576,6 +569,25 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
         }
     };
     view.candidates = supported_forecast_hours(model, spec.cycle);
+    // AROME fetch plans name logical roles whose physical packages vary by
+    // profile and (for the f000 static join) lead. Probe the union required by
+    // every candidate so a lone SP1 object can never make an incomplete run
+    // appear downloadable.
+    let mut products = Vec::<String>::new();
+    for &forecast_hour in &view.candidates {
+        let hour_products = match probe_products(model, &profile, forecast_hour) {
+            Ok(products) => products,
+            Err(message) => {
+                view.note = Some(message);
+                return view;
+            }
+        };
+        for product in hour_products {
+            if !products.contains(&product) {
+                products.push(product);
+            }
+        }
+    }
     let date = spec.date.clone();
     let cycle = spec.cycle;
     let probe = |product: &str, source: Option<SourceId>| {
@@ -618,18 +630,16 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
     view
 }
 
-/// The product files an availability probe must check for `model` under
-/// `profile`: every fetch-plan entry the profile actually reads. Surface
-/// sources are always read; pressure sources only when the profile needs
-/// isobaric data (`needs_prs`). HRRR sounding-grade -> `["prs", "sfc"]`
-/// (plan order); GFS -> `["pgrb2.0p25"]`.
-fn probe_products(model: ModelId, profile: &IngestProfile) -> Result<Vec<&'static str>, String> {
-    let plan = rw_ingest::fetch_plan(model).map_err(|err| err.to_string())?;
-    Ok(plan
-        .iter()
-        .filter(|fetch| fetch.surface_source || (fetch.pressure_source && profile.needs_prs()))
-        .map(|fetch| fetch.product)
-        .collect())
+/// The physical product objects an availability probe must require for one
+/// model/profile/hour. Rusty Weather owns this expansion so Latest, the hour
+/// chips, and the real fetch cannot disagree about package completeness.
+fn probe_products(
+    model: ModelId,
+    profile: &IngestProfile,
+    forecast_hour: u16,
+) -> Result<Vec<String>, String> {
+    rw_ingest::availability_probe_products(model, profile, forecast_hour)
+        .map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -652,17 +662,18 @@ fn find_latest(spec: &DownloadSpec) -> Result<(String, u8, String), String> {
     // request must not wait for an unrelated pressure product, while a
     // sounding/full request still requires both sides of split feeds such as
     // HRRR prs+sfc.
-    let products = probe_products(model, &profile)?;
     let forecast_hour = hours
         .into_iter()
         .max()
         .ok_or_else(|| "choose at least one forecast hour".to_owned())?;
+    let products = probe_products(model, &profile, forecast_hour)?;
+    let product_refs = products.iter().map(String::as_str).collect::<Vec<_>>();
     let today_utc = chrono::Utc::now().format("%Y%m%d").to_string();
     let latest = rustwx_models::latest_available_run_for_products_at_forecast_hour(
         model,
         source,
         &today_utc,
-        &products,
+        &product_refs,
         forecast_hour,
     )
     .map_err(|err| {
@@ -702,6 +713,11 @@ pub fn hrrr_conus_covers(lat_deg: f32, lon_deg: f32) -> bool {
 pub fn publication_lag_minutes(model: ModelId) -> i64 {
     match model {
         ModelId::Gfs => 220,
+        // Live package groups have completed roughly 3h15m-5h10m after
+        // initialization. Keep local cycle guesses beyond the observed slow
+        // edge; the explicit Latest action still verifies the exact requested
+        // packages upstream before changing the panel.
+        ModelId::AromeFrance001 | ModelId::AromeFrance0025 => 330,
         _ => 55,
     }
 }
@@ -1339,24 +1355,42 @@ mod tests {
         // HRRR sounding-grade reads 3D volumes -> both prs and sfc.
         let sounding = IngestProfile::preset("sounding").unwrap();
         assert_eq!(
-            probe_products(ModelId::Hrrr, &sounding).unwrap(),
-            vec!["prs", "sfc"]
+            probe_products(ModelId::Hrrr, &sounding, 3).unwrap(),
+            vec!["prs".to_owned(), "sfc".to_owned()]
         );
         // GFS/RAP: one file serves both roles.
         assert_eq!(
-            probe_products(ModelId::Gfs, &sounding).unwrap(),
-            vec!["pgrb2.0p25"]
+            probe_products(ModelId::Gfs, &sounding, 3).unwrap(),
+            vec!["pgrb2.0p25".to_owned()]
         );
         assert_eq!(
-            probe_products(ModelId::Rap, &sounding).unwrap(),
-            vec!["awp130pgrb"]
+            probe_products(ModelId::Rap, &sounding, 3).unwrap(),
+            vec!["awp130pgrb".to_owned()]
+        );
+        assert_eq!(
+            probe_products(ModelId::AromeFrance0025, &sounding, 3).unwrap(),
+            vec!["IP1".to_owned(), "SP1".to_owned(), "SP2".to_owned()]
+        );
+        assert!(
+            rw_ingest::validate_ingest_profile_for_model(ModelId::AromeFrance001, &sounding)
+                .is_err()
+        );
+        let arome_surface = IngestProfile::surface_for_model(ModelId::AromeFrance001);
+        assert_eq!(
+            probe_products(ModelId::AromeFrance001, &arome_surface, 3).unwrap(),
+            vec![
+                "SP1".to_owned(),
+                "SP2".to_owned(),
+                "SP3".to_owned(),
+                "SP3-static".to_owned(),
+            ]
         );
         // A surface-only model rejects a sounding profile before probing.
         assert!(rw_ingest::validate_ingest_profile_for_model(ModelId::Nbm, &sounding).is_err());
         let surface = IngestProfile::surface();
         assert_eq!(
-            probe_products(ModelId::Nbm, &surface).unwrap(),
-            vec!["core/co"]
+            probe_products(ModelId::Nbm, &surface, 3).unwrap(),
+            vec!["core/co".to_owned()]
         );
     }
 
@@ -1398,6 +1432,26 @@ mod tests {
         );
         assert!(!estimate.breakdown.is_empty());
         assert!(estimate.time_hint.contains("cache-cold"));
+    }
+
+    #[test]
+    fn arome_grouped_download_estimate_counts_shared_packages_once() {
+        let mut arome = spec();
+        arome.model = "arome-france-0p025".to_owned();
+        arome.hours = "0-6".to_owned();
+        let estimate = compute_estimate(
+            std::path::Path::new("definitely-missing-arome-store"),
+            &arome,
+        )
+        .expect("AROME estimate resolves");
+
+        assert_eq!(estimate.hour_count, 7);
+        assert!(
+            (580_000_000..700_000_000).contains(&estimate.download_bytes),
+            "the shared IP1/SP packages should be transferred once, got {} bytes",
+            estimate.download_bytes
+        );
+        assert!(estimate.calibration.contains("AROME 0.025"));
     }
 
     #[test]

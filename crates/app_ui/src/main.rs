@@ -3546,20 +3546,18 @@ struct ViewerApp {
     /// Last successfully rendered satellite raster plus its exact displayed
     /// identity. The identity stays with a retained texture so a failed/new
     /// frame can never be painted under the requested frame's timestamp.
-    sat_layer_texture: Option<(
-        egui::TextureHandle,
-        u64,
-        ModelLayerView,
-        bool,
-        rw_ui::SatRunKey,
-        u16,
-    )>,
+    sat_layer_texture: Option<SatLayerTexture>,
+    /// Incomplete but correctly georeferenced current-view native XYZ raster.
+    /// Kept separate so a failed/cancelled progressive render cannot replace
+    /// the last complete texture used for safe fallback.
+    sat_layer_stream_texture: Option<SatLayerTexture>,
     sat_layer_render_rx: Option<mpsc::Receiver<SatLayerRender>>,
     /// Cooperative stop token for the one detached satellite raster worker.
     /// A dropped receiver alone does not stop native NetCDF/HTTP tile work.
     sat_layer_render_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     sat_layer_render_generation: Option<u64>,
     sat_layer_render_view: Option<ModelLayerView>,
+    sat_layer_render_progress: Option<Arc<SatNativeRenderProgress>>,
     /// Transient native-tile failures keep the last valid texture and retry
     /// with bounded backoff instead of installing a transparent success.
     sat_layer_render_retry_after: Option<Instant>,
@@ -6606,6 +6604,44 @@ struct SatLayerRender {
     image: Result<egui::ColorImage, String>,
     native: bool,
     native_error: Option<String>,
+    complete: bool,
+}
+
+struct SatLayerTexture {
+    texture: egui::TextureHandle,
+    generation: u64,
+    view: ModelLayerView,
+    /// Map-point dimensions represented by the raster. This deliberately is
+    /// not the GPU texture's downsampled pixel size.
+    logical_size: egui::Vec2,
+    has_visible_pixels: bool,
+    key: rw_ui::SatRunKey,
+    hhmm: u16,
+}
+
+#[derive(Default)]
+struct SatNativeRenderProgress {
+    zoom: std::sync::atomic::AtomicU8,
+    loaded: std::sync::atomic::AtomicUsize,
+    total: std::sync::atomic::AtomicUsize,
+}
+
+impl SatNativeRenderProgress {
+    fn update(&self, progress: sat_native_map::NativeTileProgress) {
+        use std::sync::atomic::Ordering;
+        self.zoom.store(progress.zoom, Ordering::Relaxed);
+        self.total.store(progress.total, Ordering::Relaxed);
+        self.loaded.store(progress.loaded, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> (u8, usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.zoom.load(Ordering::Relaxed),
+            self.loaded.load(Ordering::Acquire),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// A rotation site detected on the lowest velocity tilt, geolocated.
@@ -10662,10 +10698,12 @@ impl ViewerApp {
             sat_layer: None,
             sat_layer_build_rx: None,
             sat_layer_texture: None,
+            sat_layer_stream_texture: None,
             sat_layer_render_rx: None,
             sat_layer_render_cancel: None,
             sat_layer_render_generation: None,
             sat_layer_render_view: None,
+            sat_layer_render_progress: None,
             sat_layer_render_retry_after: None,
             sat_layer_render_failures: 0,
             sat_layer_generation: 0,
@@ -49413,6 +49451,12 @@ fn model_download_cadence_hint(model: rustwx_core::ModelId, cycle: u8) -> &'stat
         ModelId::RrfsPublic if cycle.is_multiple_of(6) => "hourly 000-084; preliminary CONUS",
         ModelId::RrfsPublic => "hourly 000-018; preliminary CONUS",
         ModelId::Refs => "hourly 001-060; preliminary CONUS ensemble mean",
+        ModelId::AromeFrance001 => {
+            "hourly 000-051; 8 cycles/day; Meteo-France Europe 0.01 deg surface"
+        }
+        ModelId::AromeFrance0025 => {
+            "hourly 000-051; 8 cycles/day; Meteo-France Europe 0.025 deg surface + pressure"
+        }
         _ => "",
     }
 }
@@ -49487,7 +49531,10 @@ fn apply_model_download_capability_constraints(
 
 fn default_model_download_profile(model: rustwx_core::ModelId) -> (&'static str, bool) {
     use rw_ingest::IngestCapabilityLimitation as L;
-    if model == rustwx_core::ModelId::GdpsGeml {
+    if matches!(
+        model,
+        rustwx_core::ModelId::GdpsGeml | rustwx_core::ModelId::AromeFrance0025
+    ) {
         return ("sounding", false);
     }
     let capability = rw_ingest::model_ingest_capability(model);
@@ -66037,6 +66084,7 @@ mod tests {
         assert!(app.sat_map_pending.is_none());
         assert!(app.sat_layer.is_none());
         assert!(app.sat_layer_texture.is_none());
+        assert!(app.sat_layer_stream_texture.is_none());
         assert!(render_cancel.load(std::sync::atomic::Ordering::Relaxed));
         assert!(app.sat_layer_render_rx.is_none());
         assert!(app.sat_layer_render_generation.is_none());
@@ -77209,10 +77257,12 @@ mod tests {
             sat_layer: None,
             sat_layer_build_rx: None,
             sat_layer_texture: None,
+            sat_layer_stream_texture: None,
             sat_layer_render_rx: None,
             sat_layer_render_cancel: None,
             sat_layer_render_generation: None,
             sat_layer_render_view: None,
+            sat_layer_render_progress: None,
             sat_layer_render_retry_after: None,
             sat_layer_render_failures: 0,
             sat_layer_generation: 0,
@@ -81302,6 +81352,8 @@ mod tests {
             "rrfs-a",
             "rrfs-public",
             "refs",
+            "arome-france-0p01",
+            "arome-france-0p025",
         ];
         assert_eq!(options.len(), expected.len());
         for slug in expected {
@@ -81352,6 +81404,14 @@ mod tests {
 
         let unrestricted = default_download_spec("gfs");
         assert_eq!(unrestricted.profile, "sounding");
+
+        let arome_high_resolution = default_download_spec("arome-france-0p01");
+        assert_eq!(arome_high_resolution.profile, "surface");
+        assert!(!arome_high_resolution.derived && !arome_high_resolution.heavy);
+
+        let arome_pressure = default_download_spec("arome-france-0p025");
+        assert_eq!(arome_pressure.profile, "sounding");
+        assert!(!arome_pressure.derived && !arome_pressure.heavy);
     }
 
     #[test]
@@ -81436,6 +81496,13 @@ mod tests {
         assert!(model_download_cadence_hint(rustwx_core::ModelId::Aigefs, 0).contains("006"));
         assert!(model_download_cadence_hint(rustwx_core::ModelId::HrdpsWest, 0).contains("048"));
         assert!(model_download_cadence_hint(rustwx_core::ModelId::EtaCptec8km, 0).contains("264"));
+        assert!(
+            model_download_cadence_hint(rustwx_core::ModelId::AromeFrance001, 0).contains("0.01")
+        );
+        assert!(
+            model_download_cadence_hint(rustwx_core::ModelId::AromeFrance0025, 0)
+                .contains("pressure")
+        );
     }
 
     #[test]

@@ -123,6 +123,9 @@ pub enum SatRequest {
     },
     /// Start a live follow session (one at a time).
     Follow(SatFollowSpec),
+    /// Fetch the newest exact-complete product scan and stop. Unlike a live
+    /// follow, this never backfills older scans from the current hour.
+    LoadLatest(SatFollowSpec),
     /// One-shot current-hour ingest for quickly creating a playable loop.
     LoadLoop(SatFollowSpec),
     /// Read one stored frame and color it with its band palette.
@@ -557,7 +560,7 @@ pub struct NativeSatMapSource {
 #[derive(Clone)]
 pub(crate) struct RemoteSatMapSource {
     pub(crate) tile_source: RemoteSatelliteTileSource,
-    preview_product: Option<GoesAbiProduct>,
+    pub(crate) preview_product: Option<GoesAbiProduct>,
     scan_start_unix: i64,
     tile_fetcher: RemoteTileFetcher,
 }
@@ -641,10 +644,19 @@ pub enum SatResponse {
     FollowStarted,
     /// The session ended: `Ok` = clean stop, `Err` = failure.
     FollowFinished(Result<String, String>),
+    PollStarted {
+        band: u8,
+    },
     PollDone {
         band: u8,
         new_keys: usize,
+        retained_keys: usize,
         ms: u128,
+    },
+    AlreadyRetained {
+        id: String,
+        label: String,
+        bytes: u64,
     },
     DownloadStarted {
         id: String,
@@ -1026,6 +1038,45 @@ fn follow_config(spec: &SatFollowSpec, store_root: &Path) -> Result<FollowConfig
         max_bytes: spec.max_bytes(),
     };
     Ok(config)
+}
+
+/// Startup/history semantics are user intent, not an incidental consequence
+/// of S3's ascending object order. rw-sat performs the shared scan-major
+/// scheduling; BowEcho only selects the policy for each control surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoesFollowIntent {
+    Live,
+    Latest,
+    Loop,
+}
+
+fn apply_goes_follow_intent(config: &mut FollowConfig, intent: GoesFollowIntent) {
+    match intent {
+        GoesFollowIntent::Live => {
+            // Bootstrap the newest complete scan, then advance only into scans
+            // that arrive after startup. Historical loop fill is opt-in.
+            config.backfill_history = false;
+            config.max_polls = None;
+            config.max_frames = None;
+        }
+        GoesFollowIntent::Latest => {
+            config.backfill_history = false;
+            config.max_polls = Some(1);
+            config.max_frames = None;
+            config.poll_interval = Some(Duration::from_secs(1));
+            config.jitter_frac = 0.0;
+        }
+        GoesFollowIntent::Loop => {
+            // One complete poll loads the newest exact scan first, followed by
+            // older complete scans in scan-major order. Do not impose a raw
+            // component count: product recipes have different band counts.
+            config.backfill_history = true;
+            config.max_polls = Some(1);
+            config.max_frames = None;
+            config.poll_interval = Some(Duration::from_secs(1));
+            config.jitter_frac = 0.0;
+        }
+    }
 }
 
 /// The run-dir prefixes a spec's eviction/usage scans cover
@@ -1852,6 +1903,54 @@ fn native_product_overview_dimensions(
 
 fn scan_runs_for_player(store_root: &Path, spec: Option<&SatFollowSpec>) -> Vec<SatRunListing> {
     local_runs_for_active_product(store_root, scan_runs(store_root), spec)
+}
+
+/// Find the newest exact player frame belonging to one validated GOES picker
+/// spec. This is intentionally derived from the post-follow store catalog,
+/// rather than from `NativeFrameUpdated`: a newest scan that was already
+/// retained produces no write event, but "Load latest" must still select it.
+fn newest_player_frame_for_spec(
+    runs: &[SatRunListing],
+    spec: &SatFollowSpec,
+) -> Option<(SatRunKey, u16)> {
+    let resolved = resolve_spec(spec).ok()?;
+    let product = GoesAbiProduct::parse(&spec.layer)?;
+    let run_prefix = format!("{}_c{:02}_", resolved.sector.slug(), product.base_channel());
+    let product_marker =
+        (product.required_channels().len() > 1).then(|| format!("_rwproduct_{}_", product.slug()));
+
+    runs.iter()
+        .filter(|run| {
+            run.key.model == resolved.model
+                && run.key.run.starts_with(&run_prefix)
+                && product_marker
+                    .as_ref()
+                    .is_none_or(|marker| run.key.run.contains(marker))
+        })
+        .flat_map(|run| {
+            run.frames.iter().filter_map(move |&hhmm| {
+                frame_time(&run.key.run, hhmm).map(|time| (time, run.key.clone(), hhmm))
+            })
+        })
+        .max_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.run.cmp(&b.1.run))
+                .then_with(|| a.2.cmp(&b.2))
+        })
+        .map(|(_, key, hhmm)| (key, hhmm))
+}
+
+/// Build the post-one-shot catalog transaction in receiver order. `Runs`
+/// must land before `SelectFrame` so the player owns the retained timeline
+/// before the authoritative selection asks the host to map it.
+fn one_shot_catalog_responses(runs: Vec<SatRunListing>, spec: &SatFollowSpec) -> Vec<SatResponse> {
+    let newest = newest_player_frame_for_spec(&runs, spec);
+    let mut responses = Vec::with_capacity(1 + usize::from(newest.is_some()));
+    responses.push(SatResponse::Runs(runs));
+    if let Some((key, hhmm)) = newest {
+        responses.push(SatResponse::SelectFrame { key, hhmm });
+    }
+    responses
 }
 
 /// A repaired component can complete an older product minute after a newer
@@ -3364,22 +3463,29 @@ fn strict_native_product_requested(key: &SatRunKey, requested_product: Option<&s
 /// A minute-granular archive directory may contain channels from distinct ABI
 /// scans (or a republished Meso granule) whose start seconds differ. Presence
 /// alone is therefore not product completeness. A named product is renderable
-/// only when every required channel has the exact same scan interval.
+/// only when every required channel satisfies rw-sat's authoritative scan
+/// identity contract. ABI component channels share an exact scan start, while
+/// their provider end timestamps can differ by about one second.
 fn synchronized_native_product_scan(
     frame: &NativeSatelliteFrame,
     product: GoesAbiProduct,
 ) -> Option<(i64, i64)> {
+    const ABI_COMPONENT_END_TOLERANCE_SECONDS: i64 = 2;
     let mut required = product.required_channels().iter();
     let first = frame.channels.get(required.next()?)?;
-    let interval = (first.scan_start_unix, first.scan_end_unix);
-    required
-        .all(|channel| {
-            frame
-                .channels
-                .get(channel)
-                .is_some_and(|source| (source.scan_start_unix, source.scan_end_unix) == interval)
-        })
-        .then_some(interval)
+    let scan_start = first.scan_start_unix;
+    let (earliest_end, latest_end) = required.try_fold(
+        (first.scan_end_unix, first.scan_end_unix),
+        |(earliest_end, latest_end), channel| {
+            let source = frame.channels.get(channel)?;
+            (source.scan_start_unix == scan_start).then_some((
+                earliest_end.min(source.scan_end_unix),
+                latest_end.max(source.scan_end_unix),
+            ))
+        },
+    )?;
+    (latest_end.saturating_sub(earliest_end) <= ABI_COMPONENT_END_TOLERANCE_SECONDS)
+        .then_some((scan_start, latest_end))
 }
 
 /// Turn any component run written by a named multi-channel product into the
@@ -4464,10 +4570,25 @@ fn wv_grayscale_for_band(band: u8) -> Option<rw_sat::palette::Anchors> {
 /// frame row keeps one id end to end.
 fn map_event(event: SatEvent, current_key: &mut Option<String>) -> Vec<SatResponse> {
     match event {
-        SatEvent::PollStarted { .. } => Vec::new(),
-        SatEvent::PollDone { band, new_keys, ms } => {
-            vec![SatResponse::PollDone { band, new_keys, ms }]
+        SatEvent::PollStarted { band, .. } => vec![SatResponse::PollStarted { band }],
+        SatEvent::PollDone {
+            band,
+            new_keys,
+            retained_keys,
+            ms,
+        } => {
+            vec![SatResponse::PollDone {
+                band,
+                new_keys,
+                retained_keys,
+                ms,
+            }]
         }
+        SatEvent::AlreadyRetained { key, bytes } => vec![SatResponse::AlreadyRetained {
+            label: download_label(&key),
+            id: key,
+            bytes,
+        }],
         SatEvent::DownloadStarted { key, bytes } => {
             *current_key = Some(key.clone());
             let label = download_label(&key);
@@ -9113,7 +9234,13 @@ fn worker_loop(
                     }
                 }
             }
-            SatRequest::LoadLoop(spec) => {
+            request @ (SatRequest::LoadLatest(_) | SatRequest::LoadLoop(_)) => {
+                let (spec, intent) = match request {
+                    SatRequest::LoadLatest(spec) => (spec, GoesFollowIntent::Latest),
+                    SatRequest::LoadLoop(spec) => (spec, GoesFollowIntent::Loop),
+                    _ => unreachable!("guarded one-shot GOES request"),
+                };
+                let latest_only = intent == GoesFollowIntent::Latest;
                 state.active_spec = Some(spec.clone());
                 if follow_active.swap(true, Ordering::SeqCst) {
                     send(SatResponse::Note(
@@ -9129,10 +9256,7 @@ fn worker_loop(
                         continue;
                     }
                 };
-                config.max_polls = Some(1);
-                config.max_frames = Some(24);
-                config.poll_interval = Some(Duration::from_secs(1));
-                config.jitter_frac = 0.0;
+                apply_goes_follow_intent(&mut config, intent);
                 let (model, prefixes) =
                     run_prefixes(&spec).expect("spec validated by follow_config");
                 let usage_sector = config.sector.slug().to_owned();
@@ -9142,9 +9266,12 @@ fn worker_loop(
                 if !send(SatResponse::FollowStarted) {
                     return;
                 }
-                send(SatResponse::Note(
-                    "GOES loop: loading current-hour frames".to_string(),
-                ));
+                send(SatResponse::Note(if latest_only {
+                    "GOES latest: loading the newest complete product scan".to_string()
+                } else {
+                    "GOES loop: loading newest complete scan first, then current-hour history"
+                        .to_string()
+                }));
                 for response in storage_usage_responses(
                     &store_root,
                     &model,
@@ -9156,14 +9283,33 @@ fn worker_loop(
                     send(response);
                 }
 
+                // Do not hold an already-retained product behind missing
+                // loop history. Publish the current exact catalog and newest
+                // matching selection before the network thread starts; the
+                // post-follow transaction below refreshes it again after any
+                // newer scan or older history lands.
+                for response in one_shot_catalog_responses(
+                    scan_runs_for_player(&store_root, Some(&spec)),
+                    &spec,
+                ) {
+                    if !send(response) {
+                        return;
+                    }
+                }
+
                 let tx = responses.clone();
                 let thread_notify = Arc::clone(notify);
                 let thread_cancel = Arc::clone(cancel);
                 let active = Arc::clone(&follow_active);
                 let root = store_root.clone();
                 let player_spec = spec.clone();
+                let thread_name = if latest_only {
+                    "rw-sat-latest-load"
+                } else {
+                    "rw-sat-loop-load"
+                };
                 let spawned = std::thread::Builder::new()
-                    .name("rw-sat-loop-load".to_string())
+                    .name(thread_name.to_string())
                     .spawn(move || {
                         rw_ingest::throttle::set_current_thread_background_priority();
                         let result = {
@@ -9198,22 +9344,44 @@ fn worker_loop(
                             rw_sat::follow(&config, &mut sink, &thread_cancel)
                         };
                         active.store(false, Ordering::SeqCst);
+                        let completed = result.is_ok();
                         let response = match result {
                             Ok(summary) => SatResponse::FollowFinished(Ok(format!(
-                                "loop load done - {} frame(s) in {} poll(s)",
-                                summary.frames.len(),
+                                "{} done — {} source channel(s) in {} poll(s)",
+                                if latest_only {
+                                    "latest load"
+                                } else {
+                                    "loop load"
+                                },
+                                summary.downloaded_keys.len(),
                                 summary.polls
                             ))),
                             Err(SatError::Cancelled) => {
-                                SatResponse::FollowFinished(Ok("loop load stopped".to_string()))
+                                SatResponse::FollowFinished(Ok(if latest_only {
+                                    "latest load stopped"
+                                } else {
+                                    "loop load stopped"
+                                }
+                                .to_string()))
                             }
                             Err(err) => SatResponse::FollowFinished(Err(err.to_string())),
                         };
+                        let runs = scan_runs_for_player(&root, Some(&player_spec));
+                        if completed {
+                            // A retained scan has no NativeFrameUpdated event.
+                            // Publish the catalog and its exact newest
+                            // selection from this one sender, in that order,
+                            // before announcing completion.
+                            for catalog_response in one_shot_catalog_responses(runs, &player_spec) {
+                                let _ = tx.send(catalog_response);
+                            }
+                        } else {
+                            // Preserve any frames that landed before a cancel
+                            // or failure without claiming an authoritative
+                            // successful latest selection.
+                            let _ = tx.send(SatResponse::Runs(runs));
+                        }
                         let _ = tx.send(response);
-                        let _ = tx.send(SatResponse::Runs(scan_runs_for_player(
-                            &root,
-                            Some(&player_spec),
-                        )));
                         for response in storage_usage_responses(
                             &root,
                             &model,
@@ -9229,7 +9397,12 @@ fn worker_loop(
                 if let Err(err) = spawned {
                     follow_active.store(false, Ordering::SeqCst);
                     send(SatResponse::FollowFinished(Err(format!(
-                        "failed to spawn the loop-load thread: {err}"
+                        "failed to spawn the {} thread: {err}",
+                        if latest_only {
+                            "latest-load"
+                        } else {
+                            "loop-load"
+                        }
                     ))));
                 }
             }
@@ -9241,7 +9414,7 @@ fn worker_loop(
                     ));
                     continue;
                 }
-                let config = match follow_config(&spec, &store_root) {
+                let mut config = match follow_config(&spec, &store_root) {
                     Ok(config) => config,
                     Err(message) => {
                         follow_active.store(false, Ordering::SeqCst);
@@ -9249,6 +9422,7 @@ fn worker_loop(
                         continue;
                     }
                 };
+                apply_goes_follow_intent(&mut config, GoesFollowIntent::Live);
                 let (model, prefixes) =
                     run_prefixes(&spec).expect("spec validated by follow_config");
                 let usage_sector = config.sector.slug().to_owned();
@@ -9352,6 +9526,110 @@ mod tests {
 
     fn spec() -> SatFollowSpec {
         SatFollowSpec::default()
+    }
+
+    #[test]
+    fn goes_follow_intents_do_not_conflate_latest_live_and_history() {
+        let base = follow_config(&spec(), Path::new("sat-store")).expect("default GOES spec");
+
+        let mut live = base.clone();
+        apply_goes_follow_intent(&mut live, GoesFollowIntent::Live);
+        assert!(!live.backfill_history);
+        assert_eq!(live.max_polls, None);
+        assert_eq!(live.max_frames, None);
+
+        let mut latest = base.clone();
+        apply_goes_follow_intent(&mut latest, GoesFollowIntent::Latest);
+        assert!(!latest.backfill_history);
+        assert_eq!(latest.max_polls, Some(1));
+        assert_eq!(latest.max_frames, None);
+        assert_eq!(latest.jitter_frac, 0.0);
+
+        let mut loop_load = base;
+        apply_goes_follow_intent(&mut loop_load, GoesFollowIntent::Loop);
+        assert!(loop_load.backfill_history);
+        assert_eq!(loop_load.max_polls, Some(1));
+        assert_eq!(loop_load.max_frames, None);
+        assert_eq!(loop_load.jitter_frac, 0.0);
+    }
+
+    #[test]
+    fn retained_latest_product_catalog_precedes_authoritative_selection() {
+        let spec = SatFollowSpec {
+            satellite: "goes19".to_owned(),
+            sector: "fulldisk".to_owned(),
+            layer: "open_geocolor_v1".to_owned(),
+            ..SatFollowSpec::default()
+        };
+        let expected_key = SatRunKey {
+            model: "g19".to_owned(),
+            run: "fulldisk_c02_rwproduct_open_geocolor_v1_20260827".to_owned(),
+        };
+        let runs = vec![
+            SatRunListing {
+                key: expected_key.clone(),
+                title: "GOES-19 Open GeoColor".to_owned(),
+                nx: 10848,
+                ny: 10848,
+                frames: vec![140, 150],
+            },
+            SatRunListing {
+                key: SatRunKey {
+                    model: "g19".to_owned(),
+                    run: "fulldisk_c02_rwproduct_geocolor_20260827".to_owned(),
+                },
+                title: "different GOES-19 product".to_owned(),
+                nx: 10848,
+                ny: 10848,
+                frames: vec![200],
+            },
+            SatRunListing {
+                key: SatRunKey {
+                    model: "g18".to_owned(),
+                    run: "fulldisk_c02_rwproduct_open_geocolor_v1_20260827".to_owned(),
+                },
+                title: "different satellite".to_owned(),
+                nx: 10848,
+                ny: 10848,
+                frames: vec![300],
+            },
+        ];
+
+        let responses = one_shot_catalog_responses(runs, &spec);
+        assert!(
+            matches!(responses.first(), Some(SatResponse::Runs(runs)) if runs.len() == 3),
+            "the player catalog must always be installed first"
+        );
+        assert!(matches!(
+            responses.get(1),
+            Some(SatResponse::SelectFrame { key, hhmm: 150 }) if key == &expected_key
+        ));
+        assert_eq!(responses.len(), 2);
+    }
+
+    #[test]
+    fn one_shot_catalog_never_selects_an_unrelated_retained_run() {
+        let spec = SatFollowSpec {
+            satellite: "goes19".to_owned(),
+            sector: "fulldisk".to_owned(),
+            layer: "open_geocolor_v1".to_owned(),
+            ..SatFollowSpec::default()
+        };
+        let responses = one_shot_catalog_responses(
+            vec![SatRunListing {
+                key: SatRunKey {
+                    model: "g19".to_owned(),
+                    run: "fulldisk_c02_rwproduct_geocolor_20260827".to_owned(),
+                },
+                title: "different product".to_owned(),
+                nx: 10848,
+                ny: 10848,
+                frames: vec![200],
+            }],
+            &spec,
+        );
+
+        assert!(matches!(responses.as_slice(), [SatResponse::Runs(_)]));
     }
 
     #[test]
@@ -9874,6 +10152,56 @@ mod tests {
             "mixed-scan HHMM must produce no selectable product frame"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operational_geocolor_component_end_offset_remains_selectable() {
+        let start = 1_787_794_821_i64;
+        let common_end = 1_787_795_392_i64;
+        let channels = [
+            (1_u8, start, common_end),
+            (2, start, common_end),
+            (3, start, common_end),
+            // Real GOES-18 Full Disk manifests can retain C13 one whole
+            // second later than C01/C02/C03 for the same exact scan.
+            (13, start, common_end + 1),
+        ]
+        .into_iter()
+        .map(|(channel, scan_start_unix, scan_end_unix)| {
+            (
+                channel,
+                rw_sat::archive::NativeChannelSource {
+                    channel,
+                    object_key: format!("fixture-c{channel:02}"),
+                    relative_path: format!("c{channel:02}.nc"),
+                    byte_size: 1,
+                    content_blake3: None,
+                    scan_start_unix,
+                    scan_end_unix,
+                },
+            )
+        })
+        .collect();
+        let mut frame = NativeSatelliteFrame {
+            schema: rw_sat::archive::NATIVE_FRAME_SCHEMA.to_owned(),
+            platform: "g18".to_owned(),
+            sector: "fulldisk".to_owned(),
+            frame_id: "20260827T0140".to_owned(),
+            scan_start_unix: start,
+            scan_end_unix: common_end + 1,
+            channels,
+            l2_products: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            synchronized_native_product_scan(&frame, GoesAbiProduct::GeoColor),
+            Some((start, common_end + 1))
+        );
+        frame.channels.get_mut(&13).expect("C13").scan_end_unix = common_end + 3;
+        assert!(
+            synchronized_native_product_scan(&frame, GoesAbiProduct::GeoColor).is_none(),
+            "component ends outside the ABI tolerance must not be merged"
+        );
     }
 
     #[test]
@@ -11481,6 +11809,55 @@ mod tests {
         );
         assert_eq!(label, "C13 19:21:18Z");
         assert_eq!(download_label("not/a/goes-key.nc"), "goes-key.nc");
+    }
+
+    #[test]
+    fn poll_and_retained_events_keep_per_channel_identity() {
+        let mut current = None;
+        assert!(matches!(
+            map_event(
+                SatEvent::PollStarted {
+                    band: 2,
+                    prefixes: vec!["prefix".to_string()],
+                },
+                &mut current,
+            )
+            .as_slice(),
+            [SatResponse::PollStarted { band: 2 }]
+        ));
+
+        let key = "ABI-L2-CMIPF/2026/239/16/OR_ABI-L2-CMIPF-M6C02_G18_s20262391640211_e20262391649519_c20262391649578.nc".to_string();
+        assert!(matches!(
+            map_event(
+                SatEvent::AlreadyRetained {
+                    key: key.clone(),
+                    bytes: 414_400_000,
+                },
+                &mut current,
+            )
+            .as_slice(),
+            [SatResponse::AlreadyRetained { id, label, bytes: 414_400_000 }]
+                if id == &key && label == "C02 16:40:21Z"
+        ));
+
+        assert!(matches!(
+            map_event(
+                SatEvent::PollDone {
+                    band: 2,
+                    new_keys: 0,
+                    retained_keys: 5,
+                    ms: 21,
+                },
+                &mut current,
+            )
+            .as_slice(),
+            [SatResponse::PollDone {
+                band: 2,
+                new_keys: 0,
+                retained_keys: 5,
+                ms: 21,
+            }]
+        ));
     }
 
     #[test]

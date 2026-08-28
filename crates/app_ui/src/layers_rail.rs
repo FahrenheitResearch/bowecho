@@ -977,8 +977,9 @@ impl ViewerApp {
             }
             self.sat_layer = None;
             self.sat_layer_texture = None;
+            self.sat_layer_stream_texture = None;
             self.sat_layer_build_rx = None;
-            self.sat_layer_render_rx = None;
+            self.cancel_sat_layer_render();
             self.sat_map_inflight = None;
             self.sat_map_pending = None;
             ctx.request_repaint();

@@ -48,8 +48,54 @@ impl SatelliteSource {
 }
 
 const SAT_STALE_DRAPE_GRID: usize = 8;
+/// A stale viewport texture is only a useful bridge while it still covers
+/// most of the new map. After a zoom-out/pan exposes substantial new area,
+/// drawing the old finite viewport produces the misleading tilted
+/// rectangle/trapezoid reported on Full Disk imagery.
+const SAT_STALE_DRAPE_MIN_VIEW_COVERAGE: f32 = 0.72;
+const SAT_STALE_DRAPE_MIN_SCALE_RATIO: f32 = 0.80;
 const SAT_RENDER_RETRY_BASE: Duration = Duration::from_secs(1);
 const SAT_RENDER_RETRY_MAX_SECS: u64 = 16;
+
+/// `SatLayerRender` predates native dirty rectangles and deliberately remains
+/// the common final-image message. For an incomplete message only, transport
+/// the integer patch origin in `ColorImage::source_size`; the UI restores the
+/// patch's normal source size before handing it to egui `set_partial`.
+fn pack_sat_native_patch(mut patch: sat_native_map::NativeTilePatch) -> egui::ColorImage {
+    patch.image.source_size = egui::vec2(patch.origin[0] as f32, patch.origin[1] as f32);
+    patch.image
+}
+
+fn unpack_sat_native_patch(mut image: egui::ColorImage) -> Option<([usize; 2], egui::ColorImage)> {
+    let origin = image.source_size;
+    if !origin.x.is_finite()
+        || !origin.y.is_finite()
+        || origin.x < 0.0
+        || origin.y < 0.0
+        || origin.x.fract() != 0.0
+        || origin.y.fract() != 0.0
+    {
+        return None;
+    }
+    let origin = [origin.x as usize, origin.y as usize];
+    image.source_size = egui::vec2(image.size[0] as f32, image.size[1] as f32);
+    Some((origin, image))
+}
+
+fn sat_native_patch_fits(
+    texture_size: [usize; 2],
+    origin: [usize; 2],
+    patch_size: [usize; 2],
+) -> bool {
+    patch_size[0] > 0
+        && patch_size[1] > 0
+        && origin[0]
+            .checked_add(patch_size[0])
+            .is_some_and(|right| right <= texture_size[0])
+        && origin[1]
+            .checked_add(patch_size[1])
+            .is_some_and(|bottom| bottom <= texture_size[1])
+}
 
 // GOES-R nominal fixed-grid geometry (the same values carried by operational
 // ABI L1b/L2 NetCDF files). `perspective_point_height` is measured above the
@@ -305,6 +351,44 @@ fn stale_sat_texture_mesh(
     Some(mesh)
 }
 
+fn stale_sat_mesh_view_coverage(mesh: &egui::epaint::Mesh, rect: egui::Rect) -> f32 {
+    if !rect.is_finite() || !rect.is_positive() || mesh.vertices.is_empty() {
+        return 0.0;
+    }
+    let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);
+    let mut max = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for vertex in &mesh.vertices {
+        if !vertex.pos.x.is_finite() || !vertex.pos.y.is_finite() {
+            return 0.0;
+        }
+        min.x = min.x.min(vertex.pos.x);
+        min.y = min.y.min(vertex.pos.y);
+        max.x = max.x.max(vertex.pos.x);
+        max.y = max.y.max(vertex.pos.y);
+    }
+    let bounds = egui::Rect::from_min_max(min, max);
+    let visible = bounds.intersect(rect);
+    if !visible.is_positive() {
+        return 0.0;
+    }
+    (visible.width() * visible.height() / (rect.width() * rect.height())).clamp(0.0, 1.0)
+}
+
+fn stale_sat_mesh_is_useful(
+    mesh: &egui::epaint::Mesh,
+    rect: egui::Rect,
+    rendered: &ModelLayerView,
+    current: &ModelLayerView,
+    same_frame: bool,
+) -> bool {
+    if !same_frame || rendered.map_scale <= 0.0 || current.map_scale <= 0.0 {
+        return false;
+    }
+    let scale_ratio = current.map_scale / rendered.map_scale;
+    scale_ratio >= SAT_STALE_DRAPE_MIN_SCALE_RATIO
+        && stale_sat_mesh_view_coverage(mesh, rect) >= SAT_STALE_DRAPE_MIN_VIEW_COVERAGE
+}
+
 impl ViewerApp {
     /// Satellite window: GOES live-follow plus non-GOES ingest/discovery
     /// actions, all writing into BowEcho's own rolling satellite store.
@@ -517,6 +601,7 @@ impl ViewerApp {
         }
 
         let mut panel_events = Vec::new();
+        let mut load_goes_latest = false;
         let mut load_goes_loop = false;
         let mut load_goes_composite = false;
         let mut load_himawari = false;
@@ -550,9 +635,17 @@ impl ViewerApp {
                     );
                 }
                 ui.horizontal_wrapped(|ui| {
-                    if fixed_action_button(ui, "Load live loop", 110.0)
+                    if fixed_action_button(ui, "Load latest", 96.0)
                         .on_hover_text(
-                            "One-shot current-hour ingest for the selected GOES satellite, sector, and layer.",
+                            "Fetch the newest complete scan for the selected GOES product and display it immediately. No older history is downloaded.",
+                        )
+                        .clicked()
+                    {
+                        load_goes_latest = true;
+                    }
+                    if fixed_action_button(ui, "Load 1h loop", 104.0)
+                        .on_hover_text(
+                            "Display the newest complete scan first, then fill older complete scans from the current hour in the background.",
                         )
                         .clicked()
                     {
@@ -843,11 +936,20 @@ impl ViewerApp {
             self.persist_sat_native_window();
         }
 
+        if load_goes_latest && let Some(sat) = &self.sat {
+            self.sat_map_follow = true;
+            self.status = "Satellite: loading newest complete GOES scan".to_owned();
+            self.sat_panel
+                .apply_note("GOES latest: newest complete scan queued".to_owned());
+            sat.send(sat_worker::SatRequest::LoadLatest(
+                self.sat_panel.spec().clone(),
+            ));
+        }
         if load_goes_loop && let Some(sat) = &self.sat {
             self.sat_map_follow = true;
-            self.status = "Satellite: loading GOES loop".to_owned();
+            self.status = "Satellite: loading newest GOES scan, then loop history".to_owned();
             self.sat_panel
-                .apply_note("GOES loop: queued current-hour ingest".to_owned());
+                .apply_note("GOES loop: newest complete scan first; older scans follow".to_owned());
             sat.send(sat_worker::SatRequest::LoadLoop(
                 self.sat_panel.spec().clone(),
             ));
@@ -1013,9 +1115,9 @@ impl ViewerApp {
                 .sat_layer
                 .as_ref()
                 .zip(self.sat_layer_texture.as_ref())
-                .is_some_and(|(layer, (_, generation, _, has_visible_pixels, _, _))| {
-                    layer.generation == *generation
-                        && !*has_visible_pixels
+                .is_some_and(|(layer, rendered)| {
+                    layer.generation == rendered.generation
+                        && !rendered.has_visible_pixels
                         && (layer
                             .native
                             .as_ref()
@@ -1264,13 +1366,15 @@ impl ViewerApp {
     /// dropping the result receiver leaves native NetCDF reads (and remote
     /// HTTP tile requests) running, which made rapid scrub/pan pile up stale
     /// workers behind the current frame.
-    fn cancel_sat_layer_render(&mut self) {
+    pub(crate) fn cancel_sat_layer_render(&mut self) {
         if let Some(cancel) = self.sat_layer_render_cancel.take() {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.sat_layer_render_rx = None;
         self.sat_layer_render_generation = None;
         self.sat_layer_render_view = None;
+        self.sat_layer_render_progress = None;
+        self.retain_visible_sat_stream_fallback();
     }
 
     fn finish_sat_layer_render(&mut self) {
@@ -1278,6 +1382,31 @@ impl ViewerApp {
         self.sat_layer_render_rx = None;
         self.sat_layer_render_generation = None;
         self.sat_layer_render_view = None;
+        self.sat_layer_render_progress = None;
+        self.retain_visible_sat_stream_fallback();
+    }
+
+    /// If a zoom supersedes the first-ever render, keep its already-visible
+    /// partial texture as the stale drape until the new view publishes. A
+    /// complete texture for this frame remains the better fallback when one
+    /// exists because it has no transparent not-yet-loaded holes.
+    fn retain_visible_sat_stream_fallback(&mut self) {
+        let current_generation = self.sat_layer.as_ref().map(|layer| layer.generation);
+        let complete_is_current = self
+            .sat_layer_texture
+            .as_ref()
+            .is_some_and(|texture| Some(texture.generation) == current_generation);
+        let stream_is_current_and_visible =
+            self.sat_layer_stream_texture
+                .as_ref()
+                .is_some_and(|texture| {
+                    texture.has_visible_pixels && Some(texture.generation) == current_generation
+                });
+        if stream_is_current_and_visible && !complete_is_current {
+            self.sat_layer_texture = self.sat_layer_stream_texture.take();
+        } else {
+            self.sat_layer_stream_texture = None;
+        }
     }
 
     fn reset_sat_layer_render_backoff(&mut self) {
@@ -1638,8 +1767,20 @@ impl ViewerApp {
                         self.sat_panel.set_spec_status(Err(message));
                     }
                 }
-                sat_worker::SatResponse::PollDone { band, new_keys, ms } => {
-                    self.sat_panel.apply_poll_done(band, new_keys, ms);
+                sat_worker::SatResponse::PollStarted { band } => {
+                    self.sat_panel.apply_poll_started(band);
+                }
+                sat_worker::SatResponse::PollDone {
+                    band,
+                    new_keys,
+                    retained_keys,
+                    ms,
+                } => {
+                    self.sat_panel
+                        .apply_poll_done(band, new_keys, retained_keys, ms);
+                }
+                sat_worker::SatResponse::AlreadyRetained { id, label, bytes } => {
+                    self.sat_panel.apply_already_retained(id, label, bytes);
                 }
                 sat_worker::SatResponse::DownloadStarted { id, label, bytes } => {
                     self.status = format!(
@@ -2090,8 +2231,45 @@ impl ViewerApp {
         if let Some(receiver) = &self.sat_layer_render_rx {
             match receiver.try_recv() {
                 Ok(rendered) => {
+                    if !rendered.complete {
+                        if let Ok(image) = rendered.image
+                            && let Some((origin, image)) = unpack_sat_native_patch(image)
+                            && let Some(stream) =
+                                self.sat_layer_stream_texture.as_mut().filter(|stream| {
+                                    stream.generation == rendered.generation
+                                        && !model_layer_view_needs_rerender(
+                                            &stream.view,
+                                            &rendered.view,
+                                        )
+                                })
+                            && sat_native_patch_fits(stream.texture.size(), origin, image.size)
+                        {
+                            stream
+                                .texture
+                                .set_partial(origin, image, egui::TextureOptions::LINEAR);
+                            // The native renderer emits dirty patches only
+                            // after at least one non-transparent source pixel.
+                            stream.has_visible_pixels = true;
+                            if let Some(progress) = &self.sat_layer_render_progress {
+                                let (zoom, loaded, total) = progress.snapshot();
+                                self.status = format!(
+                                    "Satellite map: native XYZ z{zoom} · {loaded}/{total} tiles loaded"
+                                );
+                            }
+                        }
+                        ctx.request_repaint();
+                        return;
+                    }
+
                     self.finish_sat_layer_render();
-                    if let Some((key, hhmm, outside_coverage, can_center, remote_native)) = self
+                    if let Some((
+                        key,
+                        hhmm,
+                        outside_coverage,
+                        can_center,
+                        remote_native,
+                        daylight_only,
+                    )) = self
                         .sat_layer
                         .as_ref()
                         .filter(|layer| layer.generation == rendered.generation)
@@ -2110,18 +2288,24 @@ impl ViewerApp {
                                 .native
                                 .as_ref()
                                 .is_some_and(|native| native.is_remote());
+                            let daylight_only = layer
+                                .native
+                                .as_ref()
+                                .is_some_and(|native| native.daylight_only());
                             (
                                 layer.key.clone(),
                                 layer.hhmm,
                                 outside_coverage,
                                 can_center,
                                 remote_native,
+                                daylight_only,
                             )
                         })
                     {
                         match rendered.image {
                             Ok(image) => {
                                 self.reset_sat_layer_render_backoff();
+                                let logical_size = image.source_size;
                                 let has_visible_pixels =
                                     satellite_render_has_visible_pixels(&image);
                                 let texture = ctx.load_texture(
@@ -2129,24 +2313,34 @@ impl ViewerApp {
                                     image,
                                     egui::TextureOptions::LINEAR,
                                 );
-                                self.sat_layer_texture = Some((
+                                self.sat_layer_texture = Some(SatLayerTexture {
                                     texture,
-                                    rendered.generation,
-                                    rendered.view,
+                                    generation: rendered.generation,
+                                    view: rendered.view,
+                                    logical_size,
                                     has_visible_pixels,
                                     key,
                                     hhmm,
-                                ));
+                                });
                                 self.status = if let Some(error) = rendered.native_error {
                                     format!(
                                         "Satellite native map unavailable; using bounded preview: {error}"
                                     )
                                 } else if has_visible_pixels && rendered.native {
-                                    format!("Satellite map: {hhmm:04}Z · native resolution")
+                                    format!(
+                                        "Satellite map: {hhmm:04}Z · native resolution{}",
+                                        if daylight_only {
+                                            " · daylight-only; night transparent"
+                                        } else {
+                                            ""
+                                        }
+                                    )
                                 } else if has_visible_pixels {
                                     format!("Satellite map: {hhmm:04}Z · bounded preview")
                                 } else if outside_coverage {
                                     "Satellite map: current view is outside this sector — use Center on satellite coverage".to_owned()
+                                } else if rendered.native && daylight_only {
+                                    "Satellite map: daylight-only composite is transparent at night — select GeoColor or IR for nighttime coverage".to_owned()
                                 } else if rendered.native && can_center {
                                     "Satellite map: no native pixels in this view — use Center on satellite coverage or try IR at night".to_owned()
                                 } else if rendered.native && remote_native {
@@ -2164,12 +2358,11 @@ impl ViewerApp {
                                 self.status = self
                                     .sat_layer_texture
                                     .as_ref()
-                                    .filter(|(_, generation, _, _, _, _)| {
-                                        *generation != rendered.generation
-                                    })
-                                    .map(|(_, _, _, _, stale_key, stale_hhmm)| {
+                                    .filter(|texture| texture.generation != rendered.generation)
+                                    .map(|texture| {
                                         format!(
-                                            "Satellite map {key} {hhmm:04}Z failed; showing {stale_key} {stale_hhmm:04}Z STALE: {error}"
+                                            "Satellite map {key} {hhmm:04}Z failed; showing {} {:04}Z STALE: {error}",
+                                            texture.key, texture.hhmm,
                                         )
                                     })
                                     .unwrap_or_else(|| {
@@ -2227,9 +2420,9 @@ impl ViewerApp {
         let current = self
             .sat_layer_texture
             .as_ref()
-            .filter(|(_, rendered_generation, _, _, _, _)| *rendered_generation == generation);
+            .filter(|rendered| rendered.generation == generation);
         let needs_render = current
-            .map(|(_, _, have, _, _, _)| model_layer_view_needs_rerender(have, &view))
+            .map(|rendered| model_layer_view_needs_rerender(&rendered.view, &view))
             .unwrap_or(true);
         let defer_render = map_layer_rerender_deferred(painter.ctx());
         let now = Instant::now();
@@ -2242,7 +2435,7 @@ impl ViewerApp {
                 .request_repaint_after(retry_after.saturating_duration_since(now));
         }
         if needs_render && !defer_render && retry_ready && self.sat_layer_render_rx.is_none() {
-            let Some((native, preview)) = self.sat_layer.as_ref().map(|layer| {
+            let Some((native, preview, key, hhmm)) = self.sat_layer.as_ref().map(|layer| {
                 let native = layer.native.as_ref().map(Arc::clone);
                 let preview = layer.preview.as_ref().map(|preview| {
                     (
@@ -2254,26 +2447,56 @@ impl ViewerApp {
                         preview.flip_rows,
                     )
                 });
-                (native, preview)
+                (native, preview, layer.key.clone(), layer.hhmm)
             }) else {
                 return;
             };
-            let (sender, receiver) = mpsc::channel();
+            // At most one partial raster may queue ahead of the UI. This
+            // keeps progressive tile streaming bounded even when local tile
+            // generation outruns GPU texture upload.
+            let (sender, receiver) = mpsc::sync_channel(1);
             self.sat_layer_render_rx = Some(receiver);
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.sat_layer_render_cancel = Some(Arc::clone(&cancel));
             self.sat_layer_render_generation = Some(generation);
             self.sat_layer_render_view = Some(view);
+            let progress = native
+                .as_ref()
+                .map(|_| Arc::new(SatNativeRenderProgress::default()));
+            self.sat_layer_render_progress = progress.as_ref().map(Arc::clone);
+            if progress.is_some() {
+                self.status = "Satellite map: preparing native XYZ tiles for this view".to_owned();
+            }
             let render_view = view;
             let center_lat = view.center_lat as f64;
             let center_lon = view.center_lon as f64;
             let km_per_pt = 111.32 / view.map_scale as f64;
             let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+            let (w, h) = model_layer_render_dimensions(w_pts, h_pts, render_view.map_scale);
             let ctx = painter.ctx().clone();
+            if native.is_some() {
+                let mut image = egui::ColorImage::new(
+                    [w, h],
+                    vec![egui::Color32::TRANSPARENT; w.saturating_mul(h)],
+                );
+                image.source_size = egui::vec2(w_pts as f32, h_pts as f32);
+                let texture =
+                    ctx.load_texture("sat-layer-stream", image, egui::TextureOptions::LINEAR);
+                self.sat_layer_stream_texture = Some(SatLayerTexture {
+                    texture,
+                    generation,
+                    view: render_view,
+                    logical_size: egui::vec2(w_pts as f32, h_pts as f32),
+                    has_visible_pixels: false,
+                    key,
+                    hhmm,
+                });
+            } else {
+                self.sat_layer_stream_texture = None;
+            }
             thread::spawn(move || {
-                let (w, h) = model_layer_render_dimensions(w_pts, h_pts, render_view.map_scale);
                 let native_result = native.as_ref().map(|native| {
-                    native.render_aeqd_cancellable(
+                    native.render_aeqd_cancellable_progressive(
                         center_lat,
                         center_lon,
                         render_view.map_scale,
@@ -2282,6 +2505,37 @@ impl ViewerApp {
                         w,
                         h,
                         cancel.as_ref(),
+                        |tile_progress, partial_patch| {
+                            if let Some(progress) = &progress {
+                                progress.update(tile_progress);
+                            }
+                            let accepted = if let Some(patch) = partial_patch {
+                                let accepted = sender
+                                    .try_send(SatLayerRender {
+                                        generation,
+                                        view: render_view,
+                                        image: Ok(pack_sat_native_patch(patch)),
+                                        native: true,
+                                        native_error: None,
+                                        complete: false,
+                                    })
+                                    .is_ok();
+                                if accepted {
+                                    ctx.request_repaint();
+                                }
+                                accepted
+                            } else {
+                                true
+                            };
+                            if tile_progress.loaded == 0
+                                || tile_progress.loaded == 1
+                                || tile_progress.loaded == tile_progress.total
+                                || tile_progress.loaded.is_multiple_of(4)
+                            {
+                                ctx.request_repaint();
+                            }
+                            accepted
+                        },
                     )
                 });
                 let (image, rendered_native, native_error) = match native_result {
@@ -2339,6 +2593,7 @@ impl ViewerApp {
                     image,
                     native: rendered_native,
                     native_error,
+                    complete: true,
                 });
                 ctx.request_repaint();
             });
@@ -2346,57 +2601,75 @@ impl ViewerApp {
         let Some(layer) = &self.sat_layer else {
             return;
         };
-        if let Some((
-            texture,
-            rendered_generation,
-            rendered,
-            has_visible_pixels,
-            rendered_key,
-            rendered_hhmm,
-        )) = &self.sat_layer_texture
-        {
-            let stale_identity = *rendered_generation != layer.generation
-                || rendered_key != &layer.key
-                || *rendered_hhmm != layer.hhmm;
+        let stream_texture = self.sat_layer_stream_texture.as_ref().filter(|rendered| {
+            rendered.generation == layer.generation
+                && rendered.has_visible_pixels
+                && !model_layer_view_needs_rerender(&rendered.view, &view)
+        });
+        let displaying_stream = stream_texture.is_some();
+        if let Some(rendered_texture) = stream_texture.or(self.sat_layer_texture.as_ref()) {
+            let stale_identity = rendered_texture.generation != layer.generation
+                || rendered_texture.key != layer.key
+                || rendered_texture.hhmm != layer.hhmm;
             let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
             let tint = egui::Color32::from_white_alpha((layer.opacity * 255.0) as u8);
-            if model_layer_view_needs_rerender(rendered, &view) {
+            if model_layer_view_needs_rerender(&rendered_texture.view, &view) {
                 // Mid-gesture (owner report: "every time we zoom in the sat
                 // image disappears until we stop"): keep painting the last
                 // rendered raster through a small georeferenced drape. A
                 // single translated rectangle drifts sideways because the
                 // old and new AEQD views are not affinely related.
                 if let Some(mesh) = stale_sat_texture_mesh(
-                    texture.id(),
+                    rendered_texture.texture.id(),
                     rect,
-                    texture.size_vec2(),
-                    rendered,
+                    rendered_texture.logical_size,
+                    &rendered_texture.view,
                     &view,
                     tint,
+                ) && stale_sat_mesh_is_useful(
+                    &mesh,
+                    rect,
+                    &rendered_texture.view,
+                    &view,
+                    !stale_identity,
                 ) {
                     painter.add(egui::Shape::mesh(mesh));
-                } else {
+                } else if !stale_identity {
                     // Degenerate projection inputs are rare; retain the old
-                    // affine bridge as a safe visual fallback.
-                    let anchored =
-                        anchored_sat_texture_rect(rect, texture.size_vec2(), rendered, &view);
-                    if anchored.is_finite() && anchored.intersects(rect) {
-                        painter.image(texture.id(), anchored, uv, tint);
+                    // affine bridge only for a nearby view of this same frame.
+                    let scale_ratio = view.map_scale / rendered_texture.view.map_scale;
+                    let anchored = anchored_sat_texture_rect(
+                        rect,
+                        rendered_texture.logical_size,
+                        &rendered_texture.view,
+                        &view,
+                    );
+                    if scale_ratio >= SAT_STALE_DRAPE_MIN_SCALE_RATIO
+                        && anchored.is_finite()
+                        && anchored.intersects(rect)
+                        && anchored.intersect(rect).area() / rect.area()
+                            >= SAT_STALE_DRAPE_MIN_VIEW_COVERAGE
+                    {
+                        painter.image(rendered_texture.texture.id(), anchored, uv, tint);
                     }
                 }
             } else {
-                painter.image(texture.id(), rect, uv, tint);
+                painter.image(rendered_texture.texture.id(), rect, uv, tint);
             }
             if stale_identity {
                 draw_satellite_stale_notice(
                     painter,
                     rect,
-                    rendered_key,
-                    *rendered_hhmm,
+                    &rendered_texture.key,
+                    rendered_texture.hhmm,
                     &layer.key,
                     layer.hhmm,
                 );
-            } else if !has_visible_pixels && !model_layer_view_needs_rerender(rendered, &view) {
+            } else if !displaying_stream
+                && self.sat_layer_render_rx.is_none()
+                && !rendered_texture.has_visible_pixels
+                && !model_layer_view_needs_rerender(&rendered_texture.view, &view)
+            {
                 draw_satellite_no_visible_notice(
                     painter,
                     rect,
@@ -2416,6 +2689,34 @@ impl ViewerApp {
                         .is_some_and(|native| native.is_remote()),
                 );
             }
+        }
+        if self.sat_layer_render_rx.is_some() || (needs_render && defer_render) {
+            let text = self
+                .sat_layer_render_progress
+                .as_ref()
+                .map(|progress| progress.snapshot())
+                .map(|(zoom, loaded, total)| {
+                    if total == 0 {
+                        "Satellite · preparing native XYZ tiles…".to_owned()
+                    } else {
+                        format!("Satellite native XYZ z{zoom} · {loaded}/{total} tiles")
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if defer_render {
+                        "Satellite · release/settle the map to load this zoom…".to_owned()
+                    } else {
+                        "Satellite · rendering this map view…".to_owned()
+                    }
+                });
+            draw_satellite_loading_notice(painter, rect, &text);
+        }
+        if layer
+            .native
+            .as_ref()
+            .is_some_and(|native| native.daylight_only())
+        {
+            draw_satellite_daylight_only_notice(painter, rect);
         }
         if layer.key.model == "mtg_i1" {
             let year = layer
@@ -2686,6 +2987,49 @@ fn draw_satellite_no_visible_notice(
     painter.rect_stroke(card, 5.0, visuals.window_stroke(), egui::StrokeKind::Inside);
     painter.galley(
         card.min + egui::vec2(10.0, 7.0),
+        galley,
+        visuals.text_color(),
+    );
+}
+
+fn draw_satellite_loading_notice(painter: &egui::Painter, rect: egui::Rect, text: &str) {
+    let style = painter.ctx().global_style();
+    let visuals = &style.visuals;
+    let color = egui::Color32::from_rgb(103, 211, 255);
+    let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), color);
+    let size = galley.size() + egui::vec2(20.0, 12.0);
+    let card = egui::Rect::from_min_size(
+        egui::pos2(rect.center().x - size.x * 0.5, rect.top() + 12.0),
+        size,
+    );
+    painter.rect_filled(card, 5.0, visuals.window_fill());
+    painter.rect_stroke(
+        card,
+        5.0,
+        egui::Stroke::new(1.25, color),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(card.min + egui::vec2(10.0, 6.0), galley, color);
+}
+
+fn draw_satellite_daylight_only_notice(painter: &egui::Painter, rect: egui::Rect) {
+    let style = painter.ctx().global_style();
+    let visuals = &style.visuals;
+    let text = "Daylight-only composite · night is transparent";
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(11.0),
+        visuals.text_color(),
+    );
+    let size = galley.size() + egui::vec2(16.0, 10.0);
+    let card = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 12.0, rect.bottom() - size.y - 12.0),
+        size,
+    );
+    painter.rect_filled(card, 4.0, visuals.window_fill());
+    painter.rect_stroke(card, 4.0, visuals.window_stroke(), egui::StrokeKind::Inside);
+    painter.galley(
+        card.min + egui::vec2(8.0, 5.0),
         galley,
         visuals.text_color(),
     );
@@ -3317,6 +3661,26 @@ mod tests {
     }
 
     #[test]
+    fn native_tile_patch_round_trips_origin_and_checks_texture_bounds() {
+        let patch = sat_native_map::NativeTilePatch {
+            origin: [17, 23],
+            image: egui::ColorImage::new([3, 2], vec![egui::Color32::WHITE; 6]),
+        };
+        let packed = pack_sat_native_patch(patch);
+        let (origin, unpacked) = unpack_sat_native_patch(packed).expect("valid patch envelope");
+        assert_eq!(origin, [17, 23]);
+        assert_eq!(unpacked.size, [3, 2]);
+        assert_eq!(unpacked.source_size, egui::vec2(3.0, 2.0));
+        assert!(sat_native_patch_fits([64, 64], origin, unpacked.size));
+        assert!(!sat_native_patch_fits([19, 64], origin, unpacked.size));
+        assert!(!sat_native_patch_fits(
+            [usize::MAX, usize::MAX],
+            [usize::MAX, 0],
+            [1, 1],
+        ));
+    }
+
+    #[test]
     fn satellite_coverage_center_uses_a_visible_geolocated_pixel() {
         let mut pixels = vec![egui::Color32::TRANSPARENT; 9];
         // Grid index 7 is row 2/col 1. With flipped display rows, that lands
@@ -3504,6 +3868,86 @@ mod tests {
                 "({u}, {v}) landed at {actual:?}, expected {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn stale_satellite_drape_uses_logical_viewport_size_not_gpu_raster_size() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let view = ModelLayerView {
+            center_lat: 35.0,
+            center_lon: -137.0,
+            map_scale: 24.0,
+        };
+        let full = stale_sat_texture_mesh(
+            egui::TextureId::Managed(1),
+            rect,
+            rect.size(),
+            &view,
+            &view,
+            egui::Color32::WHITE,
+        )
+        .expect("logical viewport mesh");
+        let downsampled_gpu_pixels = stale_sat_texture_mesh(
+            egui::TextureId::Managed(1),
+            rect,
+            egui::vec2(758.0, 474.0),
+            &view,
+            &view,
+            egui::Color32::WHITE,
+        )
+        .expect("downsampled raster mesh");
+
+        assert!(stale_sat_mesh_view_coverage(&full, rect) > 0.99);
+        assert!(
+            stale_sat_mesh_view_coverage(&downsampled_gpu_pixels, rect) < 0.30,
+            "using texture pixels recreates the reported small rectangle"
+        );
+    }
+
+    #[test]
+    fn stale_satellite_drape_rejects_other_frames_and_large_zoom_changes() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let rendered = ModelLayerView {
+            center_lat: 35.0,
+            center_lon: -137.0,
+            map_scale: 100.0,
+        };
+        let mesh = stale_sat_texture_mesh(
+            egui::TextureId::Managed(2),
+            rect,
+            rect.size(),
+            &rendered,
+            &rendered,
+            egui::Color32::WHITE,
+        )
+        .expect("same-view mesh");
+        assert!(stale_sat_mesh_is_useful(
+            &mesh, rect, &rendered, &rendered, true
+        ));
+        assert!(!stale_sat_mesh_is_useful(
+            &mesh, rect, &rendered, &rendered, false
+        ));
+
+        let zoomed_out = ModelLayerView {
+            map_scale: 40.0,
+            ..rendered
+        };
+        assert!(!stale_sat_mesh_is_useful(
+            &mesh,
+            rect,
+            &rendered,
+            &zoomed_out,
+            true,
+        ));
+
+        let zoomed_in = ModelLayerView {
+            map_scale: 400.0,
+            ..rendered
+        };
+        assert!(
+            stale_sat_mesh_is_useful(&mesh, rect, &rendered, &zoomed_in, true),
+            "same-frame zoom-in must keep a visible bridge while sharper tiles load"
+        );
     }
 
     #[test]

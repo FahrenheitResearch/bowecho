@@ -23,7 +23,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.34.14"
+version = "0.35.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/bowecho"
@@ -77,8 +77,8 @@ incremental = true
 strip = false
 
 [patch.crates-io]
-hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "472d7e9d9b5a49f81dce1da1826cc5b2145aaf95" }
-openjp2 = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "472d7e9d9b5a49f81dce1da1826cc5b2145aaf95" }
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "369d65c2530cfec497d756dc137b93fd4e95e14d" }
+openjp2 = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "369d65c2530cfec497d756dc137b93fd4e95e14d" }
 
 # sharprs reaches this workspace from TWO git sources: directly from
 # rusty-weather, and transitively via sharppyrs, which pulls it from the
@@ -89,7 +89,7 @@ openjp2 = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "
 # packages by NAME within a single source, so listing only `sharprs` under the
 # rusty-weather source leaves rw-sat, rw-store, rw-ui, rw-glm, rustwx-sounding,
 # rustwx-render, netcrust, grib-core, hdf5-reader and openjp2 pinned at the
-# shared 472d7e9 native-satellite correctness revision. See
+# shared 369d65c native-satellite streaming revision. See
 # vendor/sharprs/PATCHES.md for import lineage.
 [patch."https://github.com/FahrenheitResearch/sharprs"]
 sharprs = { path = "vendor/sharprs" }
